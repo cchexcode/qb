@@ -56,6 +56,10 @@ nodes:
           mkdir ./.release/assets
   "release:asset:generate:compile":
     description: "Compiles the application."
+    env:
+      vars:
+        # cargo-zigbuild's wrapper scripts reference SDKROOT which may be unset
+        SHELLOPTS: "errexit:pipefail"
     pre:
       - name: "release:init"
     matrix:
@@ -75,17 +79,8 @@ nodes:
                 TARGET: x86_64-unknown-linux-musl
     tasks:
       - script: |
-          if [[ "${TARGET}" == *"apple-darwin"* ]]; then
-            rustup target add ${TARGET} || true
-            cargo +stable build --release --target ${TARGET}
-          else
-            if [[ "${TARGET}" == aarch64-* ]]; then
-              export DOCKER_DEFAULT_PLATFORM=linux/arm64
-            else
-              export DOCKER_DEFAULT_PLATFORM=linux/amd64
-            fi
-            cross +stable build --release --target ${TARGET}
-          fi
+          rustup target add ${TARGET} || true
+          cargo zigbuild --release --target ${TARGET}
           cp ./target/${TARGET}/release/${PROGRAM} ./.release/assets/${PROGRAM}-${TARGET}
   "release:asset:hash":
     description: "Hashes all assets."
