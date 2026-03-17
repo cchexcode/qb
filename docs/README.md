@@ -6,25 +6,27 @@ A fast, keyboard-driven terminal UI for browsing Kubernetes clusters.
 It does **not** shell out to `kubectl` — all cluster communication is native.
 
 ```
-┌ minikube > All Namespaces > Deployments ─────────────────────────────────┐
-├──────────────────────┬───────────────────────────────────────────────────┤
-│ Resources            │ NAME              NAMESPACE   READY   AGE        │
-│                      │▶ nginx-ingress    ingress     3/3     12d        │
-│ Workloads            │  coredns          kube-system 2/2     30d        │
-│   Deployments        │  metrics-server   monitoring  1/1     5d         │
-│   StatefulSets       │                                                  │
-│   ReplicaSets        │                                                  │
-│   Pods               │                                                  │
-│   CronJobs           │                                                  │
-│   Jobs               │                                                  │
-│ Config               │                                                  │
-│   ConfigMaps         │                                                  │
-│   Secrets            │                                                  │
-│ Network              │                                                  │
-│   Services           │                                                  │
-├──────────────────────┴───────────────────────────────────────────────────┤
-│ r  Resources   c  minikube   n  All Namespaces   l  Logs   q  Quit     │
-└──────────────────────────────────────────────────────────────────────────┘
+┌ minikube > All Namespaces > Deployments ────────────────────────────────────┐
+├──────────────────────────┬──────────────────────────────────────────────────┤
+│ Cluster                  │ NAME              NAMESPACE   READY  UP  AGE     │
+│ ▶ Overview               │▶ nginx-ingress    ingress     3/3    3   12d     │
+│   Nodes                  │  coredns          kube-system 2/2    2   30d     │
+│   Namespaces             │  metrics-server   monitoring  1/1    1    5d     │
+│   Events                 │                                                  │
+│ Workloads                │                                                  │
+│   Deployments            │                                                  │
+│   StatefulSets           │                                                  │
+│   DaemonSets             │                                                  │
+│   Pods                   │                                                  │
+│ Network                  │                                                  │
+│   Services               │                                                  │
+│   Ingresses              │                                                  │
+│ Config                   │                                                  │
+│   ConfigMaps             │                                                  │
+│   Secrets                │                                                  │
+├──────────────────────────┴──────────────────────────────────────────────────┤
+│ r  Resources  c  minikube  n  All Namespaces  /  Filter  l  Logs    q  Quit │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Features
