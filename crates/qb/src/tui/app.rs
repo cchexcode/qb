@@ -351,11 +351,11 @@ impl App {
 
     fn load_resources(&mut self) {
         if let Some(rt) = self.selected_resource_type {
-            let prev_selected_name = self
+            let prev_selected = self
                 .resource_state
                 .selected()
                 .and_then(|idx| self.resources.get(idx))
-                .map(|e| e.name.clone());
+                .map(|e| (e.name.clone(), e.namespace.clone()));
 
             match self.rt.block_on(self.kube.list_resources(rt)) {
                 | Ok(mut entries) => {
@@ -368,8 +368,8 @@ impl App {
                         });
                     }
                     self.resources = entries;
-                    let new_idx = prev_selected_name
-                        .and_then(|name| self.resources.iter().position(|e| e.name == name))
+                    let new_idx = prev_selected
+                        .and_then(|(name, ns)| self.resources.iter().position(|e| e.name == name && e.namespace == ns))
                         .or_else(|| {
                             if self.resources.is_empty() {
                                 None
