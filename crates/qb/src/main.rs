@@ -1,5 +1,7 @@
-use anyhow::Result;
-use clap::Parser;
+use {
+    anyhow::Result,
+    clap::Parser,
+};
 
 mod args;
 mod k8s;

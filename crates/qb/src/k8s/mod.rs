@@ -1,26 +1,62 @@
-use anyhow::{Context, Result};
-use jiff::Timestamp;
-use k8s_openapi::{
-    api::{
-        apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
-        autoscaling::v1::HorizontalPodAutoscaler,
-        batch::v1::{CronJob, Job},
-        core::v1::{
-            ConfigMap, Endpoints, Event, Namespace, Node, PersistentVolume, PersistentVolumeClaim,
-            Pod, Secret, Service, ServiceAccount,
-        },
-        networking::v1::{Ingress, NetworkPolicy},
-        rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
-        storage::v1::StorageClass,
+use {
+    anyhow::{
+        Context,
+        Result,
     },
-    apimachinery::pkg::apis::meta::v1::Time,
+    jiff::Timestamp,
+    k8s_openapi::{
+        api::{
+            apps::v1::{
+                DaemonSet,
+                Deployment,
+                ReplicaSet,
+                StatefulSet,
+            },
+            autoscaling::v1::HorizontalPodAutoscaler,
+            batch::v1::{
+                CronJob,
+                Job,
+            },
+            core::v1::{
+                ConfigMap,
+                Endpoints,
+                Event,
+                Namespace,
+                Node,
+                PersistentVolume,
+                PersistentVolumeClaim,
+                Pod,
+                Secret,
+                Service,
+                ServiceAccount,
+            },
+            networking::v1::{
+                Ingress,
+                NetworkPolicy,
+            },
+            rbac::v1::{
+                ClusterRole,
+                ClusterRoleBinding,
+                Role,
+                RoleBinding,
+            },
+            storage::v1::StorageClass,
+        },
+        apimachinery::pkg::apis::meta::v1::Time,
+    },
+    kube::{
+        api::{
+            Api,
+            ListParams,
+        },
+        config::{
+            KubeConfigOptions,
+            Kubeconfig,
+        },
+        Client,
+    },
+    serde_json::Value,
 };
-use kube::{
-    api::{Api, ListParams},
-    config::{KubeConfigOptions, Kubeconfig},
-    Client,
-};
-use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // Resource type definitions
@@ -148,38 +184,35 @@ impl ResourceType {
     pub fn all_by_category() -> Vec<(Category, Vec<ResourceType>)> {
         vec![
             (Category::Cluster, vec![Self::Node, Self::Namespace, Self::Event]),
-            (
-                Category::Workloads,
-                vec![
-                    Self::Deployment,
-                    Self::StatefulSet,
-                    Self::DaemonSet,
-                    Self::ReplicaSet,
-                    Self::Pod,
-                    Self::CronJob,
-                    Self::Job,
-                    Self::HorizontalPodAutoscaler,
-                ],
-            ),
-            (
-                Category::Network,
-                vec![Self::Service, Self::Ingress, Self::Endpoints, Self::NetworkPolicy],
-            ),
+            (Category::Workloads, vec![
+                Self::Deployment,
+                Self::StatefulSet,
+                Self::DaemonSet,
+                Self::ReplicaSet,
+                Self::Pod,
+                Self::CronJob,
+                Self::Job,
+                Self::HorizontalPodAutoscaler,
+            ]),
+            (Category::Network, vec![
+                Self::Service,
+                Self::Ingress,
+                Self::Endpoints,
+                Self::NetworkPolicy,
+            ]),
             (Category::Config, vec![Self::ConfigMap, Self::Secret]),
-            (
-                Category::Rbac,
-                vec![
-                    Self::ServiceAccount,
-                    Self::Role,
-                    Self::RoleBinding,
-                    Self::ClusterRole,
-                    Self::ClusterRoleBinding,
-                ],
-            ),
-            (
-                Category::Storage,
-                vec![Self::PersistentVolumeClaim, Self::PersistentVolume, Self::StorageClass],
-            ),
+            (Category::Rbac, vec![
+                Self::ServiceAccount,
+                Self::Role,
+                Self::RoleBinding,
+                Self::ClusterRole,
+                Self::ClusterRoleBinding,
+            ]),
+            (Category::Storage, vec![
+                Self::PersistentVolumeClaim,
+                Self::PersistentVolume,
+                Self::StorageClass,
+            ]),
         ]
     }
 }
@@ -311,7 +344,8 @@ impl KubeClient {
         self.current_namespace.as_deref()
     }
 
-    /// Returns a display string for the namespace: the name or "All Namespaces".
+    /// Returns a display string for the namespace: the name or "All
+    /// Namespaces".
     pub fn namespace_display(&self) -> &str {
         self.current_namespace.as_deref().unwrap_or("All Namespaces")
     }
@@ -391,8 +425,14 @@ impl KubeClient {
             let capacity = status.and_then(|s| s.capacity.as_ref());
             let allocatable = status.and_then(|s| s.allocatable.as_ref());
 
-            let get_res = |map: Option<&std::collections::BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>>, key: &str| -> String {
-                map.and_then(|m| m.get(key)).map(|q| q.0.clone()).unwrap_or_else(|| "-".into())
+            let get_res = |map: Option<
+                &std::collections::BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>,
+            >,
+                           key: &str|
+             -> String {
+                map.and_then(|m| m.get(key))
+                    .map(|q| q.0.clone())
+                    .unwrap_or_else(|| "-".into())
             };
 
             node_stats.push(NodeStats {
@@ -464,18 +504,14 @@ impl KubeClient {
             | ResourceType::Pod => self.list_typed::<Pod>(Self::map_pod).await,
             | ResourceType::CronJob => self.list_typed::<CronJob>(Self::map_cronjob).await,
             | ResourceType::Job => self.list_typed::<Job>(Self::map_job).await,
-            | ResourceType::HorizontalPodAutoscaler => {
-                self.list_typed::<HorizontalPodAutoscaler>(Self::map_hpa).await
-            },
+            | ResourceType::HorizontalPodAutoscaler => self.list_typed::<HorizontalPodAutoscaler>(Self::map_hpa).await,
             | ResourceType::ConfigMap => self.list_typed::<ConfigMap>(Self::map_configmap).await,
             | ResourceType::Secret => self.list_typed::<Secret>(Self::map_secret).await,
             | ResourceType::Service => self.list_typed::<Service>(Self::map_service).await,
             | ResourceType::Ingress => self.list_typed::<Ingress>(Self::map_ingress).await,
             | ResourceType::Endpoints => self.list_typed::<Endpoints>(Self::map_endpoints).await,
             | ResourceType::NetworkPolicy => self.list_typed::<NetworkPolicy>(Self::map_network_policy).await,
-            | ResourceType::PersistentVolumeClaim => {
-                self.list_typed::<PersistentVolumeClaim>(Self::map_pvc).await
-            },
+            | ResourceType::PersistentVolumeClaim => self.list_typed::<PersistentVolumeClaim>(Self::map_pvc).await,
             | ResourceType::PersistentVolume => self.list_cluster::<PersistentVolume>(Self::map_pv).await,
             | ResourceType::StorageClass => self.list_cluster::<StorageClass>(Self::map_storage_class).await,
             | ResourceType::ServiceAccount => self.list_typed::<ServiceAccount>(Self::map_service_account).await,
@@ -483,7 +519,8 @@ impl KubeClient {
             | ResourceType::RoleBinding => self.list_typed::<RoleBinding>(Self::map_role_binding).await,
             | ResourceType::ClusterRole => self.list_cluster::<ClusterRole>(Self::map_cluster_role).await,
             | ResourceType::ClusterRoleBinding => {
-                self.list_cluster::<ClusterRoleBinding>(Self::map_cluster_role_binding).await
+                self.list_cluster::<ClusterRoleBinding>(Self::map_cluster_role_binding)
+                    .await
             },
             | ResourceType::Node => self.list_cluster::<Node>(Self::map_node).await,
             | ResourceType::Namespace => self.list_cluster::<Namespace>(Self::map_namespace).await,
@@ -508,9 +545,7 @@ impl KubeClient {
             | ResourceType::Pod => self.get_value::<Pod>(ns, name).await,
             | ResourceType::CronJob => self.get_value::<CronJob>(ns, name).await,
             | ResourceType::Job => self.get_value::<Job>(ns, name).await,
-            | ResourceType::HorizontalPodAutoscaler => {
-                self.get_value::<HorizontalPodAutoscaler>(ns, name).await
-            },
+            | ResourceType::HorizontalPodAutoscaler => self.get_value::<HorizontalPodAutoscaler>(ns, name).await,
             | ResourceType::ConfigMap => self.get_value::<ConfigMap>(ns, name).await,
             | ResourceType::Secret => self.get_value::<Secret>(ns, name).await,
             | ResourceType::Service => self.get_value::<Service>(ns, name).await,
@@ -543,7 +578,10 @@ impl KubeClient {
                     .as_ref()
                     .map(|s| s.containers.iter().map(|c| c.name.clone()).collect())
                     .unwrap_or_default();
-                Ok(vec![PodInfo { name: name.to_string(), containers }])
+                Ok(vec![PodInfo {
+                    name: name.to_string(),
+                    containers,
+                }])
             },
             | ResourceType::Job => {
                 let lp = ListParams::default().labels(&format!("job-name={}", name));
@@ -606,13 +644,15 @@ impl KubeClient {
         Ok(list
             .items
             .iter()
-            .map(|p| PodInfo {
-                name: meta_name(&p.metadata),
-                containers: p
-                    .spec
-                    .as_ref()
-                    .map(|s| s.containers.iter().map(|c| c.name.clone()).collect())
-                    .unwrap_or_default(),
+            .map(|p| {
+                PodInfo {
+                    name: meta_name(&p.metadata),
+                    containers: p
+                        .spec
+                        .as_ref()
+                        .map(|s| s.containers.iter().map(|c| c.name.clone()).collect())
+                        .unwrap_or_default(),
+                }
             })
             .collect())
     }
@@ -629,13 +669,9 @@ impl KubeClient {
         Ok(api.logs(pod, &lp).await?)
     }
 
-    /// Fetch logs for multiple pod/container pairs and merge them with prefixes.
-    pub async fn fetch_logs_multi(
-        &self,
-        ns: &str,
-        pairs: &[(String, String)],
-        tail: i64,
-    ) -> Result<Vec<String>> {
+    /// Fetch logs for multiple pod/container pairs and merge them with
+    /// prefixes.
+    pub async fn fetch_logs_multi(&self, ns: &str, pairs: &[(String, String)], tail: i64) -> Result<Vec<String>> {
         let mut all_lines = Vec::new();
         for (pod, container) in pairs {
             let prefix = format!("[{}/{}] ", pod, container);
@@ -659,8 +695,8 @@ impl KubeClient {
 
     async fn list_typed<K>(&self, mapper: fn(&K) -> ResourceEntry) -> Result<Vec<ResourceEntry>>
     where
-        K: kube::Resource<DynamicType = ()> + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
-        K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
+        K: kube::Resource<DynamicType=()>+serde::de::DeserializeOwned+Clone+std::fmt::Debug,
+        K: kube::Resource<Scope=k8s_openapi::NamespaceResourceScope>,
     {
         let lp = ListParams::default();
         let list = match &self.current_namespace {
@@ -674,8 +710,8 @@ impl KubeClient {
 
     async fn get_value<K>(&self, ns: &str, name: &str) -> Result<Value>
     where
-        K: kube::Resource<DynamicType = ()> + serde::de::DeserializeOwned + serde::Serialize + Clone + std::fmt::Debug,
-        K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
+        K: kube::Resource<DynamicType=()>+serde::de::DeserializeOwned+serde::Serialize+Clone+std::fmt::Debug,
+        K: kube::Resource<Scope=k8s_openapi::NamespaceResourceScope>,
     {
         let api: Api<K> = Api::namespaced(self.client.clone(), ns);
         let obj = api.get(name).await?;
@@ -686,8 +722,8 @@ impl KubeClient {
 
     async fn list_cluster<K>(&self, mapper: fn(&K) -> ResourceEntry) -> Result<Vec<ResourceEntry>>
     where
-        K: kube::Resource<DynamicType = ()> + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
-        K: kube::Resource<Scope = k8s_openapi::ClusterResourceScope>,
+        K: kube::Resource<DynamicType=()>+serde::de::DeserializeOwned+Clone+std::fmt::Debug,
+        K: kube::Resource<Scope=k8s_openapi::ClusterResourceScope>,
     {
         let api: Api<K> = Api::all(self.client.clone());
         let list = api.list(&ListParams::default()).await?;
@@ -698,8 +734,8 @@ impl KubeClient {
 
     async fn get_value_cluster<K>(&self, name: &str) -> Result<Value>
     where
-        K: kube::Resource<DynamicType = ()> + serde::de::DeserializeOwned + serde::Serialize + Clone + std::fmt::Debug,
-        K: kube::Resource<Scope = k8s_openapi::ClusterResourceScope>,
+        K: kube::Resource<DynamicType=()>+serde::de::DeserializeOwned+serde::Serialize+Clone+std::fmt::Debug,
+        K: kube::Resource<Scope=k8s_openapi::ClusterResourceScope>,
     {
         let api: Api<K> = Api::all(self.client.clone());
         let obj = api.get(name).await?;
@@ -763,7 +799,10 @@ impl KubeClient {
     fn map_pod(p: &Pod) -> ResourceEntry {
         let status = p.status.as_ref();
         let phase = status.and_then(|s| s.phase.clone()).unwrap_or_else(|| "Unknown".into());
-        let containers = status.and_then(|s| s.container_statuses.as_ref()).cloned().unwrap_or_default();
+        let containers = status
+            .and_then(|s| s.container_statuses.as_ref())
+            .cloned()
+            .unwrap_or_default();
         let total = containers.len();
         let ready_count = containers.iter().filter(|c| c.ready).count();
         let restarts: i32 = containers.iter().map(|c| c.restart_count).sum();
@@ -810,11 +849,7 @@ impl KubeClient {
         let duration = status
             .and_then(|s| {
                 let start = s.start_time.as_ref()?;
-                let end = s
-                    .completion_time
-                    .as_ref()
-                    .map(|t| t.0)
-                    .unwrap_or_else(Timestamp::now);
+                let end = s.completion_time.as_ref().map(|t| t.0).unwrap_or_else(Timestamp::now);
                 let dur = end.duration_since(start.0);
                 Some(format_duration(dur))
             })
@@ -837,7 +872,10 @@ impl KubeClient {
         ResourceEntry {
             name: meta_name(&c.metadata),
             namespace: meta_ns(&c.metadata),
-            columns: vec![data_count.to_string(), format_age(c.metadata.creation_timestamp.as_ref())],
+            columns: vec![
+                data_count.to_string(),
+                format_age(c.metadata.creation_timestamp.as_ref()),
+            ],
             sort_key: None,
         }
     }
@@ -1039,14 +1077,8 @@ impl KubeClient {
 
     fn map_pvc(p: &PersistentVolumeClaim) -> ResourceEntry {
         let status = p.status.as_ref();
-        let phase = status
-            .and_then(|s| s.phase.clone())
-            .unwrap_or_else(|| "Pending".into());
-        let volume = p
-            .spec
-            .as_ref()
-            .and_then(|s| s.volume_name.clone())
-            .unwrap_or_default();
+        let phase = status.and_then(|s| s.phase.clone()).unwrap_or_else(|| "Pending".into());
+        let volume = p.spec.as_ref().and_then(|s| s.volume_name.clone()).unwrap_or_default();
         let capacity = status
             .and_then(|s| s.capacity.as_ref())
             .and_then(|c| c.get("storage"))
@@ -1075,11 +1107,7 @@ impl KubeClient {
         let reclaim = spec
             .and_then(|s| s.persistent_volume_reclaim_policy.clone())
             .unwrap_or_default();
-        let phase = p
-            .status
-            .as_ref()
-            .and_then(|s| s.phase.clone())
-            .unwrap_or_default();
+        let phase = p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
         let claim = spec
             .and_then(|s| s.claim_ref.as_ref())
             .map(|c| {
@@ -1110,11 +1138,7 @@ impl KubeClient {
         ResourceEntry {
             name: meta_name(&s.metadata),
             namespace: String::new(),
-            columns: vec![
-                provisioner,
-                reclaim,
-                format_age(s.metadata.creation_timestamp.as_ref()),
-            ],
+            columns: vec![provisioner, reclaim, format_age(s.metadata.creation_timestamp.as_ref())],
             sort_key: None,
         }
     }
@@ -1142,11 +1166,7 @@ impl KubeClient {
     }
 
     fn map_role_binding(r: &RoleBinding) -> ResourceEntry {
-        let role = format!(
-            "{}/{}",
-            r.role_ref.kind,
-            r.role_ref.name
-        );
+        let role = format!("{}/{}", r.role_ref.kind, r.role_ref.name);
         ResourceEntry {
             name: meta_name(&r.metadata),
             namespace: meta_ns(&r.metadata),
@@ -1165,11 +1185,7 @@ impl KubeClient {
     }
 
     fn map_cluster_role_binding(r: &ClusterRoleBinding) -> ResourceEntry {
-        let role = format!(
-            "{}/{}",
-            r.role_ref.kind,
-            r.role_ref.name
-        );
+        let role = format!("{}/{}", r.role_ref.kind, r.role_ref.name);
         ResourceEntry {
             name: meta_name(&r.metadata),
             namespace: String::new(),
@@ -1183,13 +1199,10 @@ impl KubeClient {
         let conditions = status.and_then(|s| s.conditions.as_ref());
         let ready = conditions
             .and_then(|conds| {
-                conds.iter().find(|c| c.type_ == "Ready").map(|c| {
-                    if c.status == "True" {
-                        "Ready"
-                    } else {
-                        "NotReady"
-                    }
-                })
+                conds
+                    .iter()
+                    .find(|c| c.type_ == "Ready")
+                    .map(|c| if c.status == "True" { "Ready" } else { "NotReady" })
             })
             .unwrap_or("Unknown");
         let roles = n
@@ -1245,17 +1258,12 @@ impl KubeClient {
             .involved_object
             .name
             .as_ref()
-            .map(|n| {
-                format!(
-                    "{}/{}",
-                    e.involved_object.kind.as_deref().unwrap_or(""),
-                    n
-                )
-            })
+            .map(|n| format!("{}/{}", e.involved_object.kind.as_deref().unwrap_or(""), n))
             .unwrap_or_default();
         let message = e.message.clone().unwrap_or_default();
         let count = e.count.unwrap_or(1);
-        // Use lastTimestamp (or creationTimestamp) as sort key — ISO 8601 sorts lexicographically
+        // Use lastTimestamp (or creationTimestamp) as sort key — ISO 8601 sorts
+        // lexicographically
         let sort_ts = e
             .last_timestamp
             .as_ref()

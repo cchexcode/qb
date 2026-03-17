@@ -1,9 +1,16 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
-use ratatui::prelude::*;
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-
-use crate::k8s::ResourceType;
+use {
+    crate::k8s::ResourceType,
+    base64::{
+        engine::general_purpose::STANDARD,
+        Engine,
+    },
+    ratatui::prelude::*,
+    serde_json::Value,
+    std::collections::{
+        HashMap,
+        HashSet,
+    },
+};
 
 // ---------------------------------------------------------------------------
 // Secret detail state
@@ -62,7 +69,8 @@ impl SecretDetailState {
         }
     }
 
-    /// Returns the decoded plaintext value for the selected key (always decodes base64).
+    /// Returns the decoded plaintext value for the selected key (always decodes
+    /// base64).
     pub fn selected_plaintext_value(&self) -> Option<String> {
         let key = self.keys.get(self.selected)?;
         let b64 = self.values.get(key)?;
@@ -73,16 +81,17 @@ impl SecretDetailState {
     pub fn selected_key(&self) -> Option<&str> {
         self.keys.get(self.selected).map(|s| s.as_str())
     }
-
 }
 
 // ---------------------------------------------------------------------------
 // Dict entry selection state (labels/annotations)
 // ---------------------------------------------------------------------------
 
-/// Mutable state passed into renderers so `dict_section` can register selectable entries.
+/// Mutable state passed into renderers so `dict_section` can register
+/// selectable entries.
 pub struct DictState {
-    /// All dict entries across all sections: (qualified_key, display_key, value).
+    /// All dict entries across all sections: (qualified_key, display_key,
+    /// value).
     pub entries: Vec<(String, String, String)>,
     /// Line offset where each entry starts in the rendered output.
     pub line_offsets: Vec<usize>,
@@ -145,7 +154,14 @@ fn render_deployment(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
     let ready = ji(v, "status.readyReplicas").unwrap_or(0);
     let updated = ji(v, "status.updatedReplicas").unwrap_or(0);
     let available = ji(v, "status.availableReplicas").unwrap_or(0);
-    field(&mut l, "Replicas", &format!("{}/{} ready, {} updated, {} available", ready, replicas, updated, available));
+    field(
+        &mut l,
+        "Replicas",
+        &format!(
+            "{}/{} ready, {} updated, {} available",
+            ready, replicas, updated, available
+        ),
+    );
 
     let strategy = js(v, "spec.strategy.type");
     if !strategy.is_empty() {
@@ -153,7 +169,10 @@ fn render_deployment(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
         if strategy == "RollingUpdate" {
             let max_surge = js(v, "spec.strategy.rollingUpdate.maxSurge");
             let max_unavail = js(v, "spec.strategy.rollingUpdate.maxUnavailable");
-            s = format!("{} (maxSurge: {}, maxUnavailable: {})", strategy, max_surge, max_unavail);
+            s = format!(
+                "{} (maxSurge: {}, maxUnavailable: {})",
+                strategy, max_surge, max_unavail
+            );
         }
         field(&mut l, "Strategy", &s);
     }
@@ -196,7 +215,11 @@ fn render_replicaset(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
     let desired = ji(v, "spec.replicas").unwrap_or(0);
     let current = ji(v, "status.replicas").unwrap_or(0);
     let ready = ji(v, "status.readyReplicas").unwrap_or(0);
-    field(&mut l, "Replicas", &format!("{} desired, {} current, {} ready", desired, current, ready));
+    field(
+        &mut l,
+        "Replicas",
+        &format!("{} desired, {} current, {} ready", desired, current, ready),
+    );
 
     let selector = labels_str(v, "spec.selector.matchLabels");
     if !selector.is_empty() {
@@ -253,11 +276,7 @@ fn render_pod(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
             subheading(&mut l, &format!("▸ {}", name));
             field(&mut l, "    Image", image);
             field(&mut l, "    State", &state);
-            field(
-                &mut l,
-                "    Ready",
-                if ready { "true" } else { "false" },
-            );
+            field(&mut l, "    Ready", if ready { "true" } else { "false" });
             field(&mut l, "    Restarts", &restarts.to_string());
         }
     } else {
@@ -274,9 +293,7 @@ fn render_cronjob(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
 
     field(&mut l, "Schedule", &js(v, "spec.schedule"));
 
-    let suspend = jget(v, "spec.suspend")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let suspend = jget(v, "spec.suspend").and_then(|v| v.as_bool()).unwrap_or(false);
     field(&mut l, "Suspend", if suspend { "true" } else { "false" });
 
     let policy = js(v, "spec.concurrencyPolicy");
@@ -462,12 +479,7 @@ fn render_service(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
 
     let external_ips = jget(v, "spec.externalIPs")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
         .unwrap_or_default();
     if !external_ips.is_empty() {
         field(&mut l, "External IPs", &external_ips);
@@ -501,10 +513,12 @@ fn render_service(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
                 let port = p.get("port").and_then(|v| v.as_i64()).unwrap_or(0);
                 let target = p
                     .get("targetPort")
-                    .map(|v| match v {
-                        | Value::Number(n) => n.to_string(),
-                        | Value::String(s) => s.clone(),
-                        | _ => "".into(),
+                    .map(|v| {
+                        match v {
+                            | Value::Number(n) => n.to_string(),
+                            | Value::String(s) => s.clone(),
+                            | _ => "".into(),
+                        }
                     })
                     .unwrap_or_default();
                 let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
@@ -585,7 +599,9 @@ fn render_hpa(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
     let cpu = ji(v, "spec.targetCPUUtilizationPercentage");
     if let Some(pct) = cpu {
         let current_cpu = ji(v, "status.currentCPUUtilizationPercentage");
-        let current_str = current_cpu.map(|c| format!("{}%", c)).unwrap_or_else(|| "<unknown>".into());
+        let current_str = current_cpu
+            .map(|c| format!("{}%", c))
+            .unwrap_or_else(|| "<unknown>".into());
         field(&mut l, "CPU Target", &format!("{}% (current: {})", pct, current_str));
     }
 
@@ -613,25 +629,12 @@ fn render_ingress(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
         blank(&mut l);
         section(&mut l, "Rules");
         for rule in rules {
-            let host = rule
-                .get("host")
-                .and_then(|h| h.as_str())
-                .unwrap_or("*");
+            let host = rule.get("host").and_then(|h| h.as_str()).unwrap_or("*");
             subheading(&mut l, &format!("▸ {}", host));
-            if let Some(paths) = rule
-                .get("http")
-                .and_then(|h| h.get("paths"))
-                .and_then(|p| p.as_array())
-            {
+            if let Some(paths) = rule.get("http").and_then(|h| h.get("paths")).and_then(|p| p.as_array()) {
                 for path in paths {
-                    let p = path
-                        .get("path")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("/");
-                    let path_type = path
-                        .get("pathType")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
+                    let p = path.get("path").and_then(|p| p.as_str()).unwrap_or("/");
+                    let path_type = path.get("pathType").and_then(|t| t.as_str()).unwrap_or("");
                     let svc = path
                         .get("backend")
                         .and_then(|b| b.get("service"))
@@ -661,12 +664,7 @@ fn render_ingress(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
                 let hosts = t
                     .get("hosts")
                     .and_then(|h| h.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|h| h.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
+                    .map(|arr| arr.iter().filter_map(|h| h.as_str()).collect::<Vec<_>>().join(", "))
                     .unwrap_or_default();
                 field(&mut l, "  Secret", secret);
                 field(&mut l, "  Hosts", &hosts);
@@ -716,7 +714,15 @@ fn render_endpoints(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
                         .map(|t| {
                             let kind = t.get("kind").and_then(|k| k.as_str()).unwrap_or("");
                             let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                            format!(" ({}{})", kind, if name.is_empty() { "".into() } else { format!("/{}", name) })
+                            format!(
+                                " ({}{})",
+                                kind,
+                                if name.is_empty() {
+                                    "".into()
+                                } else {
+                                    format!("/{}", name)
+                                }
+                            )
                         })
                         .unwrap_or_default();
                     l.push(Line::from(Span::styled(
@@ -747,7 +753,11 @@ fn render_network_policy(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
     let mut l = metadata_lines(v, "NetworkPolicy", ds);
 
     let selector = labels_str(v, "spec.podSelector.matchLabels");
-    field(&mut l, "Pod Selector", if selector.is_empty() { "<all pods>" } else { &selector });
+    field(
+        &mut l,
+        "Pod Selector",
+        if selector.is_empty() { "<all pods>" } else { &selector },
+    );
 
     if let Some(types) = jget(v, "spec.policyTypes").and_then(|v| v.as_array()) {
         let types_str: Vec<&str> = types.iter().filter_map(|t| t.as_str()).collect();
@@ -836,9 +846,7 @@ fn render_pv(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
         field(&mut l, "Status", &phase);
     }
 
-    let capacity = jget(v, "spec.capacity.storage")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let capacity = jget(v, "spec.capacity.storage").and_then(|v| v.as_str()).unwrap_or("");
     if !capacity.is_empty() {
         field(&mut l, "Capacity", capacity);
     }
@@ -930,9 +938,7 @@ fn render_service_account(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
 }
 
 fn render_role(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
-    let kind = jget(v, "kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Role");
+    let kind = jget(v, "kind").and_then(|v| v.as_str()).unwrap_or("Role");
     let mut l = metadata_lines(v, kind, ds);
 
     if let Some(rules) = jget(v, "rules").and_then(|v| v.as_array()) {
@@ -973,9 +979,7 @@ fn render_role(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
 }
 
 fn render_role_binding(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
-    let kind = jget(v, "kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("RoleBinding");
+    let kind = jget(v, "kind").and_then(|v| v.as_str()).unwrap_or("RoleBinding");
     let mut l = metadata_lines(v, kind, ds);
 
     let role_kind = js(v, "roleRef.kind");
@@ -1075,7 +1079,11 @@ fn render_node(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
                 .and_then(|a| a.get(k.as_str()))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            field(&mut l, &format!("  {}", k), &format!("{} (allocatable: {})", val_str, alloc));
+            field(
+                &mut l,
+                &format!("  {}", k),
+                &format!("{} (allocatable: {})", val_str, alloc),
+            );
         }
     }
 
@@ -1267,7 +1275,10 @@ fn resources_section(l: &mut Vec<Line<'static>>, res: &Value) {
 
     // Header
     l.push(Line::from(vec![
-        Span::styled(format!("    {:<dim_w$}", "RESOURCE"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("    {:<dim_w$}", "RESOURCE"),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(format!("{:<req_w$}", "REQUEST"), Style::default().fg(Color::DarkGray)),
         Span::styled("LIMIT", Style::default().fg(Color::DarkGray)),
     ]));
@@ -1351,7 +1362,10 @@ fn container_state_str(state: Option<&Value>) -> String {
         return reason.to_string();
     }
     if let Some(terminated) = state.get("terminated") {
-        let reason = terminated.get("reason").and_then(|v| v.as_str()).unwrap_or("Terminated");
+        let reason = terminated
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Terminated");
         let code = terminated.get("exitCode").and_then(|v| v.as_i64()).unwrap_or(0);
         return format!("{} (exit {})", reason, code);
     }
@@ -1390,7 +1404,8 @@ fn subheading(l: &mut Vec<Line<'static>>, text: &str) {
 }
 
 /// Renders a JSON object at `path` as a labeled key=value dictionary.
-/// Registers each entry in `ds` for selection/expansion. Shows nothing if empty.
+/// Registers each entry in `ds` for selection/expansion. Shows nothing if
+/// empty.
 fn dict_section(l: &mut Vec<Line<'static>>, v: &Value, path: &str, title: &str, ds: &mut DictState) {
     let map = match jget(v, path).and_then(|v| v.as_object()) {
         | Some(m) if !m.is_empty() => m,
@@ -1458,10 +1473,12 @@ fn dict_section(l: &mut Vec<Line<'static>>, v: &Value, path: &str, title: &str, 
 fn format_netpol_port(p: &Value) -> String {
     let port = p
         .get("port")
-        .map(|v| match v {
-            | Value::Number(n) => n.to_string(),
-            | Value::String(s) => s.clone(),
-            | _ => String::new(),
+        .map(|v| {
+            match v {
+                | Value::Number(n) => n.to_string(),
+                | Value::String(s) => s.clone(),
+                | _ => String::new(),
+            }
         })
         .unwrap_or_default();
     let proto = p.get("protocol").and_then(|p| p.as_str()).unwrap_or("TCP");
@@ -1500,12 +1517,14 @@ fn jget<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 
 fn js(v: &Value, path: &str) -> String {
     jget(v, path)
-        .map(|v| match v {
-            | Value::String(s) => s.clone(),
-            | Value::Number(n) => n.to_string(),
-            | Value::Bool(b) => b.to_string(),
-            | Value::Null => String::new(),
-            | _ => String::new(),
+        .map(|v| {
+            match v {
+                | Value::String(s) => s.clone(),
+                | Value::Number(n) => n.to_string(),
+                | Value::Bool(b) => b.to_string(),
+                | Value::Null => String::new(),
+                | _ => String::new(),
+            }
         })
         .unwrap_or_default()
 }

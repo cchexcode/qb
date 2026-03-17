@@ -1,11 +1,26 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::widgets::{ListState, TableState};
-use regex::Regex;
-use serde_json::Value;
-
-use crate::k8s::{ClusterStatsData, KubeClient, ResourceEntry, ResourceType};
-use super::logs::LogViewState;
-use super::smart::SecretDetailState;
+use {
+    super::{
+        logs::LogViewState,
+        smart::SecretDetailState,
+    },
+    crate::k8s::{
+        ClusterStatsData,
+        KubeClient,
+        ResourceEntry,
+        ResourceType,
+    },
+    crossterm::event::{
+        KeyCode,
+        KeyEvent,
+        KeyModifiers,
+    },
+    ratatui::widgets::{
+        ListState,
+        TableState,
+    },
+    regex::Regex,
+    serde_json::Value,
+};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -99,12 +114,14 @@ pub struct App {
     pub secret_state: Option<SecretDetailState>,
     /// Tracks which label/annotation keys are expanded in smart view.
     pub expanded_keys: std::collections::HashSet<String>,
-    /// Ordered list of all label/annotation dict entries: ("section:key", "key", "value").
-    /// Populated each render by smart.rs. Enables j/k navigation and y copy.
+    /// Ordered list of all label/annotation dict entries: ("section:key",
+    /// "key", "value"). Populated each render by smart.rs. Enables j/k
+    /// navigation and y copy.
     pub dict_entries: Vec<(String, String, String)>,
     /// Currently selected dict entry index (into dict_entries).
     pub dict_cursor: Option<usize>,
-    /// Line offsets for each dict entry (for click mapping). Populated each render.
+    /// Line offsets for each dict entry (for click mapping). Populated each
+    /// render.
     pub dict_line_offsets: Vec<usize>,
 
     // UI state
@@ -265,9 +282,7 @@ impl App {
 
     fn resource_matches(&self, entry: &ResourceEntry) -> bool {
         if let Some(re) = &self.resource_filter_regex {
-            re.is_match(&entry.name)
-                || re.is_match(&entry.namespace)
-                || entry.columns.iter().any(|c| re.is_match(c))
+            re.is_match(&entry.name) || re.is_match(&entry.namespace) || entry.columns.iter().any(|c| re.is_match(c))
         } else {
             let needle = &self.resource_filter_text;
             entry.name.contains(needle)
@@ -326,7 +341,8 @@ impl App {
         }
     }
 
-    /// Poll the log stream channel for new lines (called every event loop tick).
+    /// Poll the log stream channel for new lines (called every event loop
+    /// tick).
     pub fn poll_log_stream(&mut self) {
         if let Some(state) = &mut self.log_state {
             state.poll_stream();
@@ -537,9 +553,15 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
-        use crossterm::event::{MouseButton, MouseEventKind};
+        use crossterm::event::{
+            MouseButton,
+            MouseEventKind,
+        };
 
-        let pos = ratatui::layout::Position { x: event.column, y: event.row };
+        let pos = ratatui::layout::Position {
+            x: event.column,
+            y: event.row,
+        };
 
         match event.kind {
             | MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(pos),
@@ -550,7 +572,8 @@ impl App {
     }
 
     fn handle_mouse_click(&mut self, pos: ratatui::layout::Position) {
-        // Popup takes priority — click inside selects + confirms, click outside dismisses
+        // Popup takes priority — click inside selects + confirms, click outside
+        // dismisses
         if self.popup.is_some() {
             if !self.area_popup.contains(pos) {
                 self.popup = None;
@@ -736,8 +759,7 @@ impl App {
                         self.cluster_stats_scroll =
                             self.cluster_stats_scroll.saturating_sub(delta.unsigned_abs() as u16);
                     } else {
-                        self.cluster_stats_scroll =
-                            self.cluster_stats_scroll.saturating_add(delta as u16);
+                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(delta as u16);
                     }
                 } else if self.selected_resource_type == Some(ResourceType::Event) {
                     let max = self.visible_resource_indices().len().saturating_sub(1);
@@ -750,8 +772,7 @@ impl App {
                     }
                 } else {
                     let current = self.resource_state.selected().unwrap_or(0) as i32;
-                    let next =
-                        (current + delta).clamp(0, self.resources.len().saturating_sub(1) as i32) as usize;
+                    let next = (current + delta).clamp(0, self.resources.len().saturating_sub(1) as i32) as usize;
                     if !self.resources.is_empty() {
                         self.resource_state.select(Some(next));
                     }
@@ -812,9 +833,11 @@ impl App {
                     | Focus::Resources => Focus::Nav,
                 };
             },
-            | _ => match self.focus {
-                | Focus::Nav => self.handle_nav_key(key),
-                | Focus::Resources => self.handle_resource_key(key),
+            | _ => {
+                match self.focus {
+                    | Focus::Nav => self.handle_nav_key(key),
+                    | Focus::Resources => self.handle_resource_key(key),
+                }
             },
         }
     }
@@ -851,7 +874,8 @@ impl App {
         }
     }
 
-    /// Load whichever resource type or cluster stats is currently highlighted in the nav.
+    /// Load whichever resource type or cluster stats is currently highlighted
+    /// in the nav.
     fn load_nav_selection(&mut self) {
         if self.is_nav_cluster_stats() {
             if !self.is_showing_cluster_stats() {
@@ -1066,7 +1090,7 @@ impl App {
                         state.toggle_decode();
                     }
                 } else if let Some(cursor) = self.dict_cursor {
-                    if let Some((qualified_key, _, _)) = self.dict_entries.get(cursor) {
+                    if let Some((qualified_key, ..)) = self.dict_entries.get(cursor) {
                         let key = qualified_key.clone();
                         if self.expanded_keys.contains(&key) {
                             self.expanded_keys.remove(&key);
@@ -1367,18 +1391,23 @@ impl App {
             | KeyCode::Enter => {
                 let action = match &self.popup {
                     | Some(Popup::ContextSelect { items, state }) => {
-                        state.selected().and_then(|idx| items.get(idx).cloned()).map(PendingLoad::SwitchContext)
+                        state
+                            .selected()
+                            .and_then(|idx| items.get(idx).cloned())
+                            .map(PendingLoad::SwitchContext)
                     },
-                    | Some(Popup::NamespaceSelect { items, state }) => state.selected().and_then(|idx| {
-                        items.get(idx).map(|ns| {
-                            if ns == ALL_NAMESPACES_LABEL {
-                                self.kube.set_namespace(None);
-                            } else {
-                                self.kube.set_namespace(Some(ns.clone()));
-                            }
-                            PendingLoad::Resources
+                    | Some(Popup::NamespaceSelect { items, state }) => {
+                        state.selected().and_then(|idx| {
+                            items.get(idx).map(|ns| {
+                                if ns == ALL_NAMESPACES_LABEL {
+                                    self.kube.set_namespace(None);
+                                } else {
+                                    self.kube.set_namespace(Some(ns.clone()));
+                                }
+                                PendingLoad::Resources
+                            })
                         })
-                    }),
+                    },
                     | Some(Popup::PodSelect { state, .. }) => {
                         if let Some(idx) = state.selected() {
                             if let Some(log_state) = &mut self.log_state {

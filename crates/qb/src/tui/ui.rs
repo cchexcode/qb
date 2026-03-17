@@ -1,11 +1,22 @@
-use ratatui::{
-    prelude::*,
-    widgets::*,
+use {
+    super::{
+        app::{
+            App,
+            DetailMode,
+            Focus,
+            NavItemKind,
+            Popup,
+            View,
+            ALL_NAMESPACES_LABEL,
+        },
+        smart,
+    },
+    crate::k8s::ResourceType,
+    ratatui::{
+        prelude::*,
+        widgets::*,
+    },
 };
-
-use super::app::{App, DetailMode, Focus, NavItemKind, Popup, View, ALL_NAMESPACES_LABEL};
-use super::smart;
-use crate::k8s::ResourceType;
 
 // ---------------------------------------------------------------------------
 // Top-level render dispatch
@@ -94,11 +105,11 @@ fn render_main(f: &mut Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),            // breadcrumb
-            Constraint::Min(3),               // main area
+            Constraint::Length(1),             // breadcrumb
+            Constraint::Min(3),                // main area
             Constraint::Length(filter_height), // filter bar
-            Constraint::Length(1),            // error line
-            Constraint::Length(1),            // hotkey tab bar
+            Constraint::Length(1),             // error line
+            Constraint::Length(1),             // hotkey tab bar
         ])
         .split(f.area());
 
@@ -319,7 +330,8 @@ fn gauge_bar(filled: usize, total: usize, width: usize) -> Vec<Span<'static>> {
     ]
 }
 
-/// Builds a mini stat card: ` ╭ LABEL ─────╮\n │  VALUE      │\n ╰─────────────╯`
+/// Builds a mini stat card: ` ╭ LABEL ─────╮\n │  VALUE      │\n
+/// ╰─────────────╯`
 fn stat_card(label: &str, value: &str, value_style: Style, width: usize) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let inner = width.saturating_sub(4); // 2 border + 2 padding
@@ -338,9 +350,7 @@ fn stat_card(label: &str, value: &str, value_style: Style, width: usize) -> Vec<
             Span::styled(format!("{:<width$}", value, width = inner), value_style),
             Span::styled(" │", dim),
         ]),
-        Line::from(vec![
-            Span::styled(format!(" ╰{}╯", "─".repeat(bar_w)), dim),
-        ]),
+        Line::from(vec![Span::styled(format!(" ╰{}╯", "─".repeat(bar_w)), dim)]),
     ]
 }
 
@@ -360,7 +370,8 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
     let status_icon = if is_ready { "●" } else { "○" };
     let inner = w.saturating_sub(4); // │ + space ... space + │
 
-    // Helper: pad a set of spans to exactly `inner` visible chars, then wrap in │ … │
+    // Helper: pad a set of spans to exactly `inner` visible chars, then wrap in │ …
+    // │
     let row = |content: Vec<Span<'static>>| -> Vec<Span<'static>> {
         // Calculate visible width of content spans
         let content_w: usize = content.iter().map(|s| s.content.chars().count()).sum();
@@ -402,14 +413,10 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
     ]);
 
     // Role
-    card.push(row(vec![
-        Span::styled(role_display, dim),
-    ]));
+    card.push(row(vec![Span::styled(role_display, dim)]));
 
     // Separator
-    card.push(vec![
-        Span::styled(format!("├{}┤", "─".repeat(bar_w)), dim),
-    ]);
+    card.push(vec![Span::styled(format!("├{}┤", "─".repeat(bar_w)), dim)]);
 
     let res_lbl_w = 8;
     let res_val_w = inner.saturating_sub(res_lbl_w);
@@ -424,7 +431,11 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
     card.push(row(vec![
         Span::styled(format!("{:<w$}", "cpu", w = res_lbl_w), lbl),
         Span::styled(
-            format!("{:<w$}", format!("{} / {}", node.cpu_allocatable, node.cpu_capacity), w = res_val_w),
+            format!(
+                "{:<w$}",
+                format!("{} / {}", node.cpu_allocatable, node.cpu_capacity),
+                w = res_val_w
+            ),
             val,
         ),
     ]));
@@ -433,7 +444,11 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
     card.push(row(vec![
         Span::styled(format!("{:<w$}", "memory", w = res_lbl_w), lbl),
         Span::styled(
-            format!("{:<w$}", format!("{} / {}", node.mem_allocatable, node.mem_capacity), w = res_val_w),
+            format!(
+                "{:<w$}",
+                format!("{} / {}", node.mem_allocatable, node.mem_capacity),
+                w = res_val_w
+            ),
             val,
         ),
     ]));
@@ -442,32 +457,26 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
     card.push(row(vec![
         Span::styled(format!("{:<w$}", "pods", w = res_lbl_w), lbl),
         Span::styled(
-            format!("{:<w$}", format!("{} / {}", node.pods_allocatable, node.pods_capacity), w = res_val_w),
+            format!(
+                "{:<w$}",
+                format!("{} / {}", node.pods_allocatable, node.pods_capacity),
+                w = res_val_w
+            ),
             val,
         ),
     ]));
 
     // Separator
-    card.push(vec![
-        Span::styled(format!("├{}┤", "─".repeat(bar_w)), dim),
-    ]);
+    card.push(vec![Span::styled(format!("├{}┤", "─".repeat(bar_w)), dim)]);
 
     // OS/arch & age
     card.push(row(vec![
-        Span::styled(
-            format!("{:<width$}", node.os_arch, width = inner / 2),
-            dim,
-        ),
-        Span::styled(
-            format!("{:>width$}", node.age, width = inner - inner / 2),
-            dim,
-        ),
+        Span::styled(format!("{:<width$}", node.os_arch, width = inner / 2), dim),
+        Span::styled(format!("{:>width$}", node.age, width = inner - inner / 2), dim),
     ]));
 
     // Bottom border
-    card.push(vec![
-        Span::styled(format!("╰{}╯", "─".repeat(bar_w)), dim),
-    ]);
+    card.push(vec![Span::styled(format!("╰{}╯", "─".repeat(bar_w)), dim)]);
 
     card
 }
@@ -520,7 +529,8 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
             if let Some(line) = card.get(row) {
                 spans.extend(line.spans.iter().cloned());
             }
-            spans.push(Span::styled("  ", Style::default())); // gap between cards
+            spans.push(Span::styled("  ", Style::default())); // gap between
+                                                              // cards
         }
         lines.push(Line::from(spans));
     }
@@ -552,10 +562,7 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
         if stats.pods_pending > 0 {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:<12}", "Pending"), label),
-                Span::styled(
-                    format!("{}", stats.pods_pending),
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled(format!("{}", stats.pods_pending), Style::default().fg(Color::Yellow)),
             ]));
         }
 
@@ -763,10 +770,7 @@ fn render_events_log(f: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
 
-            spans.push(Span::styled(
-                format!("  {}", message),
-                Style::default().fg(msg_color),
-            ));
+            spans.push(Span::styled(format!("  {}", message), Style::default().fg(msg_color)));
 
             let mut line = Line::from(spans);
             if is_selected {
@@ -848,7 +852,11 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
     // Clamp cursor if entries changed
     if let Some(c) = app.dict_cursor {
         if c >= app.dict_entries.len() {
-            app.dict_cursor = if app.dict_entries.is_empty() { None } else { Some(app.dict_entries.len() - 1) };
+            app.dict_cursor = if app.dict_entries.is_empty() {
+                None
+            } else {
+                Some(app.dict_entries.len() - 1)
+            };
         }
     }
     lines
@@ -894,10 +902,10 @@ fn render_logs(f: &mut Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                  // breadcrumb
-            Constraint::Min(3),                     // log content
-            Constraint::Length(filter_height),       // filter bar
-            Constraint::Length(1),                   // hotkey bar
+            Constraint::Length(1),             // breadcrumb
+            Constraint::Min(3),                // log content
+            Constraint::Length(filter_height), // filter bar
+            Constraint::Length(1),             // hotkey bar
         ])
         .split(f.area());
 
@@ -999,10 +1007,7 @@ fn build_log_hotkey_bar(state: &super::logs::LogViewState) -> Line<'static> {
     if state.active_containers().len() > 1 {
         spans.extend([
             Span::styled(" c ", key_style),
-            Span::styled(
-                format!(" Container: {}", state.container_label()),
-                label_style,
-            ),
+            Span::styled(format!(" Container: {}", state.container_label()), label_style),
             sep.clone(),
         ]);
     }
@@ -1093,9 +1098,7 @@ fn render_hotkey_bar(f: &mut Frame, app: &App, area: Rect) {
         ]);
     }
 
-    spans.extend([Span::styled(" q ", key_style),
-        Span::styled(" Quit", label_style),
-    ]);
+    spans.extend([Span::styled(" q ", key_style), Span::styled(" Quit", label_style)]);
 
     let bar = Line::from(spans);
     f.render_widget(Paragraph::new(bar), area);

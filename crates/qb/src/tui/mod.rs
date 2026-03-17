@@ -3,16 +3,26 @@ pub mod logs;
 pub mod smart;
 pub mod ui;
 
-use anyhow::Result;
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+use {
+    crate::k8s::KubeClient,
+    anyhow::Result,
+    crossterm::{
+        event::{
+            self,
+            DisableMouseCapture,
+            EnableMouseCapture,
+        },
+        execute,
+        terminal::{
+            disable_raw_mode,
+            enable_raw_mode,
+            EnterAlternateScreen,
+            LeaveAlternateScreen,
+        },
+    },
+    ratatui::prelude::*,
+    std::io,
 };
-use ratatui::prelude::*;
-use std::io;
-
-use crate::k8s::KubeClient;
 
 pub async fn run(kubeconfig: Option<String>, context: Option<String>, namespace: Option<String>) -> Result<()> {
     let kube_client = KubeClient::new(kubeconfig, context, namespace).await?;

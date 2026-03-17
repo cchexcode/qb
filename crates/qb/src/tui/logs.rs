@@ -1,8 +1,13 @@
-use crate::k8s::PodInfo;
-use k8s_openapi::api::core::v1::Pod;
-use kube::{api::Api, Client};
-use regex::Regex;
-use std::sync::mpsc;
+use {
+    crate::k8s::PodInfo,
+    k8s_openapi::api::core::v1::Pod,
+    kube::{
+        api::Api,
+        Client,
+    },
+    regex::Regex,
+    std::sync::mpsc,
+};
 
 // ---------------------------------------------------------------------------
 // Log view state
@@ -102,7 +107,10 @@ impl LogViewState {
                 | Some(ci) => {
                     let active = self.active_containers();
                     let name = active.get(ci);
-                    pod.containers.iter().filter(|c| name.map(|n| n == *c).unwrap_or(false)).collect()
+                    pod.containers
+                        .iter()
+                        .filter(|c| name.map(|n| n == *c).unwrap_or(false))
+                        .collect()
                 },
                 | None => pod.containers.iter().collect(),
             };
@@ -134,7 +142,11 @@ impl LogViewState {
         if self.filter_text.is_empty() {
             self.lines.iter().map(|s| s.as_str()).collect()
         } else if let Some(re) = &self.filter_regex {
-            self.lines.iter().filter(|l| re.is_match(l)).map(|s| s.as_str()).collect()
+            self.lines
+                .iter()
+                .filter(|l| re.is_match(l))
+                .map(|s| s.as_str())
+                .collect()
         } else {
             self.lines
                 .iter()
@@ -240,7 +252,6 @@ impl LogViewState {
         self.scroll = visible_count.saturating_sub(1);
         self.auto_scroll = true;
     }
-
 }
 
 impl Drop for LogViewState {
@@ -264,7 +275,10 @@ async fn log_stream_task(
     container_tag: String,
     tx: mpsc::Sender<String>,
 ) {
-    use futures::{AsyncBufReadExt, StreamExt};
+    use futures::{
+        AsyncBufReadExt,
+        StreamExt,
+    };
 
     let api: Api<Pod> = Api::namespaced(client, &ns);
     let lp = kube::api::LogParams {
