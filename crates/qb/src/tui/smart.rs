@@ -77,6 +77,22 @@ impl SecretDetailState {
 }
 
 // ---------------------------------------------------------------------------
+// Dict entry selection state (labels/annotations)
+// ---------------------------------------------------------------------------
+
+/// Mutable state passed into renderers so `dict_section` can register selectable entries.
+pub struct DictState {
+    /// All dict entries across all sections: (qualified_key, display_key, value).
+    pub entries: Vec<(String, String, String)>,
+    /// Line offset where each entry starts in the rendered output.
+    pub line_offsets: Vec<usize>,
+    /// Currently selected entry index, if any.
+    pub cursor: Option<usize>,
+    /// Which entries are expanded.
+    pub expanded: std::collections::HashSet<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -84,35 +100,37 @@ pub fn render(
     rt: ResourceType,
     v: &Value,
     secret_state: Option<&mut SecretDetailState>,
-    expanded_keys: &std::collections::HashSet<String>,
+    dict_state: &mut DictState,
 ) -> Vec<Line<'static>> {
-    let ek = expanded_keys;
+    dict_state.entries.clear();
+    dict_state.line_offsets.clear();
+    let ds = &mut *dict_state;
     match rt {
-        | ResourceType::Deployment => render_deployment(v, ek),
-        | ResourceType::StatefulSet => render_statefulset(v, ek),
-        | ResourceType::DaemonSet => render_daemonset(v, ek),
-        | ResourceType::ReplicaSet => render_replicaset(v, ek),
-        | ResourceType::Pod => render_pod(v, ek),
-        | ResourceType::CronJob => render_cronjob(v, ek),
-        | ResourceType::Job => render_job(v, ek),
-        | ResourceType::HorizontalPodAutoscaler => render_hpa(v, ek),
-        | ResourceType::ConfigMap => render_configmap(v, ek),
-        | ResourceType::Secret => render_secret(v, secret_state, ek),
-        | ResourceType::Service => render_service(v, ek),
-        | ResourceType::Ingress => render_ingress(v, ek),
-        | ResourceType::Endpoints => render_endpoints(v, ek),
-        | ResourceType::NetworkPolicy => render_network_policy(v, ek),
-        | ResourceType::PersistentVolumeClaim => render_pvc(v, ek),
-        | ResourceType::PersistentVolume => render_pv(v, ek),
-        | ResourceType::StorageClass => render_storage_class(v, ek),
-        | ResourceType::ServiceAccount => render_service_account(v, ek),
-        | ResourceType::Role => render_role(v, ek),
-        | ResourceType::RoleBinding => render_role_binding(v, ek),
-        | ResourceType::ClusterRole => render_role(v, ek),
-        | ResourceType::ClusterRoleBinding => render_role_binding(v, ek),
-        | ResourceType::Node => render_node(v, ek),
-        | ResourceType::Namespace => render_namespace(v, ek),
-        | ResourceType::Event => render_event(v, ek),
+        | ResourceType::Deployment => render_deployment(v, ds),
+        | ResourceType::StatefulSet => render_statefulset(v, ds),
+        | ResourceType::DaemonSet => render_daemonset(v, ds),
+        | ResourceType::ReplicaSet => render_replicaset(v, ds),
+        | ResourceType::Pod => render_pod(v, ds),
+        | ResourceType::CronJob => render_cronjob(v, ds),
+        | ResourceType::Job => render_job(v, ds),
+        | ResourceType::HorizontalPodAutoscaler => render_hpa(v, ds),
+        | ResourceType::ConfigMap => render_configmap(v, ds),
+        | ResourceType::Secret => render_secret(v, secret_state, ds),
+        | ResourceType::Service => render_service(v, ds),
+        | ResourceType::Ingress => render_ingress(v, ds),
+        | ResourceType::Endpoints => render_endpoints(v, ds),
+        | ResourceType::NetworkPolicy => render_network_policy(v, ds),
+        | ResourceType::PersistentVolumeClaim => render_pvc(v, ds),
+        | ResourceType::PersistentVolume => render_pv(v, ds),
+        | ResourceType::StorageClass => render_storage_class(v, ds),
+        | ResourceType::ServiceAccount => render_service_account(v, ds),
+        | ResourceType::Role => render_role(v, ds),
+        | ResourceType::RoleBinding => render_role_binding(v, ds),
+        | ResourceType::ClusterRole => render_role(v, ds),
+        | ResourceType::ClusterRoleBinding => render_role_binding(v, ds),
+        | ResourceType::Node => render_node(v, ds),
+        | ResourceType::Namespace => render_namespace(v, ds),
+        | ResourceType::Event => render_event(v, ds),
     }
 }
 
@@ -120,8 +138,8 @@ pub fn render(
 // Per-type renderers
 // ---------------------------------------------------------------------------
 
-fn render_deployment(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Deployment", ek);
+fn render_deployment(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Deployment", ds);
 
     let replicas = ji(v, "spec.replicas").unwrap_or(0);
     let ready = ji(v, "status.readyReplicas").unwrap_or(0);
@@ -150,8 +168,8 @@ fn render_deployment(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<L
     l
 }
 
-fn render_statefulset(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "StatefulSet", ek);
+fn render_statefulset(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "StatefulSet", ds);
 
     let replicas = ji(v, "spec.replicas").unwrap_or(0);
     let ready = ji(v, "status.readyReplicas").unwrap_or(0);
@@ -172,8 +190,8 @@ fn render_statefulset(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<
     l
 }
 
-fn render_replicaset(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "ReplicaSet", ek);
+fn render_replicaset(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "ReplicaSet", ds);
 
     let desired = ji(v, "spec.replicas").unwrap_or(0);
     let current = ji(v, "status.replicas").unwrap_or(0);
@@ -197,8 +215,8 @@ fn render_replicaset(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<L
     l
 }
 
-fn render_pod(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Pod", ek);
+fn render_pod(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Pod", ds);
 
     field(&mut l, "Phase", &js(v, "status.phase"));
 
@@ -251,8 +269,8 @@ fn render_pod(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'st
     l
 }
 
-fn render_cronjob(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "CronJob", ek);
+fn render_cronjob(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "CronJob", ds);
 
     field(&mut l, "Schedule", &js(v, "spec.schedule"));
 
@@ -280,8 +298,8 @@ fn render_cronjob(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line
     l
 }
 
-fn render_job(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Job", ek);
+fn render_job(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Job", ds);
 
     let completions = ji(v, "spec.completions").unwrap_or(1);
     let succeeded = ji(v, "status.succeeded").unwrap_or(0);
@@ -312,8 +330,8 @@ fn render_job(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'st
     l
 }
 
-fn render_configmap(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "ConfigMap", ek);
+fn render_configmap(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "ConfigMap", ds);
 
     if let Some(data) = v.get("data").and_then(|d| d.as_object()) {
         blank(&mut l);
@@ -361,8 +379,8 @@ fn render_configmap(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Li
     l
 }
 
-fn render_secret(v: &Value, state: Option<&mut SecretDetailState>, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Secret", ek);
+fn render_secret(v: &Value, state: Option<&mut SecretDetailState>, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Secret", ds);
 
     let stype = js(v, "type");
     if !stype.is_empty() {
@@ -436,8 +454,8 @@ fn render_secret(v: &Value, state: Option<&mut SecretDetailState>, ek: &std::col
     l
 }
 
-fn render_service(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Service", ek);
+fn render_service(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Service", ds);
 
     field(&mut l, "Type", &js(v, "spec.type"));
     field(&mut l, "Cluster IP", &js(v, "spec.clusterIP"));
@@ -515,8 +533,8 @@ fn render_service(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line
     l
 }
 
-fn render_daemonset(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "DaemonSet", ek);
+fn render_daemonset(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "DaemonSet", ds);
 
     let desired = ji(v, "status.desiredNumberScheduled").unwrap_or(0);
     let current = ji(v, "status.currentNumberScheduled").unwrap_or(0);
@@ -547,8 +565,8 @@ fn render_daemonset(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Li
     l
 }
 
-fn render_hpa(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "HorizontalPodAutoscaler", ek);
+fn render_hpa(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "HorizontalPodAutoscaler", ds);
 
     let kind = js(v, "spec.scaleTargetRef.kind");
     let name = js(v, "spec.scaleTargetRef.name");
@@ -575,8 +593,8 @@ fn render_hpa(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'st
     l
 }
 
-fn render_ingress(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Ingress", ek);
+fn render_ingress(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Ingress", ds);
 
     let class = js(v, "spec.ingressClassName");
     if !class.is_empty() {
@@ -659,8 +677,8 @@ fn render_ingress(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line
     l
 }
 
-fn render_endpoints(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Endpoints", ek);
+fn render_endpoints(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Endpoints", ds);
 
     if let Some(subsets) = jget(v, "subsets").and_then(|v| v.as_array()) {
         for (i, subset) in subsets.iter().enumerate() {
@@ -725,8 +743,8 @@ fn render_endpoints(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Li
     l
 }
 
-fn render_network_policy(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "NetworkPolicy", ek);
+fn render_network_policy(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "NetworkPolicy", ds);
 
     let selector = labels_str(v, "spec.podSelector.matchLabels");
     field(&mut l, "Pod Selector", if selector.is_empty() { "<all pods>" } else { &selector });
@@ -769,8 +787,8 @@ fn render_network_policy(v: &Value, ek: &std::collections::HashSet<String>) -> V
     l
 }
 
-fn render_pvc(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "PersistentVolumeClaim", ek);
+fn render_pvc(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "PersistentVolumeClaim", ds);
 
     let phase = js(v, "status.phase");
     if !phase.is_empty() {
@@ -810,8 +828,8 @@ fn render_pvc(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'st
     l
 }
 
-fn render_pv(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "PersistentVolume", ek);
+fn render_pv(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "PersistentVolume", ds);
 
     let phase = js(v, "status.phase");
     if !phase.is_empty() {
@@ -849,8 +867,8 @@ fn render_pv(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'sta
     l
 }
 
-fn render_storage_class(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "StorageClass", ek);
+fn render_storage_class(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "StorageClass", ds);
 
     field(&mut l, "Provisioner", &js(v, "provisioner"));
 
@@ -883,8 +901,8 @@ fn render_storage_class(v: &Value, ek: &std::collections::HashSet<String>) -> Ve
     l
 }
 
-fn render_service_account(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "ServiceAccount", ek);
+fn render_service_account(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "ServiceAccount", ds);
 
     if let Some(secrets) = jget(v, "secrets").and_then(|v| v.as_array()) {
         if !secrets.is_empty() {
@@ -911,11 +929,11 @@ fn render_service_account(v: &Value, ek: &std::collections::HashSet<String>) -> 
     l
 }
 
-fn render_role(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
+fn render_role(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
     let kind = jget(v, "kind")
         .and_then(|v| v.as_str())
         .unwrap_or("Role");
-    let mut l = metadata_lines(v, kind, ek);
+    let mut l = metadata_lines(v, kind, ds);
 
     if let Some(rules) = jget(v, "rules").and_then(|v| v.as_array()) {
         blank(&mut l);
@@ -954,11 +972,11 @@ fn render_role(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'s
     l
 }
 
-fn render_role_binding(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
+fn render_role_binding(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
     let kind = jget(v, "kind")
         .and_then(|v| v.as_str())
         .unwrap_or("RoleBinding");
-    let mut l = metadata_lines(v, kind, ek);
+    let mut l = metadata_lines(v, kind, ds);
 
     let role_kind = js(v, "roleRef.kind");
     let role_name = js(v, "roleRef.name");
@@ -983,8 +1001,8 @@ fn render_role_binding(v: &Value, ek: &std::collections::HashSet<String>) -> Vec
     l
 }
 
-fn render_node(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Node", ek);
+fn render_node(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Node", ds);
 
     // Status from conditions
     if let Some(conds) = jget(v, "status.conditions").and_then(|v| v.as_array()) {
@@ -1065,8 +1083,8 @@ fn render_node(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'s
     l
 }
 
-fn render_namespace(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Namespace", ek);
+fn render_namespace(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Namespace", ds);
 
     let phase = js(v, "status.phase");
     if !phase.is_empty() {
@@ -1077,8 +1095,8 @@ fn render_namespace(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Li
     l
 }
 
-fn render_event(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
-    let mut l = metadata_lines(v, "Event", ek);
+fn render_event(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "Event", ds);
 
     let event_type = js(v, "type");
     if !event_type.is_empty() {
@@ -1148,7 +1166,7 @@ fn render_event(v: &Value, ek: &std::collections::HashSet<String>) -> Vec<Line<'
 // Shared rendering helpers
 // ---------------------------------------------------------------------------
 
-fn metadata_lines(v: &Value, kind: &str, ek: &std::collections::HashSet<String>) -> Vec<Line<'static>> {
+fn metadata_lines(v: &Value, kind: &str, ds: &mut DictState) -> Vec<Line<'static>> {
     let name = js(v, "metadata.name");
     let ns = js(v, "metadata.namespace");
     let created = js(v, "metadata.creationTimestamp");
@@ -1167,8 +1185,8 @@ fn metadata_lines(v: &Value, kind: &str, ek: &std::collections::HashSet<String>)
     }
     field(&mut l, "Created", &created);
 
-    dict_section(&mut l, v, "metadata.labels", "Labels", ek);
-    dict_section(&mut l, v, "metadata.annotations", "Annotations", ek);
+    dict_section(&mut l, v, "metadata.labels", "Labels", ds);
+    dict_section(&mut l, v, "metadata.annotations", "Annotations", ds);
 
     l
 }
@@ -1233,10 +1251,24 @@ fn resources_section(l: &mut Vec<Line<'static>>, res: &Value) {
         }
     }
 
+    // Compute column widths from data
+    let mut dim_w = 8usize; // "RESOURCE"
+    let mut req_w = 7usize; // "REQUEST"
+    for dim in &dimensions {
+        dim_w = dim_w.max(dim.len());
+        let req_val = requests
+            .and_then(|r| r.get(dim.as_str()))
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        req_w = req_w.max(req_val.len());
+    }
+    dim_w += 2;
+    req_w += 2;
+
     // Header
     l.push(Line::from(vec![
-        Span::styled(format!("    {:<16}", "RESOURCE"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:<16}", "REQUEST"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("    {:<dim_w$}", "RESOURCE"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:<req_w$}", "REQUEST"), Style::default().fg(Color::DarkGray)),
         Span::styled("LIMIT", Style::default().fg(Color::DarkGray)),
     ]));
 
@@ -1250,8 +1282,8 @@ fn resources_section(l: &mut Vec<Line<'static>>, res: &Value) {
             .and_then(|v| v.as_str())
             .unwrap_or("-");
         l.push(Line::from(vec![
-            Span::styled(format!("    {:<16}", dim), Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{:<16}", req_val), Style::default().fg(Color::Green)),
+            Span::styled(format!("    {:<dim_w$}", dim), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:<req_w$}", req_val), Style::default().fg(Color::Green)),
             Span::styled(lim_val.to_string(), Style::default().fg(Color::Yellow)),
         ]));
     }
@@ -1267,10 +1299,22 @@ fn conditions_section(l: &mut Vec<Line<'static>>, v: &Value) {
     blank(l);
     section(l, "Conditions");
 
+    // Compute column widths from data
+    let mut type_w = 4usize; // "TYPE"
+    let mut status_w = 6usize; // "STATUS"
+    for c in conditions {
+        let ctype = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let status = c.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        type_w = type_w.max(ctype.len());
+        status_w = status_w.max(status.len());
+    }
+    type_w += 2; // padding
+    status_w += 2;
+
     // Header
     l.push(Line::from(vec![
-        Span::styled(format!("  {:<22}", "TYPE"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:<10}", "STATUS"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("  {:<type_w$}", "TYPE"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:<status_w$}", "STATUS"), Style::default().fg(Color::DarkGray)),
         Span::styled("REASON", Style::default().fg(Color::DarkGray)),
     ]));
 
@@ -1286,8 +1330,8 @@ fn conditions_section(l: &mut Vec<Line<'static>>, v: &Value) {
         };
 
         l.push(Line::from(vec![
-            Span::styled(format!("  {:<22}", ctype), Style::default().fg(Color::White)),
-            Span::styled(format!("{:<10}", status), status_style),
+            Span::styled(format!("  {:<type_w$}", ctype), Style::default().fg(Color::White)),
+            Span::styled(format!("{:<status_w$}", status), status_style),
             Span::styled(reason.to_string(), Style::default().fg(Color::DarkGray)),
         ]));
     }
@@ -1319,8 +1363,10 @@ fn container_state_str(state: Option<&Value>) -> String {
 // ---------------------------------------------------------------------------
 
 fn field(l: &mut Vec<Line<'static>>, label: &str, value: &str) {
+    // Pad to at least 18 chars, but grow if label is longer (indented sub-fields)
+    let pad = label.len().max(18);
     l.push(Line::from(vec![
-        Span::styled(format!("  {:<16}", label), Style::default().fg(Color::Cyan)),
+        Span::styled(format!("  {:<pad$}", label), Style::default().fg(Color::Cyan)),
         Span::styled(value.to_string(), Style::default().fg(Color::White)),
     ]));
 }
@@ -1344,38 +1390,51 @@ fn subheading(l: &mut Vec<Line<'static>>, text: &str) {
 }
 
 /// Renders a JSON object at `path` as a labeled key=value dictionary.
-/// Shows nothing if the object is missing or empty.
-fn dict_section(l: &mut Vec<Line<'static>>, v: &Value, path: &str, title: &str, ek: &std::collections::HashSet<String>) {
+/// Registers each entry in `ds` for selection/expansion. Shows nothing if empty.
+fn dict_section(l: &mut Vec<Line<'static>>, v: &Value, path: &str, title: &str, ds: &mut DictState) {
     let map = match jget(v, path).and_then(|v| v.as_object()) {
         | Some(m) if !m.is_empty() => m,
         | _ => return,
     };
-    let truncated_count = map.values().filter(|v| v.as_str().map(|s| s.len() > 70).unwrap_or(false)).count();
-    let hint = if truncated_count > 0 {
-        format!("{} ({}, {} truncated — [e] expand)", title, map.len(), truncated_count)
-    } else {
-        format!("{} ({})", title, map.len())
-    };
     blank(l);
-    section(l, &hint);
+    section(l, &format!("{} ({})", title, map.len()));
     for (k, val) in map {
         let val_str = val.as_str().unwrap_or("");
-        let expanded = ek.contains(&format!("{}:{}", title, k));
+        let qualified_key = format!("{}:{}", title, k);
+        let entry_idx = ds.entries.len();
+        ds.entries.push((qualified_key.clone(), k.clone(), val_str.to_string()));
+        ds.line_offsets.push(l.len());
+
+        let is_selected = ds.cursor == Some(entry_idx);
+        let expanded = ds.expanded.contains(&qualified_key);
         let is_long = val_str.len() > 70;
+
+        let marker = if is_selected { "▸ " } else { "  " };
+        let key_style = if is_selected {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+
         if is_long && !expanded {
-            // Truncated single-line with "..." indicator
-            l.push(Line::from(vec![
-                Span::styled(format!("    {}", k), Style::default().fg(Color::Cyan)),
+            let mut line = Line::from(vec![
+                Span::styled(format!("  {}{}", marker, k), key_style),
                 Span::styled(": ", Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{}...", &val_str[..70]), Style::default().fg(Color::White)),
-            ]));
+            ]);
+            if is_selected {
+                line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            l.push(line);
         } else if is_long {
-            // Expanded: show key on its own line, then the full value wrapped
-            l.push(Line::from(vec![
-                Span::styled(format!("    {}", k), Style::default().fg(Color::Cyan)),
+            let mut header_line = Line::from(vec![
+                Span::styled(format!("  {}{}", marker, k), key_style),
                 Span::styled(":", Style::default().fg(Color::DarkGray)),
-            ]));
-            // Word-wrap at ~100 chars per line
+            ]);
+            if is_selected {
+                header_line = header_line.style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            l.push(header_line);
             for chunk in wrap_str(val_str, 100) {
                 l.push(Line::from(Span::styled(
                     format!("      {}", chunk),
@@ -1383,11 +1442,15 @@ fn dict_section(l: &mut Vec<Line<'static>>, v: &Value, path: &str, title: &str, 
                 )));
             }
         } else {
-            l.push(Line::from(vec![
-                Span::styled(format!("    {}", k), Style::default().fg(Color::Cyan)),
+            let mut line = Line::from(vec![
+                Span::styled(format!("  {}{}", marker, k), key_style),
                 Span::styled(": ", Style::default().fg(Color::DarkGray)),
                 Span::styled(val_str.to_string(), Style::default().fg(Color::White)),
-            ]));
+            ]);
+            if is_selected {
+                line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            l.push(line);
         }
     }
 }

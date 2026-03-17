@@ -203,16 +203,21 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let all_ns = app.kube.is_all_namespaces();
     let base_headers = rt.column_headers();
 
-    let mut header_cells: Vec<Cell> = Vec::new();
-    let header_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    header_cells.push(Cell::from(base_headers[0]).style(header_style));
+    // Build logical columns: [NAME, (NAMESPACE)?, col1, col2, ...]
+    let mut col_headers: Vec<&str> = vec![base_headers[0]];
     if all_ns {
-        header_cells.push(Cell::from("NAMESPACE").style(header_style));
+        col_headers.push("NAMESPACE");
     }
-    for h in &base_headers[1..] {
-        header_cells.push(Cell::from(*h).style(header_style));
-    }
-    let header = Row::new(header_cells).height(1);
+    col_headers.extend(&base_headers[1..]);
+
+    let header_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let header = Row::new(
+        col_headers
+            .iter()
+            .map(|h| Cell::from(*h).style(header_style))
+            .collect::<Vec<_>>(),
+    )
+    .height(1);
 
     let rows: Vec<Row> = visible_indices
         .iter()
@@ -229,12 +234,35 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let mut constraints: Vec<Constraint> = vec![Constraint::Min(20)];
-    if all_ns {
-        constraints.push(Constraint::Length(20));
+    // Compute column widths from header + data content
+    let num_cols = col_headers.len();
+    let mut max_widths: Vec<usize> = col_headers.iter().map(|h| h.len()).collect();
+    for &idx in &visible_indices {
+        let entry = &app.resources[idx];
+        // Column 0 = NAME
+        max_widths[0] = max_widths[0].max(entry.name.len());
+        let data_start = if all_ns {
+            max_widths[1] = max_widths[1].max(entry.namespace.len());
+            2
+        } else {
+            1
+        };
+        for (i, col) in entry.columns.iter().enumerate() {
+            let ci = data_start + i;
+            if ci < num_cols {
+                max_widths[ci] = max_widths[ci].max(col.len());
+            }
+        }
     }
-    for _ in 1..base_headers.len() {
-        constraints.push(Constraint::Length(16));
+    // Add padding (2 chars) and cap individual columns at 50 to prevent blowout
+    for w in &mut max_widths {
+        *w = (*w + 2).min(50);
+    }
+    // NAME column (first) is flexible; all others are fixed width
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(num_cols);
+    constraints.push(Constraint::Min(max_widths[0] as u16));
+    for &w in &max_widths[1..] {
+        constraints.push(Constraint::Length(w as u16));
     }
 
     let focused = app.focus == Focus::Resources;
@@ -806,7 +834,24 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
         | Some(rt) => rt,
         | None => return vec![],
     };
-    smart::render(rt, &app.detail_value, app.secret_state.as_mut(), &app.expanded_keys)
+    let mut ds = smart::DictState {
+        entries: Vec::new(),
+        line_offsets: Vec::new(),
+        cursor: app.dict_cursor,
+        expanded: app.expanded_keys.clone(),
+    };
+    let lines = smart::render(rt, &app.detail_value, app.secret_state.as_mut(), &mut ds);
+    // Sync state back to App
+    app.dict_entries = ds.entries;
+    app.dict_line_offsets = ds.line_offsets;
+    app.expanded_keys = ds.expanded;
+    // Clamp cursor if entries changed
+    if let Some(c) = app.dict_cursor {
+        if c >= app.dict_entries.len() {
+            app.dict_cursor = if app.dict_entries.is_empty() { None } else { Some(app.dict_entries.len() - 1) };
+        }
+    }
+    lines
 }
 
 fn render_yaml_lines(yaml: &str) -> Vec<Line<'_>> {
@@ -1072,52 +1117,72 @@ fn build_detail_hotkey_bar(app: &App) -> Line<'static> {
         sep.clone(),
     ];
 
+    // [v] cycle view
+    let view_label = match app.detail_mode {
+        | DetailMode::Smart => " YAML",
+        | DetailMode::Yaml => " Smart",
+    };
+    spans.extend([
+        Span::styled(" v ", key_style),
+        Span::styled(view_label, label_style),
+        sep.clone(),
+    ]);
+
     if is_secret_smart {
         spans.extend([
-            Span::styled(" d ", key_style),
+            Span::styled(" j/k ", key_style),
+            Span::styled(" Navigate", label_style),
+            sep.clone(),
+            Span::styled(" Space ", key_style),
             Span::styled(" Decode", label_style),
             sep.clone(),
             Span::styled(" y ", key_style),
             Span::styled(" Copy", label_style),
-            sep.clone(),
-            Span::styled(" j/k ", key_style),
-            Span::styled(" Navigate", label_style),
         ]);
-    } else {
-        // Show view toggle
-        match app.detail_mode {
-            | DetailMode::Smart => {
+    } else if app.detail_mode == DetailMode::Smart {
+        let has_dict = !app.dict_entries.is_empty();
+        if app.dict_cursor.is_some() {
+            // In selection mode
+            spans.extend([
+                Span::styled(" j/k ", key_style),
+                Span::styled(" Navigate", label_style),
+                sep.clone(),
+                Span::styled(" Space ", key_style),
+                Span::styled(" Expand", label_style),
+                sep.clone(),
+                Span::styled(" y ", key_style),
+                Span::styled(" Copy", label_style),
+                sep.clone(),
+                Span::styled(" e ", key_style),
+                Span::styled(" Done", label_style),
+                sep.clone(),
+            ]);
+        } else {
+            spans.extend([
+                Span::styled(" j/k ", key_style),
+                Span::styled(" Scroll", label_style),
+                sep.clone(),
+            ]);
+            if has_dict {
                 spans.extend([
-                    Span::styled(" y ", key_style),
-                    Span::styled(" YAML", label_style),
+                    Span::styled(" e ", key_style),
+                    Span::styled(" Select", label_style),
                     sep.clone(),
                 ]);
-            },
-            | DetailMode::Yaml => {
-                spans.extend([
-                    Span::styled(" s ", key_style),
-                    Span::styled(" Smart", label_style),
-                    sep.clone(),
-                ]);
-            },
+            }
         }
+    } else {
         spans.extend([
+            Span::styled(" y ", key_style),
+            Span::styled(" Copy", label_style),
+            sep.clone(),
             Span::styled(" j/k ", key_style),
             Span::styled(" Scroll", label_style),
-        ]);
-    }
-
-    // [e] expand/collapse labels & annotations
-    if app.detail_mode == DetailMode::Smart && !is_secret_smart {
-        let expand_label = if app.expanded_keys.is_empty() { " Expand" } else { " Collapse" };
-        spans.extend([
             sep.clone(),
-            Span::styled(" e ", key_style),
-            Span::styled(expand_label, label_style),
         ]);
     }
 
-    spans.extend([sep.clone(), Span::styled(" PgUp/Dn ", key_style), Span::styled(" Page", label_style)]);
+    spans.extend([Span::styled(" PgUp/Dn ", key_style), Span::styled(" Page", label_style)]);
 
     // Show [l] Logs for workload resources
     if app.selected_resource_type.map(|rt| rt.supports_logs()).unwrap_or(false) {

@@ -97,9 +97,15 @@ pub struct App {
     pub detail_scroll: u16,
     pub detail_mode: DetailMode,
     pub secret_state: Option<SecretDetailState>,
-    /// Tracks which label/annotation keys are expanded (not truncated) in smart view.
-    /// Keys are stored as "section:key", e.g. "Labels:app.kubernetes.io/name".
+    /// Tracks which label/annotation keys are expanded in smart view.
     pub expanded_keys: std::collections::HashSet<String>,
+    /// Ordered list of all label/annotation dict entries: ("section:key", "key", "value").
+    /// Populated each render by smart.rs. Enables j/k navigation and y copy.
+    pub dict_entries: Vec<(String, String, String)>,
+    /// Currently selected dict entry index (into dict_entries).
+    pub dict_cursor: Option<usize>,
+    /// Line offsets for each dict entry (for click mapping). Populated each render.
+    pub dict_line_offsets: Vec<usize>,
 
     // UI state
     pub focus: Focus,
@@ -155,6 +161,9 @@ impl App {
             detail_mode: DetailMode::Smart,
             secret_state: None,
             expanded_keys: std::collections::HashSet::new(),
+            dict_entries: Vec::new(),
+            dict_cursor: None,
+            dict_line_offsets: Vec::new(),
             log_state: None,
             resource_filter_text: String::new(),
             resource_filter_regex: None,
@@ -438,6 +447,9 @@ impl App {
                     self.detail_scroll = 0;
                     self.detail_mode = DetailMode::Smart;
                     self.expanded_keys.clear();
+                    self.dict_entries.clear();
+                    self.dict_cursor = None;
+                    self.dict_line_offsets.clear();
                     self.view = View::Detail;
                     self.error = None;
                 },
@@ -1025,39 +1037,53 @@ impl App {
 
         match key.code {
             | KeyCode::Esc | KeyCode::Char('q') => {
+                self.dict_cursor = None;
                 self.view = View::Main;
                 self.focus = Focus::Resources;
             },
-            // [s] Smart view
-            | KeyCode::Char('s') => {
-                if self.detail_mode != DetailMode::Smart {
-                    self.detail_mode = DetailMode::Smart;
-                    self.detail_scroll = 0;
-                }
+            // [v] Cycle view: Smart → YAML → Smart
+            | KeyCode::Char('v') => {
+                self.detail_mode = match self.detail_mode {
+                    | DetailMode::Smart => DetailMode::Yaml,
+                    | DetailMode::Yaml => DetailMode::Smart,
+                };
+                self.detail_scroll = 0;
             },
-            // [y] YAML view — or copy in secret smart view
+            // [y] Copy to clipboard
             | KeyCode::Char('y') => {
                 if secret_smart {
                     self.copy_secret_to_clipboard();
-                } else if self.detail_mode != DetailMode::Yaml {
-                    self.detail_mode = DetailMode::Yaml;
-                    self.detail_scroll = 0;
+                } else if self.detail_mode == DetailMode::Yaml {
+                    self.copy_yaml_to_clipboard();
+                } else if self.dict_cursor.is_some() {
+                    self.copy_dict_entry_to_clipboard();
                 }
             },
-            // [d] Decode secret value
-            | KeyCode::Char('d') => {
+            // [Space] Expand/decode selected item
+            | KeyCode::Char(' ') => {
                 if secret_smart {
                     if let Some(state) = &mut self.secret_state {
                         state.toggle_decode();
                     }
+                } else if let Some(cursor) = self.dict_cursor {
+                    if let Some((qualified_key, _, _)) = self.dict_entries.get(cursor) {
+                        let key = qualified_key.clone();
+                        if self.expanded_keys.contains(&key) {
+                            self.expanded_keys.remove(&key);
+                        } else {
+                            self.expanded_keys.insert(key);
+                        }
+                    }
                 }
             },
-            // j/k: navigate secret keys in secret smart view, scroll otherwise
+            // j/k: navigate dict entries (when selected) or secret keys, scroll otherwise
             | KeyCode::Up | KeyCode::Char('k') => {
                 if secret_smart {
                     if let Some(state) = &mut self.secret_state {
                         state.nav_up();
                     }
+                } else if self.dict_cursor.is_some() {
+                    self.dict_nav_up();
                 } else {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
                 }
@@ -1067,6 +1093,8 @@ impl App {
                     if let Some(state) = &mut self.secret_state {
                         state.nav_down();
                     }
+                } else if self.dict_cursor.is_some() {
+                    self.dict_nav_down();
                 } else {
                     self.detail_scroll = self.detail_scroll.saturating_add(1);
                 }
@@ -1080,13 +1108,15 @@ impl App {
             | KeyCode::Home => {
                 self.detail_scroll = 0;
             },
-            // [e] Expand/collapse all labels & annotations
+            // [e] Enter/leave label/annotation selection mode
             | KeyCode::Char('e') => {
-                if self.expanded_keys.is_empty() {
-                    // Expand all: collect all truncated keys from labels & annotations
-                    self.expand_all_dict_keys();
-                } else {
-                    self.expanded_keys.clear();
+                if secret_smart {
+                    // no-op for secrets
+                } else if self.dict_cursor.is_some() {
+                    self.dict_cursor = None;
+                } else if !self.dict_entries.is_empty() {
+                    self.dict_cursor = Some(0);
+                    self.scroll_to_dict_cursor();
                 }
             },
             // [l] Open logs (for workload resources)
@@ -1097,21 +1127,75 @@ impl App {
         }
     }
 
-    fn expand_all_dict_keys(&mut self) {
-        for section_name in &["Labels", "Annotations"] {
-            let path = if *section_name == "Labels" {
-                "metadata.labels"
-            } else {
-                "metadata.annotations"
-            };
-            if let Some(map) = self
-                .detail_value
-                .get("metadata")
-                .and_then(|m| m.get(path.rsplit('.').next().unwrap_or("")))
-                .and_then(|v| v.as_object())
-            {
-                for k in map.keys() {
-                    self.expanded_keys.insert(format!("{}:{}", section_name, k));
+    fn dict_nav_up(&mut self) {
+        match self.dict_cursor {
+            | Some(0) => {
+                self.dict_cursor = None;
+            },
+            | Some(i) => {
+                self.dict_cursor = Some(i - 1);
+                self.scroll_to_dict_cursor();
+            },
+            | None => {},
+        }
+    }
+
+    fn dict_nav_down(&mut self) {
+        let max = self.dict_entries.len().saturating_sub(1);
+        match self.dict_cursor {
+            | Some(i) if i >= max => {
+                self.dict_cursor = None;
+            },
+            | Some(i) => {
+                self.dict_cursor = Some(i + 1);
+                self.scroll_to_dict_cursor();
+            },
+            | None => {},
+        }
+    }
+
+    /// Scroll the detail view to keep the selected dict entry visible.
+    fn scroll_to_dict_cursor(&mut self) {
+        if let Some(cursor) = self.dict_cursor {
+            if let Some(&line_offset) = self.dict_line_offsets.get(cursor) {
+                let scroll = self.detail_scroll as usize;
+                // Rough visible height estimate (will be exact next frame)
+                let visible_height = 30usize;
+                if line_offset < scroll {
+                    self.detail_scroll = line_offset as u16;
+                } else if line_offset >= scroll + visible_height {
+                    self.detail_scroll = line_offset.saturating_sub(visible_height / 2) as u16;
+                }
+            }
+        }
+    }
+
+    fn copy_yaml_to_clipboard(&mut self) {
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&self.detail_yaml)) {
+            | Ok(()) => {
+                self.error = None;
+                self.status = format!("Copied YAML ({} bytes)", self.detail_yaml.len());
+            },
+            | Err(e) => {
+                self.error = Some(format!("Clipboard error: {}", e));
+            },
+        }
+    }
+
+    fn copy_dict_entry_to_clipboard(&mut self) {
+        if let Some(cursor) = self.dict_cursor {
+            if let Some((_, key, value)) = self.dict_entries.get(cursor) {
+                let key = key.clone();
+                let value = value.clone();
+                let text = format!("{}: {}", key, value);
+                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+                    | Ok(()) => {
+                        self.error = None;
+                        self.status = format!("Copied '{}' ({} bytes)", key, value.len());
+                    },
+                    | Err(e) => {
+                        self.error = Some(format!("Clipboard error: {}", e));
+                    },
                 }
             }
         }
