@@ -37,6 +37,46 @@ pub enum View {
     Main,
     Detail,
     Logs,
+    EditDiff,
+}
+
+// ---------------------------------------------------------------------------
+// Edit state
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DiffKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DiffMode {
+    Inline,
+    SideBySide,
+}
+
+pub struct EditContext {
+    pub resource_type: ResourceType,
+    pub name: String,
+    pub namespace: String,
+    #[allow(dead_code)]
+    pub original_yaml: String,
+    pub edited_yaml: String,
+    pub diff_lines: Vec<(DiffKind, String)>,
+    pub diff_mode: DiffMode,
+    pub scroll: u16,
+    pub error: Option<String>,
+}
+
+/// Set by key handler, consumed by the event loop to suspend TUI and run
+/// $EDITOR.
+pub struct PendingEdit {
+    pub resource_type: ResourceType,
+    pub name: String,
+    pub namespace: String,
+    pub yaml: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -112,6 +152,12 @@ pub struct App {
     pub detail_scroll: u16,
     pub detail_mode: DetailMode,
     pub secret_state: Option<SecretDetailState>,
+    pub detail_name: String,
+    pub detail_namespace: String,
+
+    // Edit
+    pub pending_edit: Option<PendingEdit>,
+    pub edit_ctx: Option<EditContext>,
     /// Tracks which label/annotation keys are expanded in smart view.
     pub expanded_keys: std::collections::HashSet<String>,
     /// Ordered list of all label/annotation dict entries: ("section:key",
@@ -148,6 +194,7 @@ pub struct App {
     pub events_auto_scroll: bool,
 
     // Auto-refresh
+    pub paused: bool,
     pub last_refresh: std::time::Instant,
 
     // Click areas — updated each render by ui.rs
@@ -177,6 +224,10 @@ impl App {
             detail_scroll: 0,
             detail_mode: DetailMode::Smart,
             secret_state: None,
+            detail_name: String::new(),
+            detail_namespace: String::new(),
+            pending_edit: None,
+            edit_ctx: None,
             expanded_keys: std::collections::HashSet::new(),
             dict_entries: Vec::new(),
             dict_cursor: None,
@@ -189,6 +240,7 @@ impl App {
             events_scroll: 0,
             events_cursor: 0,
             events_auto_scroll: true,
+            paused: false,
             focus: Focus::Nav,
             view: View::Main,
             popup: None,
@@ -342,8 +394,11 @@ impl App {
     }
 
     /// Poll the log stream channel for new lines (called every event loop
-    /// tick).
+    /// tick). Paused state suppresses polling.
     pub fn poll_log_stream(&mut self) {
+        if self.paused {
+            return;
+        }
         if let Some(state) = &mut self.log_state {
             state.poll_stream();
         }
@@ -399,6 +454,9 @@ impl App {
     }
 
     pub fn maybe_auto_refresh(&mut self) {
+        if self.paused {
+            return;
+        }
         if self.view == View::Main
             && self.popup.is_none()
             && self.pending_load.is_none()
@@ -460,6 +518,8 @@ impl App {
                         None
                     };
                     self.detail_value = value;
+                    self.detail_name = name.to_string();
+                    self.detail_namespace = ns.to_string();
                     self.detail_scroll = 0;
                     self.detail_mode = DetailMode::Smart;
                     self.expanded_keys.clear();
@@ -787,6 +847,20 @@ impl App {
             return;
         }
 
+        // [p] Toggle pause — global, works in any view (except popups/filter editing)
+        if key.code == KeyCode::Char('p') && self.popup.is_none() && !self.resource_filter_editing {
+            // Don't consume 'p' in log view (used for pod selector) or edit diff view
+            if self.view != View::Logs && self.view != View::EditDiff {
+                self.paused = !self.paused;
+                self.status = if self.paused {
+                    "Paused — auto-refresh disabled".into()
+                } else {
+                    "Resumed — auto-refresh enabled".into()
+                };
+                return;
+            }
+        }
+
         if self.popup.is_some() {
             self.handle_popup_key(key);
             return;
@@ -799,6 +873,11 @@ impl App {
 
         if self.view == View::Logs {
             self.handle_log_key(key);
+            return;
+        }
+
+        if self.view == View::EditDiff {
+            self.handle_edit_diff_key(key);
             return;
         }
 
@@ -1006,6 +1085,9 @@ impl App {
             | KeyCode::Char('l') => {
                 self.open_logs_for_selected();
             },
+            | KeyCode::Char('e') => {
+                self.start_edit_from_list();
+            },
             | _ => {},
         }
     }
@@ -1132,8 +1214,8 @@ impl App {
             | KeyCode::Home => {
                 self.detail_scroll = 0;
             },
-            // [e] Enter/leave label/annotation selection mode
-            | KeyCode::Char('e') => {
+            // [s] Enter/leave label/annotation selection mode
+            | KeyCode::Char('s') => {
                 if secret_smart {
                     // no-op for secrets
                 } else if self.dict_cursor.is_some() {
@@ -1142,6 +1224,10 @@ impl App {
                     self.dict_cursor = Some(0);
                     self.scroll_to_dict_cursor();
                 }
+            },
+            // [e] Edit resource
+            | KeyCode::Char('e') => {
+                self.start_edit_from_detail();
             },
             // [l] Open logs (for workload resources)
             | KeyCode::Char('l') => {
@@ -1500,4 +1586,200 @@ impl App {
         state.select(Some(sel));
         self.popup = Some(Popup::ContainerSelect { items, state });
     }
+
+    // -----------------------------------------------------------------------
+    // Edit flow
+    // -----------------------------------------------------------------------
+
+    /// Start edit from the resource list view: fetch YAML for the selected
+    /// resource.
+    fn start_edit_from_list(&mut self) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) => rt,
+            | None => return,
+        };
+        // Resolve the selected resource
+        let visible = self.visible_resource_indices();
+        let vis_pos = self
+            .resource_state
+            .selected()
+            .and_then(|sel| visible.iter().position(|&i| i == sel))
+            .unwrap_or(0);
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+            | Some(e) => e,
+            | None => return,
+        };
+        let name = entry.name.clone();
+        let namespace = entry.namespace.clone();
+
+        // Fetch the resource YAML
+        match self.rt.block_on(self.kube.get_resource(rt, &namespace, &name)) {
+            | Ok(value) => {
+                let yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                self.pending_edit = Some(PendingEdit {
+                    resource_type: rt,
+                    name,
+                    namespace,
+                    yaml,
+                });
+            },
+            | Err(e) => {
+                self.error = Some(format!("Failed to fetch resource: {}", e));
+            },
+        }
+    }
+
+    /// Start edit from the detail view: use the already-loaded YAML.
+    fn start_edit_from_detail(&mut self) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) => rt,
+            | None => return,
+        };
+        self.pending_edit = Some(PendingEdit {
+            resource_type: rt,
+            name: self.detail_name.clone(),
+            namespace: self.detail_namespace.clone(),
+            yaml: self.detail_yaml.clone(),
+        });
+    }
+
+    /// Called by the event loop after the editor exits. Computes the diff.
+    pub fn handle_edit_result(&mut self, edit: PendingEdit, edited_yaml: String) {
+        if edited_yaml.trim() == edit.yaml.trim() {
+            self.status = "No changes".into();
+            return;
+        }
+
+        let diff_lines = compute_diff(&edit.yaml, &edited_yaml);
+
+        self.edit_ctx = Some(EditContext {
+            resource_type: edit.resource_type,
+            name: edit.name,
+            namespace: edit.namespace,
+            original_yaml: edit.yaml,
+            edited_yaml,
+            diff_lines,
+            diff_mode: DiffMode::Inline,
+            scroll: 0,
+            error: None,
+        });
+        self.view = View::EditDiff;
+    }
+
+    /// Key handler for the diff preview view.
+    pub fn handle_edit_diff_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Esc | KeyCode::Char('q') => {
+                self.edit_ctx = None;
+                // Return to previous view
+                if self.detail_name.is_empty() {
+                    self.view = View::Main;
+                } else {
+                    self.view = View::Detail;
+                }
+            },
+            | KeyCode::Char('v') => {
+                if let Some(ctx) = &mut self.edit_ctx {
+                    ctx.diff_mode = match ctx.diff_mode {
+                        | DiffMode::Inline => DiffMode::SideBySide,
+                        | DiffMode::SideBySide => DiffMode::Inline,
+                    };
+                    ctx.scroll = 0;
+                }
+            },
+            | KeyCode::Enter => {
+                self.apply_edit();
+            },
+            | KeyCode::Char('e') => {
+                // Re-edit: reopen editor with the edited YAML
+                if let Some(ctx) = self.edit_ctx.take() {
+                    self.pending_edit = Some(PendingEdit {
+                        resource_type: ctx.resource_type,
+                        name: ctx.name,
+                        namespace: ctx.namespace,
+                        yaml: ctx.edited_yaml,
+                    });
+                }
+            },
+            | KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(ctx) = &mut self.edit_ctx {
+                    ctx.scroll = ctx.scroll.saturating_sub(1);
+                }
+            },
+            | KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(ctx) = &mut self.edit_ctx {
+                    ctx.scroll = ctx.scroll.saturating_add(1);
+                }
+            },
+            | KeyCode::PageUp => {
+                if let Some(ctx) = &mut self.edit_ctx {
+                    ctx.scroll = ctx.scroll.saturating_sub(20);
+                }
+            },
+            | KeyCode::PageDown => {
+                if let Some(ctx) = &mut self.edit_ctx {
+                    ctx.scroll = ctx.scroll.saturating_add(20);
+                }
+            },
+            | _ => {},
+        }
+    }
+
+    fn apply_edit(&mut self) {
+        let ctx = match &self.edit_ctx {
+            | Some(c) => c,
+            | None => return,
+        };
+        let rt = ctx.resource_type;
+        let ns = ctx.namespace.clone();
+        let name = ctx.name.clone();
+        let yaml = ctx.edited_yaml.clone();
+
+        match self.rt.block_on(self.kube.replace_resource_yaml(rt, &ns, &name, &yaml)) {
+            | Ok(value) => {
+                self.status = format!("Applied changes to {}/{}", rt.display_name(), name);
+                self.error = None;
+                // Refresh the detail view with updated data
+                self.detail_yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                self.detail_value = value;
+                self.detail_name = name;
+                self.detail_namespace = ns;
+                self.edit_ctx = None;
+                self.view = View::Detail;
+            },
+            | Err(e) => {
+                // Stay on diff view, show error, allow re-edit
+                if let Some(ctx) = &mut self.edit_ctx {
+                    ctx.error = Some(format!("{}", e));
+                }
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diff computation
+// ---------------------------------------------------------------------------
+
+fn compute_diff(original: &str, edited: &str) -> Vec<(DiffKind, String)> {
+    use similar::{
+        ChangeTag,
+        TextDiff,
+    };
+    let diff = TextDiff::from_lines(original, edited);
+    let mut lines = Vec::new();
+    for change in diff.iter_all_changes() {
+        let kind = match change.tag() {
+            | ChangeTag::Equal => DiffKind::Context,
+            | ChangeTag::Insert => DiffKind::Added,
+            | ChangeTag::Delete => DiffKind::Removed,
+        };
+        let prefix = match kind {
+            | DiffKind::Context => "  ",
+            | DiffKind::Added => "+ ",
+            | DiffKind::Removed => "- ",
+        };
+        lines.push((kind, format!("{}{}", prefix, change.value().trim_end())));
+    }
+    lines
 }

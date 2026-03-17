@@ -6,9 +6,9 @@
 
 ## Project
 
-qb is a ratatui-based terminal UI for browsing Kubernetes clusters. It talks directly to the
-K8s API server via the `kube` crate using kubeconfig — no kubectl dependency. Single binary,
-no external frontend, no remote services.
+qb is a ratatui-based terminal UI for browsing and editing Kubernetes clusters. It talks
+directly to the K8s API server via the `kube` crate using kubeconfig — no kubectl dependency.
+Single binary, no external frontend, no remote services.
 
 **Workspace layout**: `crates/qb/` is the sole crate. Workspace root at `Cargo.toml`.
 
@@ -16,12 +16,15 @@ no external frontend, no remote services.
 crates/qb/src/
   main.rs          Entry point, CLI routing
   args.rs          CLI argument parsing (clap derive)
-  k8s/mod.rs       K8s API client, resource types, pod resolution, log fetching, cluster stats
-  tui/mod.rs       Terminal setup, event loop (render → load → poll logs → poll input)
+  k8s/mod.rs       K8s API client, resource types, pod resolution, log fetching, cluster stats,
+                   resource editing (replace via DynamicObject)
+  tui/mod.rs       Terminal setup, event loop (render → load → poll logs → poll input),
+                   external editor invocation (suspend/resume terminal)
   tui/app.rs       App struct (all state), key/mouse handlers, deferred loading, filter state,
-                   dict entry selection/expansion
+                   dict entry selection/expansion, edit flow (diff, apply, re-edit)
   tui/ui.rs        Rendering: main view, detail view, log view, events log, cluster stats,
-                   popups, breadcrumb, hotkey bars, node grid cards, gauge bars
+                   edit diff view (inline + side-by-side), popups, breadcrumb with refresh
+                   indicator, hotkey bars, node grid cards, gauge bars
   tui/smart.rs     Per-resource-type structured renderers, SecretDetailState, DictState,
                    selectable labels/annotations, structured resource requests/limits
   tui/logs.rs      LogViewState, follow-mode streaming, regex filter
@@ -38,18 +41,21 @@ crates/qb/src/
    Log streaming uses async tasks with `mpsc` channels polled each tick. The UI never blocks on I/O.
 5. **Auto-refresh** — Resource list and cluster stats refresh every 2 seconds. Scroll position and
    selection are always preserved across refreshes — never reset viewport on auto-refresh.
+   Breadcrumb shows refresh timestamp right-aligned. `p` pauses/resumes globally.
 6. **Smart then YAML** — Detail views open in Smart mode (typed, structured rendering per resource
    type). `v` cycles between Smart and YAML views.
 7. **Keyboard-first, mouse-supported** — Gitui-inspired hotkey bar at the bottom. All actions are
    keyboard-accessible. Mouse clicks and scroll wheel work as a convenience layer.
 8. **Breadcrumb always visible** — Top bar shows `cluster > namespace > type > resource > logs` in
-   every view so the user always knows where they are.
+   every view, plus a right-aligned refresh indicator (`⟳ just now` / `⟳ Ns ago` / `⏸ paused`).
 9. **Cluster stats as default view** — App starts on the Overview panel showing cluster-wide
    statistics, node grid cards, and pod health gauges.
 10. **Instant nav** — Sidebar selection loads immediately on j/k movement, no Enter required.
     Enter moves focus to the right panel.
 11. **Space = expand everywhere** — `Space` is the universal expand/decode key across all views
     (secret values, label/annotation values).
+12. **Edit via $EDITOR** — `e` opens the resource YAML in `$EDITOR` (falls back to vim → vi).
+    On save, shows a diff preview (inline or side-by-side) with apply/re-edit/cancel options.
 
 ## Key Bindings Summary
 
@@ -60,6 +66,7 @@ crates/qb/src/
 | `Ctrl+C` | Force quit |
 | `q` | Quit / back |
 | `Esc` | Back / dismiss |
+| `p` | Pause/resume auto-refresh (except log view where p = pod selector) |
 
 ### Main View
 
@@ -73,6 +80,7 @@ crates/qb/src/
 | `n` | Switch namespace (popup) |
 | `/` | Filter resources by regex |
 | `x` | Clear filter |
+| `e` | Edit selected resource ($EDITOR) |
 | `l` | Open logs (workload resources) |
 
 ### Detail View
@@ -81,10 +89,21 @@ crates/qb/src/
 |-----|--------|
 | `v` | Cycle view: Smart → YAML → Smart |
 | `j`/`k` | Scroll (or navigate selected entries) |
-| `e` | Enter/leave label/annotation selection |
+| `s` | Enter/leave label/annotation selection |
 | `Space` | Expand/collapse selected entry or decode secret |
 | `y` | Copy: selected entry value, full YAML, or secret |
+| `e` | Edit resource ($EDITOR) |
 | `l` | Open logs (workload resources) |
+
+### Edit Diff View
+
+| Key | Action |
+|-----|--------|
+| `v` | Cycle: inline diff ↔ side-by-side diff |
+| `Enter` | Apply changes to cluster |
+| `e` | Re-edit (reopen $EDITOR with current edits) |
+| `j`/`k` | Scroll diff |
+| `Esc` | Cancel edit |
 
 ### Log View
 
@@ -135,15 +154,31 @@ events log. Filter persists across auto-refreshes, clears on resource type chang
 
 ### Selectable Labels/Annotations
 
-In the detail smart view, press `e` to enter selection mode on labels/annotations. Navigate
+In the detail smart view, press `s` to enter selection mode on labels/annotations. Navigate
 with `j`/`k`, press `Space` to expand/collapse long values (word-wrapped at 100 chars), press
-`y` to copy `key: value` to clipboard. Press `e` again to leave selection mode. Values longer
+`y` to copy `key: value` to clipboard. Press `s` again to leave selection mode. Values longer
 than 70 chars are truncated with `...` until expanded.
+
+### Resource Editing
+
+Press `e` on any resource (from list or detail view) to edit it. The flow:
+1. YAML is opened in `$EDITOR` (falls back to `vim` then `vi`)
+2. TUI suspends, editor runs, TUI resumes on editor exit
+3. Diff preview shows changes (inline or side-by-side, toggle with `v`)
+4. `Enter` applies via `Api::replace` (kube dynamic API with `DynamicObject`)
+5. On error, shows message and offers `e` to re-edit or `Esc` to cancel
+6. On success, returns to detail view with refreshed data
 
 ### Pod/Container Selection
 
 In the log view, `p` and `c` open popup list selectors (not cycling). Lists include "All" as
 the first entry. Navigate with j/k, select with Enter.
+
+### Pause
+
+`p` toggles auto-refresh globally (main view, detail view). When paused, the breadcrumb shows
+`⏸ paused` and log stream polling is suppressed. In the log view, `p` is the pod selector
+instead — use `f` (follow) to control live streaming there.
 
 ## Coding Standards
 
@@ -171,8 +206,10 @@ Follow Rust conventions: one `mod.rs` per directory, re-export public items. Eac
 single clear responsibility:
 
 - `k8s/` — data access only. No TUI imports. Returns domain types (`ResourceEntry`, `PodInfo`,
-  `ClusterStatsData`, `Value`).
-- `tui/app.rs` — state + event handling. No rendering code.
+  `ClusterStatsData`, `Value`). Also handles `replace_resource_yaml` via dynamic API.
+- `tui/mod.rs` — terminal setup, event loop, and external editor invocation (suspend/resume).
+- `tui/app.rs` — state + event handling. No rendering code. Includes edit flow state
+  (`PendingEdit`, `EditContext`, `DiffMode`).
 - `tui/ui.rs` — rendering only. Reads from App, writes to Frame. No mutations except storing
   click-area rects, clamping scroll/cursor positions, and syncing `DictState`.
 - `tui/smart.rs` — per-resource-type renderers. Returns `Vec<Line<'static>>`. Accepts
@@ -190,18 +227,20 @@ Resource types are a `ResourceType` enum. Adding a new type means:
    (or `list_cluster`/`get_value_cluster` for cluster-scoped resources)
 5. Add `render_*` function in `smart.rs` + dispatch match arm (accepts `ds: &mut DictState`)
 6. If it supports logs, add to `supports_logs()` match
-7. Add `sort_key: None` (or `Some(...)` for sortable types) to the `ResourceEntry` constructor
+7. Add to `api_resource()` and `is_cluster_scoped()` match arms
+8. Add `sort_key: None` (or `Some(...)` for sortable types) to the `ResourceEntry` constructor
 
-Views (`View::Main | Detail | Logs`), detail modes (`DetailMode::Smart | Yaml`), and pending
-loads (`PendingLoad`) all use enums for exhaustive matching. No `unreachable!()` in dispatch.
+Views (`View::Main | Detail | Logs | EditDiff`), detail modes (`DetailMode::Smart | Yaml`),
+diff modes (`DiffMode::Inline | SideBySide`), and pending loads (`PendingLoad`) all use enums
+for exhaustive matching. No `unreachable!()` in dispatch.
 
 ### Patterns to follow
 
 - **Deferred loading**: Queue a `PendingLoad` variant → `process_pending_load()` runs it after
   the next render. Never call `block_on` inside a key handler directly.
-- **Selection preservation**: When refreshing a list, save the selected item's name, reload,
-  then find the same name in the new list. Never reset `TableState` to `default()` on refresh —
-  only update the selected index to preserve viewport offset.
+- **Selection preservation**: When refreshing a list, save the selected item's `(name, namespace)`
+  pair, reload, then find the same pair in the new list. Never reset `TableState` to `default()`
+  on refresh — only update the selected index to preserve viewport offset.
 - **Scroll preservation**: Auto-refresh must never reset scroll positions. Only user-initiated
   navigation (switching resource type, opening a new detail) should reset scroll.
 - **Popup = `Option<Popup>`**: One popup at a time. `None` means no popup. Popup keys are handled
@@ -221,6 +260,12 @@ loads (`PendingLoad`) all use enums for exhaustive matching. No `unreachable!()`
   values + 2 padding), capped at 50. NAME column uses `Constraint::Min`, others `Constraint::Length`.
   Detail view `field()` pads labels to `max(label.len(), 18)`. Conditions and resource tables also
   compute widths from data.
+- **Edit flow**: `PendingEdit` is set by key handler, consumed by the event loop in `tui/mod.rs`
+  to suspend terminal → run `$EDITOR` → resume terminal. Result feeds into `handle_edit_result`
+  which computes the diff and enters `View::EditDiff`. Apply uses `KubeClient::replace_resource_yaml`
+  with `DynamicObject` + `ApiResource` for generic resource replacement.
+- **External editor**: Resolved as `$EDITOR` → `vim` → `vi`. Terminal is fully suspended
+  (leave alternate screen, disable raw mode) before editor runs, and restored after.
 - **OSC 52 vs arboard**: Clipboard currently uses `arboard` (native macOS/Linux clipboard). If
   terminal-only clipboard is needed in the future, OSC 52 escape sequences are the alternative.
 
@@ -239,6 +284,8 @@ loads (`PendingLoad`) all use enums for exhaustive matching. No `unreachable!()`
 - **rustls** with `ring` feature — TLS crypto provider (must be explicit since rustls 0.23+).
 - **jiff** — Time arithmetic (duration formatting, age display). Replaced chrono.
 - **arboard** — System clipboard access for secret copying.
+- **similar** — Text diff computation (unified diff for edit preview).
+- **tempfile** — Temp file creation for editor invocation.
 
 ## Build
 

@@ -181,6 +181,50 @@ impl ResourceType {
         )
     }
 
+    pub fn is_cluster_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::Node
+                | Self::Namespace
+                | Self::PersistentVolume
+                | Self::StorageClass
+                | Self::ClusterRole
+                | Self::ClusterRoleBinding
+        )
+    }
+
+    /// Returns the kube `ApiResource` descriptor for dynamic API operations.
+    pub fn api_resource(&self) -> kube::api::ApiResource {
+        use kube::api::ApiResource;
+        match self {
+            | Self::Deployment => ApiResource::erase::<Deployment>(&()),
+            | Self::StatefulSet => ApiResource::erase::<StatefulSet>(&()),
+            | Self::DaemonSet => ApiResource::erase::<DaemonSet>(&()),
+            | Self::ReplicaSet => ApiResource::erase::<ReplicaSet>(&()),
+            | Self::Pod => ApiResource::erase::<Pod>(&()),
+            | Self::CronJob => ApiResource::erase::<CronJob>(&()),
+            | Self::Job => ApiResource::erase::<Job>(&()),
+            | Self::HorizontalPodAutoscaler => ApiResource::erase::<HorizontalPodAutoscaler>(&()),
+            | Self::ConfigMap => ApiResource::erase::<ConfigMap>(&()),
+            | Self::Secret => ApiResource::erase::<Secret>(&()),
+            | Self::Service => ApiResource::erase::<Service>(&()),
+            | Self::Ingress => ApiResource::erase::<Ingress>(&()),
+            | Self::Endpoints => ApiResource::erase::<Endpoints>(&()),
+            | Self::NetworkPolicy => ApiResource::erase::<NetworkPolicy>(&()),
+            | Self::PersistentVolumeClaim => ApiResource::erase::<PersistentVolumeClaim>(&()),
+            | Self::PersistentVolume => ApiResource::erase::<PersistentVolume>(&()),
+            | Self::StorageClass => ApiResource::erase::<StorageClass>(&()),
+            | Self::ServiceAccount => ApiResource::erase::<ServiceAccount>(&()),
+            | Self::Role => ApiResource::erase::<Role>(&()),
+            | Self::RoleBinding => ApiResource::erase::<RoleBinding>(&()),
+            | Self::ClusterRole => ApiResource::erase::<ClusterRole>(&()),
+            | Self::ClusterRoleBinding => ApiResource::erase::<ClusterRoleBinding>(&()),
+            | Self::Node => ApiResource::erase::<Node>(&()),
+            | Self::Namespace => ApiResource::erase::<Namespace>(&()),
+            | Self::Event => ApiResource::erase::<Event>(&()),
+        }
+    }
+
     pub fn all_by_category() -> Vec<(Category, Vec<ResourceType>)> {
         vec![
             (Category::Cluster, vec![Self::Node, Self::Namespace, Self::Event]),
@@ -558,6 +602,24 @@ impl KubeClient {
             | ResourceType::RoleBinding => self.get_value::<RoleBinding>(ns, name).await,
             | ResourceType::Event => self.get_value::<Event>(ns, name).await,
         }
+    }
+
+    // -- Edit / replace resource -----------------------------------------------
+
+    /// Replace a resource with edited YAML. Uses the kube dynamic API so it
+    /// works for any resource type without per-type match arms.
+    pub async fn replace_resource_yaml(&self, rt: ResourceType, ns: &str, name: &str, yaml: &str) -> Result<Value> {
+        let obj: kube::api::DynamicObject = serde_yaml::from_str(yaml).context("Invalid YAML")?;
+        let ar = rt.api_resource();
+        let api: Api<kube::api::DynamicObject> = if rt.is_cluster_scoped() {
+            Api::all_with(self.client.clone(), &ar)
+        } else {
+            Api::namespaced_with(self.client.clone(), ns, &ar)
+        };
+        let pp = kube::api::PostParams::default();
+        let result = api.replace(name, &pp, &obj).await.context("Failed to apply resource")?;
+        let val = serde_json::to_value(&result)?;
+        Ok(val)
     }
 
     // -- Generic list helper -------------------------------------------------

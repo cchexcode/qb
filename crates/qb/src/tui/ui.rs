@@ -27,6 +27,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         | View::Main => render_main(f, app),
         | View::Detail => render_detail(f, app),
         | View::Logs => render_logs(f, app),
+        | View::EditDiff => render_edit_diff(f, app),
     }
 
     if app.popup.is_some() {
@@ -88,6 +89,26 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
+
+    // Right-align the refresh indicator
+    let elapsed = app.last_refresh.elapsed().as_secs();
+    let refresh_text = if app.paused {
+        " ⏸ paused ".to_string()
+    } else if elapsed < 2 {
+        " ⟳ just now ".to_string()
+    } else {
+        format!(" ⟳ {}s ago ", elapsed)
+    };
+    let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let area_width = area.width as usize;
+    let pad = area_width.saturating_sub(left_width + refresh_text.len());
+    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(Color::DarkGray)));
+    let refresh_style = if app.paused {
+        Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::White).bg(Color::DarkGray)
+    };
+    spans.push(Span::styled(refresh_text, refresh_style));
 
     let line = Line::from(spans);
     let bar = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
@@ -833,6 +854,230 @@ fn render_detail(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(bar), outer[2]);
 }
 
+// ---------------------------------------------------------------------------
+// Edit diff view
+// ---------------------------------------------------------------------------
+
+fn render_edit_diff(f: &mut Frame, app: &mut App) {
+    use super::app::{
+        DiffKind,
+        DiffMode,
+    };
+
+    let ctx = match &app.edit_ctx {
+        | Some(c) => c,
+        | None => return,
+    };
+
+    let has_error = ctx.error.is_some();
+    let error_height = if has_error { 2 } else { 0 };
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),            // breadcrumb
+            Constraint::Min(3),               // diff content
+            Constraint::Length(error_height), // error
+            Constraint::Length(1),            // hotkey bar
+        ])
+        .split(f.area());
+
+    // Breadcrumb
+    let mode_label = match ctx.diff_mode {
+        | DiffMode::Inline => "Inline",
+        | DiffMode::SideBySide => "Side-by-Side",
+    };
+    let breadcrumb = Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            format!(" Edit: {}/{} ", ctx.resource_type.display_name(), ctx.name),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" — Review changes [{}]", mode_label),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(breadcrumb).style(Style::default().bg(Color::DarkGray)),
+        outer[0],
+    );
+
+    // Diff content
+    let added = ctx.diff_lines.iter().filter(|(k, _)| *k == DiffKind::Added).count();
+    let removed = ctx.diff_lines.iter().filter(|(k, _)| *k == DiffKind::Removed).count();
+    let summary = format!(" +{} -{} ", added, removed);
+
+    match ctx.diff_mode {
+        | DiffMode::Inline => {
+            let lines: Vec<Line> = ctx
+                .diff_lines
+                .iter()
+                .map(|(kind, text)| {
+                    let style = match kind {
+                        | DiffKind::Added => Style::default().fg(Color::Green),
+                        | DiffKind::Removed => Style::default().fg(Color::Red),
+                        | DiffKind::Context => Style::default().fg(Color::DarkGray),
+                    };
+                    Line::from(Span::styled(text.clone(), style))
+                })
+                .collect();
+
+            let paragraph = Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .title(" Diff ")
+                        .title_bottom(summary),
+                )
+                .scroll((ctx.scroll, 0));
+            f.render_widget(paragraph, outer[1]);
+        },
+        | DiffMode::SideBySide => {
+            // Split the diff into left (removed/context) and right (added/context) columns
+            let mut left: Vec<(DiffKind, String)> = Vec::new();
+            let mut right: Vec<(DiffKind, String)> = Vec::new();
+
+            let mut i = 0;
+            let dl = &ctx.diff_lines;
+            while i < dl.len() {
+                match dl[i].0 {
+                    | DiffKind::Context => {
+                        let text = dl[i].1.trim_start_matches("  ").to_string();
+                        left.push((DiffKind::Context, text.clone()));
+                        right.push((DiffKind::Context, text));
+                        i += 1;
+                    },
+                    | DiffKind::Removed => {
+                        // Collect consecutive removals then match with consecutive additions
+                        let mut removes = Vec::new();
+                        while i < dl.len() && dl[i].0 == DiffKind::Removed {
+                            removes.push(dl[i].1.trim_start_matches("- ").to_string());
+                            i += 1;
+                        }
+                        let mut adds = Vec::new();
+                        while i < dl.len() && dl[i].0 == DiffKind::Added {
+                            adds.push(dl[i].1.trim_start_matches("+ ").to_string());
+                            i += 1;
+                        }
+                        // Pair them up
+                        let max_len = removes.len().max(adds.len());
+                        for j in 0..max_len {
+                            left.push(
+                                removes
+                                    .get(j)
+                                    .map(|s| (DiffKind::Removed, s.clone()))
+                                    .unwrap_or((DiffKind::Context, String::new())),
+                            );
+                            right.push(
+                                adds.get(j)
+                                    .map(|s| (DiffKind::Added, s.clone()))
+                                    .unwrap_or((DiffKind::Context, String::new())),
+                            );
+                        }
+                    },
+                    | DiffKind::Added => {
+                        // Orphan add (no preceding remove)
+                        left.push((DiffKind::Context, String::new()));
+                        right.push((DiffKind::Added, dl[i].1.trim_start_matches("+ ").to_string()));
+                        i += 1;
+                    },
+                }
+            }
+
+            // Render side-by-side
+            let content_area = outer[1];
+            let inner_w = content_area.width.saturating_sub(2) as usize; // minus borders
+            let half_w = inner_w / 2;
+            let sep_dim = Style::default().fg(Color::DarkGray);
+
+            let lines: Vec<Line> = left
+                .iter()
+                .zip(right.iter())
+                .map(|((lk, lt), (rk, rt))| {
+                    let left_style = match lk {
+                        | DiffKind::Removed => Style::default().fg(Color::Red),
+                        | _ => Style::default().fg(Color::DarkGray),
+                    };
+                    let right_style = match rk {
+                        | DiffKind::Added => Style::default().fg(Color::Green),
+                        | _ => Style::default().fg(Color::DarkGray),
+                    };
+                    // Truncate/pad each side to half width
+                    let left_text = if lt.len() > half_w.saturating_sub(1) {
+                        format!("{:.w$}", lt, w = half_w.saturating_sub(1))
+                    } else {
+                        format!("{:<w$}", lt, w = half_w.saturating_sub(1))
+                    };
+                    let right_text = if rt.len() > half_w {
+                        format!("{:.w$}", rt, w = half_w)
+                    } else {
+                        format!("{:<w$}", rt, w = half_w)
+                    };
+                    Line::from(vec![
+                        Span::styled(left_text, left_style),
+                        Span::styled("│", sep_dim),
+                        Span::styled(right_text, right_style),
+                    ])
+                })
+                .collect();
+
+            let paragraph = Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .title(" Diff — Side by Side ")
+                        .title_bottom(summary),
+                )
+                .scroll((ctx.scroll, 0));
+            f.render_widget(paragraph, content_area);
+        },
+    }
+
+    // Error display
+    if let Some(err) = &ctx.error {
+        let err_lines = vec![
+            Line::from(vec![
+                Span::styled(" ERROR: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(err.clone(), Style::default().fg(Color::Red)),
+            ]),
+            Line::from(Span::styled(
+                " Press [e] to re-edit or [Esc] to cancel",
+                Style::default().fg(Color::Yellow),
+            )),
+        ];
+        f.render_widget(Paragraph::new(err_lines), outer[2]);
+    }
+
+    // Hotkey bar
+    let key_style = Style::default().fg(Color::Black).bg(Color::Yellow);
+    let label_style = Style::default().fg(Color::White);
+    let sep = Span::styled("  ", Style::default());
+    let view_label = match ctx.diff_mode {
+        | DiffMode::Inline => " Side-by-Side",
+        | DiffMode::SideBySide => " Inline",
+    };
+    let bar = Line::from(vec![
+        Span::styled(" Enter ", key_style),
+        Span::styled(" Apply", label_style),
+        sep.clone(),
+        Span::styled(" v ", key_style),
+        Span::styled(view_label, label_style),
+        sep.clone(),
+        Span::styled(" e ", key_style),
+        Span::styled(" Re-edit", label_style),
+        sep.clone(),
+        Span::styled(" j/k ", key_style),
+        Span::styled(" Scroll", label_style),
+        sep.clone(),
+        Span::styled(" Esc ", key_style),
+        Span::styled(" Cancel", label_style),
+    ]);
+    f.render_widget(Paragraph::new(bar), outer[3]);
+}
+
 fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
     let rt = match app.selected_resource_type {
         | Some(rt) => rt,
@@ -1084,6 +1329,15 @@ fn render_hotkey_bar(f: &mut Frame, app: &App, area: Rect) {
         ]);
     }
 
+    // Edit
+    if app.selected_resource_type.is_some() && app.focus == Focus::Resources {
+        spans.extend([
+            Span::styled(" e ", key_style),
+            Span::styled(" Edit", label_style),
+            sep.clone(),
+        ]);
+    }
+
     // Filter controls
     spans.extend([
         Span::styled(" / ", key_style),
@@ -1096,6 +1350,21 @@ fn render_hotkey_bar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" Clear", label_style),
             sep.clone(),
         ]);
+    }
+
+    // Pause toggle
+    let pause_label = if app.paused { " Resume" } else { " Pause" };
+    spans.extend([
+        Span::styled(" p ", key_style),
+        Span::styled(pause_label, label_style),
+        sep.clone(),
+    ]);
+    if app.paused {
+        spans.push(Span::styled(
+            " ⏸ PAUSED ",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ));
+        spans.push(Span::styled("  ", Style::default()));
     }
 
     spans.extend([Span::styled(" q ", key_style), Span::styled(" Quit", label_style)]);
@@ -1156,7 +1425,7 @@ fn build_detail_hotkey_bar(app: &App) -> Line<'static> {
                 Span::styled(" y ", key_style),
                 Span::styled(" Copy", label_style),
                 sep.clone(),
-                Span::styled(" e ", key_style),
+                Span::styled(" s ", key_style),
                 Span::styled(" Done", label_style),
                 sep.clone(),
             ]);
@@ -1168,7 +1437,7 @@ fn build_detail_hotkey_bar(app: &App) -> Line<'static> {
             ]);
             if has_dict {
                 spans.extend([
-                    Span::styled(" e ", key_style),
+                    Span::styled(" s ", key_style),
                     Span::styled(" Select", label_style),
                     sep.clone(),
                 ]);
@@ -1185,11 +1454,29 @@ fn build_detail_hotkey_bar(app: &App) -> Line<'static> {
         ]);
     }
 
-    spans.extend([Span::styled(" PgUp/Dn ", key_style), Span::styled(" Page", label_style)]);
+    spans.extend([
+        Span::styled(" PgUp/Dn ", key_style),
+        Span::styled(" Page", label_style),
+        sep.clone(),
+        Span::styled(" e ", key_style),
+        Span::styled(" Edit", label_style),
+    ]);
 
     // Show [l] Logs for workload resources
     if app.selected_resource_type.map(|rt| rt.supports_logs()).unwrap_or(false) {
-        spans.extend([sep, Span::styled(" l ", key_style), Span::styled(" Logs", label_style)]);
+        spans.extend([
+            sep.clone(),
+            Span::styled(" l ", key_style),
+            Span::styled(" Logs", label_style),
+        ]);
+    }
+
+    // Pause indicator
+    if app.paused {
+        spans.extend([
+            sep,
+            Span::styled(" ⏸ PAUSED ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+        ]);
     }
 
     Line::from(spans)
