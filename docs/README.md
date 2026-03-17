@@ -44,15 +44,15 @@ It does **not** shell out to `kubectl` — all cluster communication is native.
 
 ## Installation
 
-### cargo install (recommended)
+### From crates.io (recommended)
 
 Requires [Rust](https://rustup.rs/) 1.75+.
 
 ```sh
-cargo install --git https://github.com/cchexcode/qb.git -p qb
+cargo install qb
 ```
 
-Or via SSH:
+### From git
 
 ```sh
 cargo install --git git@github.com:cchexcode/qb.git -p qb
