@@ -655,7 +655,7 @@ fn render_events_log(f: &mut Frame, app: &mut App, area: Rect) {
     let cursor = app.events_cursor.min(total.saturating_sub(1));
     app.events_cursor = cursor;
 
-    // Auto-scroll keeps cursor at the last event
+    // Auto-scroll keeps cursor at the bottom (newest event)
     if app.events_auto_scroll && total > 0 {
         app.events_cursor = total - 1;
     }

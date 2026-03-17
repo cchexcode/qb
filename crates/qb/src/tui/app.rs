@@ -334,12 +334,12 @@ impl App {
 
             match self.rt.block_on(self.kube.list_resources(rt)) {
                 | Ok(mut entries) => {
-                    // Sort events chronologically (newest first)
+                    // Sort events chronologically (oldest first, newest at bottom)
                     if rt == ResourceType::Event {
                         entries.sort_by(|a, b| {
                             let ts_a = a.sort_key.as_deref().unwrap_or("");
                             let ts_b = b.sort_key.as_deref().unwrap_or("");
-                            ts_b.cmp(ts_a)
+                            ts_a.cmp(ts_b)
                         });
                     }
                     self.resources = entries;
@@ -640,7 +640,7 @@ impl App {
                     let clicked = self.events_scroll.saturating_add(inner_y);
                     let vis_len = self.visible_resource_indices().len();
                     self.events_cursor = clicked.min(vis_len.saturating_sub(1));
-                    self.events_auto_scroll = false;
+                    self.events_auto_scroll = self.events_cursor == vis_len.saturating_sub(1);
                 } else {
                     // Skip border (1) + header row (1) = 2
                     let inner_y = pos.y.saturating_sub(self.area_resources.y + 2) as usize;
@@ -734,6 +734,7 @@ impl App {
                         self.events_auto_scroll = false;
                     } else {
                         self.events_cursor = (self.events_cursor + delta as usize).min(max);
+                        self.events_auto_scroll = self.events_cursor == max;
                     }
                 } else {
                     let current = self.resource_state.selected().unwrap_or(0) as i32;
@@ -985,6 +986,7 @@ impl App {
                 if self.events_cursor < max {
                     self.events_cursor += 1;
                 }
+                self.events_auto_scroll = self.events_cursor == max;
             },
             | KeyCode::PageUp => {
                 self.events_cursor = self.events_cursor.saturating_sub(30);
@@ -992,6 +994,7 @@ impl App {
             },
             | KeyCode::PageDown => {
                 self.events_cursor = (self.events_cursor + 30).min(max);
+                self.events_auto_scroll = self.events_cursor == max;
             },
             | KeyCode::Home | KeyCode::Char('g') => {
                 self.events_cursor = 0;
