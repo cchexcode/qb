@@ -284,6 +284,7 @@ pub struct App {
 
     // Log view
     pub log_state: Option<LogViewState>,
+    pub log_detail_line: Option<String>,
 
     // Resource filter (regex on name, namespace, columns)
     pub resource_filter_text: String,
@@ -373,6 +374,7 @@ impl App {
             dict_cursor: None,
             dict_line_offsets: Vec::new(),
             log_state: None,
+            log_detail_line: None,
             resource_filter_text: String::new(),
             resource_filter_regex: None,
             resource_filter_editing: false,
@@ -975,6 +977,23 @@ impl App {
                     if content_line >= offset {
                         state.selected = i;
                         break;
+                    }
+                }
+            }
+        }
+
+        // Log view — click to select a log line (only when not wrapping,
+        // since wrapped lines break the 1:1 row-to-line mapping)
+        if self.view == View::Logs {
+            if let Some(state) = &mut self.log_state {
+                if !state.wrap {
+                    let inner_y = pos.y.saturating_sub(2) as usize;
+                    let scroll = state.scroll;
+                    let clicked_idx = scroll + inner_y;
+                    let vis_count = state.visible_lines().len();
+                    if clicked_idx < vis_count {
+                        state.selected_line = Some(clicked_idx);
+                        state.auto_scroll = false;
                     }
                 }
             }
@@ -1703,12 +1722,27 @@ impl App {
 
         match key.code {
             | KeyCode::Esc | KeyCode::Char('q') => {
-                if let Some(state) = &mut self.log_state {
-                    state.stop_following();
+                // Dismiss detail popup first, then deselect, then exit
+                if self.log_detail_line.is_some() {
+                    self.log_detail_line = None;
+                } else if self
+                    .log_state
+                    .as_ref()
+                    .map(|s| s.selected_line.is_some())
+                    .unwrap_or(false)
+                {
+                    if let Some(state) = &mut self.log_state {
+                        state.selected_line = None;
+                    }
+                } else {
+                    if let Some(state) = &mut self.log_state {
+                        state.stop_following();
+                    }
+                    self.log_state = None;
+                    self.log_detail_line = None;
+                    self.view = View::Main;
+                    self.focus = Focus::Resources;
                 }
-                self.log_state = None;
-                self.view = View::Main;
-                self.focus = Focus::Resources;
             },
             // [/] Start filter edit
             | KeyCode::Char('/') => {
@@ -1740,15 +1774,62 @@ impl App {
                     state.clear_filter();
                 }
             },
-            // Navigation
+            // [w] Toggle wrap
+            | KeyCode::Char('w') => {
+                if let Some(state) = &mut self.log_state {
+                    state.wrap = !state.wrap;
+                }
+            },
+            // [Enter] Open selected line in detail popup
+            | KeyCode::Enter => {
+                if let Some(state) = &self.log_state {
+                    if let Some(sel) = state.selected_line {
+                        let visible = state.visible_lines();
+                        if let Some(line) = visible.get(sel) {
+                            self.log_detail_line = Some(line.to_string());
+                        }
+                    }
+                }
+            },
+            // Navigation — moves selected_line cursor
             | KeyCode::Up | KeyCode::Char('k') => {
                 if let Some(state) = &mut self.log_state {
-                    state.scroll_up(1);
+                    match state.selected_line {
+                        | Some(sel) if sel > 0 => {
+                            state.selected_line = Some(sel - 1);
+                            // Scroll to keep selection visible
+                            if sel - 1 < state.scroll {
+                                state.scroll = sel - 1;
+                            }
+                            state.auto_scroll = false;
+                        },
+                        | None => {
+                            // Start selection at current scroll position
+                            let vis_count = state.visible_lines().len();
+                            if vis_count > 0 {
+                                let pos = state.scroll.min(vis_count.saturating_sub(1));
+                                state.selected_line = Some(pos);
+                                state.auto_scroll = false;
+                            }
+                        },
+                        | _ => {},
+                    }
                 }
             },
             | KeyCode::Down | KeyCode::Char('j') => {
                 if let Some(state) = &mut self.log_state {
-                    state.scroll_down(1, visible_count);
+                    let vis_count = state.visible_lines().len();
+                    match state.selected_line {
+                        | Some(sel) if sel + 1 < vis_count => {
+                            state.selected_line = Some(sel + 1);
+                            state.auto_scroll = sel + 1 == vis_count.saturating_sub(1);
+                        },
+                        | None if vis_count > 0 => {
+                            let pos = state.scroll.min(vis_count.saturating_sub(1));
+                            state.selected_line = Some(pos);
+                        },
+                        | _ => {},
+                    }
                 }
             },
             | KeyCode::PageUp => {

@@ -1292,11 +1292,22 @@ fn render_logs(f: &mut Frame, app: &mut App) {
 
     render_breadcrumb(f, app, outer[0]);
 
-    let title = if state.following { " [Following]" } else { "" };
+    let mut title_parts = Vec::new();
+    if state.following {
+        title_parts.push("[Following]");
+    }
+    if state.wrap {
+        title_parts.push("[Wrap]");
+    }
+    let title = if title_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", title_parts.join(" "))
+    };
 
     // Log lines (filtered)
     let visible = state.visible_lines();
-    let area_height = outer[1].height.saturating_sub(2) as usize; // minus borders
+    let area_height = outer[1].height.saturating_sub(2) as usize;
 
     // Auto-scroll: if at bottom, keep scroll at end
     let scroll_offset = if state.auto_scroll && visible.len() > area_height {
@@ -1307,35 +1318,60 @@ fn render_logs(f: &mut Frame, app: &mut App) {
 
     let lines: Vec<Line> = visible
         .iter()
+        .enumerate()
         .skip(scroll_offset)
         .take(area_height)
-        .map(|l| {
+        .map(|(idx, l)| {
+            let is_selected = state.selected_line == Some(idx);
+            let base_style = if is_selected {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::White)
+            };
             // Highlight filter matches
-            if let Some(re) = &state.filter_regex {
-                if let Some(m) = re.find(l) {
-                    return Line::from(vec![
-                        Span::styled(&l[..m.start()], Style::default().fg(Color::White)),
-                        Span::styled(
-                            l[m.start()..m.end()].to_string(),
-                            Style::default().fg(Color::Black).bg(Color::Yellow),
-                        ),
-                        Span::styled(&l[m.end()..], Style::default().fg(Color::White)),
-                    ]);
+            if !is_selected {
+                if let Some(re) = &state.filter_regex {
+                    if let Some(m) = re.find(l) {
+                        return Line::from(vec![
+                            Span::styled(&l[..m.start()], Style::default().fg(Color::White)),
+                            Span::styled(
+                                l[m.start()..m.end()].to_string(),
+                                Style::default().fg(Color::Black).bg(Color::Yellow),
+                            ),
+                            Span::styled(&l[m.end()..], Style::default().fg(Color::White)),
+                        ]);
+                    }
                 }
             }
-            Line::from(Span::styled(*l, Style::default().fg(Color::White)))
+            Line::from(Span::styled(*l, base_style))
         })
         .collect();
 
     let line_info = format!(" {}/{} ", scroll_offset + lines.len(), visible.len());
-    let paragraph = Paragraph::new(lines).block(
+    let mut paragraph = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title(title)
             .title_bottom(line_info),
     );
+    if state.wrap {
+        paragraph = paragraph.wrap(Wrap { trim: false });
+    }
     f.render_widget(paragraph, outer[1]);
+
+    // Log detail popup (selected line expanded)
+    if let Some(detail) = &app.log_detail_line {
+        let popup_area = centered_rect(80, 50, f.area());
+        f.render_widget(Clear, popup_area);
+        let detail_paragraph = Paragraph::new(detail.as_str()).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Log Line Detail — Esc to close "),
+        );
+        f.render_widget(detail_paragraph, popup_area);
+    }
 
     // Filter bar
     if has_filter_bar {
@@ -1397,7 +1433,19 @@ fn build_log_hotkey_bar(state: &super::logs::LogViewState) -> Line<'static> {
         spans.extend([
             Span::styled(" x ", key_style),
             Span::styled(" Clear filter", label_style),
+            sep.clone(),
         ]);
+    }
+
+    let wrap_label = if state.wrap { " Unwrap" } else { " Wrap" };
+    spans.extend([
+        Span::styled(" w ", key_style),
+        Span::styled(wrap_label, label_style),
+        sep.clone(),
+    ]);
+
+    if state.selected_line.is_some() {
+        spans.extend([Span::styled(" Enter ", key_style), Span::styled(" Open", label_style)]);
     }
 
     Line::from(spans)

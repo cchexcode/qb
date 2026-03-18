@@ -30,9 +30,11 @@ pub struct LogViewState {
     pub receivers: Vec<mpsc::Receiver<String>>,
     pub stream_handles: Vec<tokio::task::JoinHandle<()>>,
 
-    // Scroll
+    // Scroll & selection
     pub scroll: usize,
     pub auto_scroll: bool,
+    pub selected_line: Option<usize>,
+    pub wrap: bool,
 
     // Pod / container selection
     pub pods: Vec<PodInfo>,
@@ -54,6 +56,8 @@ impl LogViewState {
             stream_handles: Vec::new(),
             scroll: 0,
             auto_scroll: true,
+            selected_line: None,
+            wrap: false,
             pods,
             selected_pod: None,
             selected_container: None,
