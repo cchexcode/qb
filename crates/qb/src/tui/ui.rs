@@ -36,6 +36,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.popup.is_some() {
         render_popup(f, app);
     }
+
+    if app.palette_open {
+        render_palette(f, app);
+    }
+
+    if app.help_open {
+        render_help(f, app);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +243,8 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
                 .title(title),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
-        .highlight_symbol("▶ ");
+        .highlight_symbol("▶ ")
+        .scroll_padding(1);
 
     f.render_stateful_widget(list, area, &mut app.nav_state);
 }
@@ -299,7 +308,22 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|&idx| {
             let entry = &app.resources[idx];
-            let mut cells = vec![Cell::from(entry.name.as_str())];
+            let is_diff_marked = app
+                .diff_mark
+                .as_ref()
+                .map(|(n, ns, _)| n == &entry.name && ns == &entry.namespace)
+                .unwrap_or(false);
+
+            let name_cell = if is_diff_marked {
+                Cell::from(Span::styled(
+                    format!("* {}", entry.name),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Cell::from(entry.name.as_str())
+            };
+
+            let mut cells = vec![name_cell];
             if all_ns {
                 cells.push(Cell::from(entry.namespace.as_str()));
             }
@@ -345,16 +369,17 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let border_color = if focused { Color::Cyan } else { Color::DarkGray };
     let title = format!(" {} ", rt.display_name());
 
-    // Map real selection index to filtered row position for highlight
-    let mut filtered_state = TableState::default();
+    // Map real selection index to filtered row position for highlight.
+    // Preserve the table offset across renders for smooth edge-scrolling.
     if let Some(sel) = app.resource_state.selected() {
         if let Some(vis_pos) = visible_indices.iter().position(|&i| i == sel) {
-            filtered_state.select(Some(vis_pos));
+            app.resource_table_state.select(Some(vis_pos));
         } else if !visible_indices.is_empty() {
-            // Selection not in filtered view — select first visible
-            filtered_state.select(Some(0));
+            app.resource_table_state.select(Some(0));
             app.resource_state.select(Some(visible_indices[0]));
         }
+    } else {
+        app.resource_table_state.select(None);
     }
 
     let table = Table::new(rows, constraints)
@@ -368,7 +393,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
         .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(table, area, &mut filtered_state);
+    f.render_stateful_widget(table, area, &mut app.resource_table_state);
 }
 
 /// Builds a text gauge bar: `[████████░░░░░░░░░░░░] 75%`
@@ -988,21 +1013,39 @@ fn render_edit_diff(f: &mut Frame, app: &mut App) {
             while i < dl.len() {
                 match dl[i].0 {
                     | DiffKind::Context => {
-                        let text = dl[i].1.trim_start_matches("  ").to_string();
+                        let text = dl[i]
+                            .1
+                            .strip_prefix("  ")
+                            .or_else(|| dl[i].1.strip_prefix(" "))
+                            .unwrap_or(&dl[i].1)
+                            .to_string();
                         left.push((DiffKind::Context, text.clone()));
                         right.push((DiffKind::Context, text));
                         i += 1;
                     },
                     | DiffKind::Removed => {
-                        // Collect consecutive removals then match with consecutive additions
                         let mut removes = Vec::new();
                         while i < dl.len() && dl[i].0 == DiffKind::Removed {
-                            removes.push(dl[i].1.trim_start_matches("- ").to_string());
+                            removes.push(
+                                dl[i]
+                                    .1
+                                    .strip_prefix("- ")
+                                    .or_else(|| dl[i].1.strip_prefix("-"))
+                                    .unwrap_or(&dl[i].1)
+                                    .to_string(),
+                            );
                             i += 1;
                         }
                         let mut adds = Vec::new();
                         while i < dl.len() && dl[i].0 == DiffKind::Added {
-                            adds.push(dl[i].1.trim_start_matches("+ ").to_string());
+                            adds.push(
+                                dl[i]
+                                    .1
+                                    .strip_prefix("+ ")
+                                    .or_else(|| dl[i].1.strip_prefix("+"))
+                                    .unwrap_or(&dl[i].1)
+                                    .to_string(),
+                            );
                             i += 1;
                         }
                         // Pair them up
@@ -1022,9 +1065,16 @@ fn render_edit_diff(f: &mut Frame, app: &mut App) {
                         }
                     },
                     | DiffKind::Added => {
-                        // Orphan add (no preceding remove)
                         left.push((DiffKind::Context, String::new()));
-                        right.push((DiffKind::Added, dl[i].1.trim_start_matches("+ ").to_string()));
+                        right.push((
+                            DiffKind::Added,
+                            dl[i]
+                                .1
+                                .strip_prefix("+ ")
+                                .or_else(|| dl[i].1.strip_prefix("+"))
+                                .unwrap_or(&dl[i].1)
+                                .to_string(),
+                        ));
                         i += 1;
                     },
                 }
@@ -1470,6 +1520,39 @@ fn render_hotkey_bar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" Delete", label_style),
             sep.clone(),
         ]);
+
+        // Restart
+        if matches!(
+            rt,
+            ResourceType::Deployment | ResourceType::StatefulSet | ResourceType::DaemonSet
+        ) {
+            spans.extend([
+                Span::styled(" R ", key_style),
+                Span::styled(" Restart", label_style),
+                sep.clone(),
+            ]);
+        }
+
+        // Copy name
+        spans.extend([
+            Span::styled(" y ", key_style),
+            Span::styled(" Copy", label_style),
+            sep.clone(),
+        ]);
+
+        // Diff
+        spans.extend([
+            Span::styled(" d ", key_style),
+            Span::styled(if app.diff_mark.is_some() { " Diff*" } else { " Diff" }, label_style),
+            sep.clone(),
+        ]);
+
+        // Create
+        spans.extend([
+            Span::styled(" C ", key_style),
+            Span::styled(" Create", label_style),
+            sep.clone(),
+        ]);
     }
 
     // Port forwards view hotkeys
@@ -1520,6 +1603,12 @@ fn render_hotkey_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     spans.extend([
+        Span::styled(" ^p ", key_style),
+        Span::styled(" Palette", label_style),
+        sep.clone(),
+        Span::styled(" ? ", key_style),
+        Span::styled(" Help", label_style),
+        sep.clone(),
         Span::styled(" O ", key_style),
         Span::styled(" Kubeconfig", label_style),
         sep,
@@ -1626,6 +1715,22 @@ fn build_detail_hotkey_bar(app: &App) -> Line<'static> {
             sep.clone(),
             Span::styled(" l ", key_style),
             Span::styled(" Logs", label_style),
+        ]);
+    }
+
+    // Watch toggle
+    let watch_label = if app.detail_auto_refresh { " Unwatch" } else { " Watch" };
+    spans.extend([
+        sep.clone(),
+        Span::styled(" w ", key_style),
+        Span::styled(watch_label, label_style),
+    ]);
+
+    // Watch indicator
+    if app.detail_auto_refresh {
+        spans.extend([
+            sep.clone(),
+            Span::styled(" ⟳ WATCH ", Style::default().fg(Color::Black).bg(Color::Green)),
         ]);
     }
 
@@ -1740,6 +1845,173 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
     );
 
     f.render_stateful_widget(table, area, &mut app.pf_table_state);
+}
+
+// ---------------------------------------------------------------------------
+// Command palette
+// ---------------------------------------------------------------------------
+
+fn render_help(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let width = (area.width * 70 / 100).max(50).min(area.width);
+    let x = (area.width.saturating_sub(width)) / 2;
+    let max_rows = 20u16;
+    let height = (max_rows + 3).min(area.height);
+    let help_area = ratatui::layout::Rect::new(x, 1, width, height);
+
+    f.render_widget(Clear, help_area);
+
+    let entries = app.filtered_help_entries();
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Search input
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("{}|", app.help_buf),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let visible_rows = (height.saturating_sub(3)) as usize;
+    // Edge-only scrolling: only scroll when cursor hits the boundary
+    if app.help_cursor < app.help_scroll {
+        app.help_scroll = app.help_cursor;
+    } else if visible_rows > 0 && app.help_cursor >= app.help_scroll + visible_rows {
+        app.help_scroll = app.help_cursor - visible_rows + 1;
+    }
+    app.help_scroll = app.help_scroll.min(entries.len().saturating_sub(visible_rows));
+
+    for (i, (key, desc, ctx)) in entries.iter().skip(app.help_scroll).take(visible_rows).enumerate() {
+        let actual_idx = i + app.help_scroll;
+        let is_selected = actual_idx == app.help_cursor;
+        let row_style = if is_selected {
+            Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<12}", key),
+                if is_selected {
+                    row_style
+                } else {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                },
+            ),
+            Span::styled(format!("{:<36}", desc), row_style),
+            Span::styled(
+                format!("{}", ctx),
+                if is_selected {
+                    row_style
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+        ]));
+    }
+
+    if entries.is_empty() && !app.help_buf.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    No matching keybinds",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let count = entries.len();
+    let title = format!(" Keybindings ({})  |  Esc to close ", count);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title);
+
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, help_area);
+}
+
+fn render_palette(f: &mut Frame, app: &mut App) {
+    // Top-centered palette, like VS Code
+    let area = f.area();
+    let width = (area.width * 60 / 100).max(40).min(area.width);
+    let x = (area.width.saturating_sub(width)) / 2;
+    let max_results = 12u16;
+    let height = (max_results + 3).min(area.height); // input + border + results
+    let palette_area = ratatui::layout::Rect::new(x, 1, width, height);
+
+    f.render_widget(Clear, palette_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Input line
+    let prefix = if app.palette_buf.starts_with('>') { "" } else { "  " };
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default()),
+        Span::styled(
+            format!("{}|", app.palette_buf),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Results
+    let visible_results = (height.saturating_sub(3)) as usize;
+    // Scroll to keep cursor visible
+    let scroll = if app.palette_cursor >= visible_results {
+        app.palette_cursor - visible_results + 1
+    } else {
+        0
+    };
+
+    for (i, entry) in app
+        .palette_results
+        .iter()
+        .skip(scroll)
+        .take(visible_results)
+        .enumerate()
+    {
+        let actual_idx = i + scroll;
+        let is_selected = actual_idx == app.palette_cursor;
+        let style = if is_selected {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let marker = if is_selected { "▶ " } else { "  " };
+
+        let kind_label = match &entry.kind {
+            | super::app::PaletteEntryKind::Resource { .. } => "",
+            | super::app::PaletteEntryKind::Command(_) => "  cmd",
+        };
+        let kind_span = Span::styled(kind_label, Style::default().fg(Color::DarkGray));
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {}{}", marker, entry.label), style),
+            kind_span,
+        ]));
+    }
+
+    if app.palette_results.is_empty() && !app.palette_buf.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    No matches",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let hint = if app.palette_buf.starts_with('>') {
+        " Commands (type to filter) "
+    } else if app.palette_global {
+        " Search ALL resources  |  Tab=local  |  > commands "
+    } else {
+        " Search resources  |  Tab=all types  |  > commands "
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(hint);
+
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, palette_area);
 }
 
 // ---------------------------------------------------------------------------

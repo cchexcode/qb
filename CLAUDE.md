@@ -231,11 +231,25 @@ an editable field for the new count. Uses `Api::patch` with `Patch::Merge` to up
 
 ### Container Exec/Shell
 
+**Experimental** — requires `qb -e` to enable.
+
 Press `x` for quick exec (`/bin/sh` into first container of first pod). Press `X` for the
-full dialog: choose container (Tab/Up/Down), edit command string (split on whitespace for
-argv). The flow suspends TUI (like editor), opens an interactive session via kube exec API
-with TTY mode, and restores TUI on session end. Uses `Api::<Pod>::exec` with `AttachParams`
-and bidirectional async I/O between terminal stdin/stdout and pod streams.
+full dialog: choose container (Tab to switch fields, Up/Down for containers), edit command
+(split on whitespace for argv), and override the terminal application.
+
+Exec opens a **new terminal window** running `kubectl exec -it`. The terminal is resolved as:
+1. `$TERMINAL` env var (explicit override, freedesktop convention)
+2. `$TERM_PROGRAM` env var (set automatically by most terminals: Ghostty, iTerm2, Alacritty,
+   kitty, WezTerm, etc.)
+3. Error if neither is set — user must set one of the above
+
+On macOS, Apple Terminal.app uses osascript `do script`. All other terminals are invoked
+directly as `<terminal> -e <script>`, which spawns a new window. The `X` dialog allows
+overriding the terminal per-session.
+
+The kubectl command includes `--context` and `--kubeconfig` (if a custom kubeconfig was loaded
+via `O`) to ensure the exec targets the correct cluster. The spawned terminal auto-closes
+after the session ends (`; exit` appended).
 
 ### Describe-Style Events
 

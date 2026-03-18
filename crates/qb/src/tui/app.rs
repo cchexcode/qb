@@ -95,6 +95,37 @@ pub struct PendingExec {
     pub command: Vec<String>,
 }
 
+pub struct PendingCreate {
+    pub yaml: String,
+}
+
+pub struct PaletteEntry {
+    pub label: String,
+    pub kind: PaletteEntryKind,
+}
+
+pub enum PaletteEntryKind {
+    Resource {
+        name: String,
+        namespace: String,
+        resource_type: Option<ResourceType>,
+    },
+    Command(PaletteCommand),
+}
+
+#[derive(Clone)]
+pub enum PaletteCommand {
+    Restart,
+    Scale,
+    Delete,
+    PortForward,
+    Exec,
+    Create,
+    SwitchContext,
+    SwitchNamespace,
+    OpenKubeconfig,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum DetailMode {
     Smart,
@@ -205,6 +236,7 @@ pub struct App {
     // Resource table
     pub resources: Vec<ResourceEntry>,
     pub resource_state: TableState,
+    pub resource_table_state: TableState,
     pub selected_resource_type: Option<ResourceType>,
     pub resource_counts: std::collections::HashMap<ResourceType, usize>,
 
@@ -222,9 +254,10 @@ pub struct App {
     pub detail_namespace: String,
     pub related_events: Vec<RelatedEvent>,
 
-    // Edit / Exec
+    // Edit / Exec / Create
     pub pending_edit: Option<PendingEdit>,
     pub pending_exec: Option<PendingExec>,
+    pub pending_create: Option<PendingCreate>,
     pub exec_terminal_override: Option<String>,
     pub edit_ctx: Option<EditContext>,
     /// Tracks which label/annotation keys are expanded in smart view.
@@ -267,6 +300,26 @@ pub struct App {
     pub paused: bool,
     pub last_refresh: std::time::Instant,
 
+    // Watch mode for detail view
+    pub detail_auto_refresh: bool,
+
+    // Diff between resources
+    pub diff_mark: Option<(String, String, String)>, // (name, namespace, yaml)
+
+    // Command palette
+    pub palette_open: bool,
+    pub palette_global: bool,
+    pub palette_buf: String,
+    pub palette_results: Vec<PaletteEntry>,
+    pub palette_cursor: usize,
+    pub palette_all_resources: Vec<(ResourceType, Vec<crate::k8s::ResourceEntry>)>,
+
+    // Help palette
+    pub help_open: bool,
+    pub help_buf: String,
+    pub help_cursor: usize,
+    pub help_scroll: usize,
+
     // Port forwards
     pub pf_manager: PortForwardManager,
     pub showing_port_forwards: bool,
@@ -297,6 +350,7 @@ impl App {
             nav_state,
             resources: Vec::new(),
             resource_state: TableState::default(),
+            resource_table_state: TableState::default(),
             selected_resource_type: None,
             resource_counts: std::collections::HashMap::new(),
             cluster_stats: None,
@@ -311,6 +365,7 @@ impl App {
             related_events: Vec::new(),
             pending_edit: None,
             pending_exec: None,
+            pending_create: None,
             exec_terminal_override: None,
             edit_ctx: None,
             expanded_keys: std::collections::HashSet::new(),
@@ -335,6 +390,18 @@ impl App {
             error: None,
             pending_load: Some(PendingLoad::ClusterStats),
             last_refresh: std::time::Instant::now(),
+            detail_auto_refresh: true,
+            diff_mark: None,
+            palette_open: false,
+            palette_global: false,
+            palette_buf: String::new(),
+            palette_results: Vec::new(),
+            palette_cursor: 0,
+            palette_all_resources: Vec::new(),
+            help_open: false,
+            help_buf: String::new(),
+            help_cursor: 0,
+            help_scroll: 0,
             pf_manager: PortForwardManager::new(),
             showing_port_forwards: false,
             pf_cursor: 0,
@@ -578,6 +645,21 @@ impl App {
                 self.pending_load = Some(PendingLoad::Resources);
             }
         }
+        // Detail view watch mode
+        if self.detail_auto_refresh
+            && self.view == View::Detail
+            && self.popup.is_none()
+            && self.pending_load.is_none()
+            && self.last_refresh.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            if !self.detail_name.is_empty() {
+                self.pending_load = Some(PendingLoad::ResourceDetail {
+                    name: self.detail_name.clone(),
+                    namespace: self.detail_namespace.clone(),
+                });
+                self.last_refresh = std::time::Instant::now();
+            }
+        }
     }
 
     fn load_namespaces(&mut self) {
@@ -631,12 +713,14 @@ impl App {
                     self.detail_value = value;
                     self.detail_name = name.to_string();
                     self.detail_namespace = ns.to_string();
-                    self.detail_scroll = 0;
-                    self.detail_mode = DetailMode::Smart;
-                    self.expanded_keys.clear();
-                    self.dict_entries.clear();
-                    self.dict_cursor = None;
-                    self.dict_line_offsets.clear();
+                    if !self.detail_auto_refresh {
+                        self.detail_scroll = 0;
+                        self.detail_mode = DetailMode::Smart;
+                        self.expanded_keys.clear();
+                        self.dict_entries.clear();
+                        self.dict_cursor = None;
+                        self.dict_line_offsets.clear();
+                    }
                     self.view = View::Detail;
                     self.error = None;
                     // Fetch related events for describe-style view
@@ -898,6 +982,26 @@ impl App {
     }
 
     fn handle_mouse_scroll(&mut self, delta: i32) {
+        if self.help_open {
+            let count = self.filtered_help_entries().len();
+            if count > 0 {
+                let current = self.help_cursor as i32;
+                let next = (current + delta).clamp(0, count.saturating_sub(1) as i32) as usize;
+                self.help_cursor = next;
+            }
+            return;
+        }
+
+        if self.palette_open {
+            let count = self.palette_results.len();
+            if count > 0 {
+                let current = self.palette_cursor as i32;
+                let next = (current + delta).clamp(0, count.saturating_sub(1) as i32) as usize;
+                self.palette_cursor = next;
+            }
+            return;
+        }
+
         if self.popup.is_some() {
             // Scroll popup list
             if let Some(popup) = &mut self.popup {
@@ -920,6 +1024,17 @@ impl App {
                     | Popup::ScaleInput { .. }
                     | Popup::ExecShell { .. }
                     | Popup::KubeconfigInput { .. } => {},
+                }
+            }
+            return;
+        }
+
+        if self.view == View::EditDiff {
+            if let Some(ctx) = &mut self.edit_ctx {
+                if delta < 0 {
+                    ctx.scroll = ctx.scroll.saturating_sub(delta.unsigned_abs() as u16);
+                } else {
+                    ctx.scroll = ctx.scroll.saturating_add(delta as u16);
                 }
             }
             return;
@@ -992,6 +1107,21 @@ impl App {
             return;
         }
 
+        if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_palette(false);
+            return;
+        }
+
+        if self.help_open {
+            self.handle_help_key(key);
+            return;
+        }
+
+        if self.palette_open {
+            self.handle_palette_key(key);
+            return;
+        }
+
         // [p] Toggle pause — global, works in any view (except popups/filter
         // editing/port forwards/logs)
         if key.code == KeyCode::Char('p') && self.popup.is_none() && !self.resource_filter_editing {
@@ -1006,6 +1136,13 @@ impl App {
                 };
                 return;
             }
+        }
+
+        if key.code == KeyCode::Char('?') && self.popup.is_none() && !self.resource_filter_editing {
+            self.help_open = true;
+            self.help_buf.clear();
+            self.help_cursor = 0;
+            return;
         }
 
         if self.popup.is_some() {
@@ -1134,6 +1271,7 @@ impl App {
             self.showing_port_forwards = false;
             if self.selected_resource_type != Some(rt) {
                 self.selected_resource_type = Some(rt);
+                self.resource_table_state = TableState::default();
                 self.events_scroll = 0;
                 self.events_cursor = 0;
                 self.events_auto_scroll = true;
@@ -1275,11 +1413,23 @@ impl App {
             | KeyCode::Char('e') => {
                 self.start_edit_from_list();
             },
+            | KeyCode::Char('y') => {
+                self.copy_resource_name();
+            },
             | KeyCode::Char('F') => {
                 self.open_port_forward_dialog();
             },
             | KeyCode::Char('D') => {
                 self.open_delete_confirm();
+            },
+            | KeyCode::Char('R') => {
+                self.restart_selected_workload();
+            },
+            | KeyCode::Char('d') => {
+                self.handle_diff_mark();
+            },
+            | KeyCode::Char('C') => {
+                self.start_create_resource();
             },
             | KeyCode::Char('S') => {
                 self.open_scale_input();
@@ -1441,6 +1591,17 @@ impl App {
             },
             | KeyCode::Char('D') => {
                 self.open_delete_confirm_detail();
+            },
+            | KeyCode::Char('R') => {
+                self.restart_selected_workload();
+            },
+            | KeyCode::Char('w') => {
+                self.detail_auto_refresh = !self.detail_auto_refresh;
+                self.status = if self.detail_auto_refresh {
+                    "Watch mode enabled".into()
+                } else {
+                    "Watch mode disabled".into()
+                };
             },
             | KeyCode::Char('S') => {
                 self.open_scale_input_detail();
@@ -2138,6 +2299,539 @@ fn spawn_terminal_window(terminal_app: &str, command: &str) -> Result<std::proce
 
 impl App {
     // -----------------------------------------------------------------------
+    // Restart workload
+    // -----------------------------------------------------------------------
+
+    fn restart_selected_workload(&mut self) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) if rt.supports_scale() || matches!(rt, ResourceType::DaemonSet) => rt,
+            | _ => return,
+        };
+        let (name, namespace) = if self.view == View::Detail {
+            (self.detail_name.clone(), self.detail_namespace.clone())
+        } else {
+            let visible = self.visible_resource_indices();
+            let vis_pos = self
+                .resource_state
+                .selected()
+                .and_then(|sel| visible.iter().position(|&i| i == sel))
+                .unwrap_or(0);
+            match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+                | Some(e) => (e.name.clone(), e.namespace.clone()),
+                | None => return,
+            }
+        };
+        match self.rt.block_on(self.kube.restart_workload(rt, &namespace, &name)) {
+            | Ok(()) => {
+                self.status = format!("Restarted {}/{}", rt.display_name(), name);
+                self.error = None;
+            },
+            | Err(e) => {
+                self.error = Some(format!("Restart failed: {}", e));
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Copy resource name
+    // -----------------------------------------------------------------------
+
+    fn copy_resource_name(&mut self) {
+        let visible = self.visible_resource_indices();
+        let vis_pos = self
+            .resource_state
+            .selected()
+            .and_then(|sel| visible.iter().position(|&i| i == sel))
+            .unwrap_or(0);
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+            | Some(e) => e,
+            | None => return,
+        };
+        let name = entry.name.clone();
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&name)) {
+            | Ok(()) => {
+                self.status = format!("Copied '{}'", name);
+                self.error = None;
+            },
+            | Err(e) => {
+                self.error = Some(format!("Clipboard error: {}", e));
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Diff between resources
+    // -----------------------------------------------------------------------
+
+    fn handle_diff_mark(&mut self) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) => rt,
+            | None => return,
+        };
+        let visible = self.visible_resource_indices();
+        let vis_pos = self
+            .resource_state
+            .selected()
+            .and_then(|sel| visible.iter().position(|&i| i == sel))
+            .unwrap_or(0);
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+            | Some(e) => e,
+            | None => return,
+        };
+        let name = entry.name.clone();
+        let namespace = entry.namespace.clone();
+
+        if let Some((mark_name, _mark_ns, mark_yaml)) = self.diff_mark.take() {
+            // Second resource selected - fetch its YAML and show diff
+            match self.rt.block_on(self.kube.get_resource(rt, &namespace, &name)) {
+                | Ok(value) => {
+                    let yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                    let diff_lines = compute_diff(&mark_yaml, &yaml);
+                    self.edit_ctx = Some(EditContext {
+                        resource_type: rt,
+                        name: format!("{} vs {}", mark_name, name),
+                        namespace: namespace.clone(),
+                        original_yaml: mark_yaml,
+                        edited_yaml: yaml,
+                        diff_lines,
+                        diff_mode: DiffMode::Inline,
+                        scroll: 0,
+                        error: None,
+                    });
+                    self.view = View::EditDiff;
+                    self.status = format!("Diff: {} vs {}", mark_name, name);
+                },
+                | Err(e) => {
+                    self.error = Some(format!("Failed to fetch resource: {}", e));
+                },
+            }
+        } else {
+            // First resource - mark it
+            match self.rt.block_on(self.kube.get_resource(rt, &namespace, &name)) {
+                | Ok(value) => {
+                    let yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                    self.diff_mark = Some((name.clone(), namespace, yaml));
+                    self.status = format!("Marked '{}' for diff \u{2014} select another and press [d]", name);
+                    self.error = None;
+                },
+                | Err(e) => {
+                    self.error = Some(format!("Failed to fetch resource: {}", e));
+                },
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Create resource
+    // -----------------------------------------------------------------------
+
+    fn start_create_resource(&mut self) {
+        let ns = self.kube.current_namespace().unwrap_or("default").to_string();
+        let template = format!(
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: new-resource\n  namespace: {}\ndata: {{}}\n",
+            ns
+        );
+        self.pending_create = Some(PendingCreate { yaml: template });
+    }
+
+    pub fn handle_create_result(&mut self, yaml: String) {
+        if yaml.trim().is_empty() {
+            self.status = "Empty YAML, nothing created".into();
+            return;
+        }
+        match self.rt.block_on(self.kube.create_resource_yaml(&yaml)) {
+            | Ok(_) => {
+                self.status = "Resource created".into();
+                self.error = None;
+                self.pending_load = Some(PendingLoad::Resources);
+            },
+            | Err(e) => {
+                self.error = Some(format!("Create failed: {}", e));
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Command palette
+    // -----------------------------------------------------------------------
+
+    fn toggle_palette(&mut self, global: bool) {
+        if self.palette_open {
+            self.palette_open = false;
+            self.palette_all_resources.clear();
+        } else {
+            self.palette_open = true;
+            self.palette_global = global;
+            self.palette_buf.clear();
+            self.palette_cursor = 0;
+
+            if global {
+                self.palette_all_resources.clear();
+                for (_, types) in ResourceType::all_by_category() {
+                    for rt in types {
+                        if rt == ResourceType::Event {
+                            continue;
+                        }
+                        if let Ok(entries) = self.rt.block_on(self.kube.list_resources(rt)) {
+                            if !entries.is_empty() {
+                                self.palette_all_resources.push((rt, entries));
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.update_palette_results();
+        }
+    }
+
+    fn update_palette_results(&mut self) {
+        self.palette_results.clear();
+        let query = self.palette_buf.to_lowercase();
+        let is_command = query.starts_with('>');
+
+        if is_command {
+            let cmd_query = query.trim_start_matches('>');
+            let commands: Vec<(PaletteCommand, &str)> = vec![
+                (PaletteCommand::Restart, "Restart Workload"),
+                (PaletteCommand::Scale, "Scale Workload"),
+                (PaletteCommand::Delete, "Delete Resource"),
+                (PaletteCommand::PortForward, "Port Forward"),
+                (PaletteCommand::Create, "Create Resource"),
+                (PaletteCommand::SwitchContext, "Switch Context"),
+                (PaletteCommand::SwitchNamespace, "Switch Namespace"),
+                (PaletteCommand::OpenKubeconfig, "Open Kubeconfig"),
+            ];
+            for (cmd, label) in &commands {
+                if cmd_query.is_empty() || label.to_lowercase().contains(cmd_query) {
+                    self.palette_results.push(PaletteEntry {
+                        label: label.to_string(),
+                        kind: PaletteEntryKind::Command(cmd.clone()),
+                    });
+                }
+            }
+            if self.experimental {
+                let label = "Exec Shell";
+                if cmd_query.is_empty() || label.to_lowercase().contains(cmd_query) {
+                    self.palette_results.push(PaletteEntry {
+                        label: label.to_string(),
+                        kind: PaletteEntryKind::Command(PaletteCommand::Exec),
+                    });
+                }
+            }
+        } else if self.palette_global {
+            // Fuzzy search over ALL resource types — searchable as "type/name"
+            for (rt, entries) in &self.palette_all_resources {
+                let singular = rt.singular_name();
+                for entry in entries {
+                    // Include "type/name" so users can search e.g. "deployment/myapp"
+                    let haystack = format!(
+                        "{} {}/{} {} {}",
+                        singular,
+                        singular,
+                        entry.name,
+                        entry.namespace,
+                        entry.columns.join(" ")
+                    )
+                    .to_lowercase();
+                    if query.is_empty() || query.split_whitespace().all(|word| haystack.contains(word)) {
+                        let label = if entry.namespace.is_empty() {
+                            format!("{}/{}", singular, entry.name)
+                        } else {
+                            format!("{}/{}  ({})", singular, entry.name, entry.namespace)
+                        };
+                        self.palette_results.push(PaletteEntry {
+                            label,
+                            kind: PaletteEntryKind::Resource {
+                                name: entry.name.clone(),
+                                namespace: entry.namespace.clone(),
+                                resource_type: Some(*rt),
+                            },
+                        });
+                    }
+                    if self.palette_results.len() >= 100 {
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Fuzzy search over current resource list
+            let singular = self.selected_resource_type.map(|rt| rt.singular_name()).unwrap_or("");
+            for entry in self.resources.iter() {
+                let haystack = format!(
+                    "{} {}/{} {} {}",
+                    singular,
+                    singular,
+                    entry.name,
+                    entry.namespace,
+                    entry.columns.join(" ")
+                )
+                .to_lowercase();
+                if query.is_empty() || query.split_whitespace().all(|word| haystack.contains(word)) {
+                    let label = if entry.namespace.is_empty() {
+                        format!("{}/{}", singular, entry.name)
+                    } else {
+                        format!("{}/{}  ({})", singular, entry.name, entry.namespace)
+                    };
+                    self.palette_results.push(PaletteEntry {
+                        label,
+                        kind: PaletteEntryKind::Resource {
+                            name: entry.name.clone(),
+                            namespace: entry.namespace.clone(),
+                            resource_type: None,
+                        },
+                    });
+                }
+            }
+        }
+        // Clamp cursor
+        if !self.palette_results.is_empty() {
+            self.palette_cursor = self.palette_cursor.min(self.palette_results.len() - 1);
+        } else {
+            self.palette_cursor = 0;
+        }
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Esc => {
+                self.palette_open = false;
+            },
+            | KeyCode::Enter => {
+                if let Some(entry) = self.palette_results.get(self.palette_cursor) {
+                    match &entry.kind {
+                        | PaletteEntryKind::Resource {
+                            name,
+                            namespace,
+                            resource_type,
+                        } => {
+                            let name = name.clone();
+                            let namespace = namespace.clone();
+                            let rt = *resource_type;
+                            self.palette_open = false;
+                            self.palette_all_resources.clear();
+                            // If global result, switch to that resource type first
+                            if let Some(rt) = rt {
+                                self.selected_resource_type = Some(rt);
+                                self.showing_port_forwards = false;
+                                self.view = View::Main;
+                                // Load the resource list for this type so detail can work
+                                if let Ok(entries) = self.rt.block_on(self.kube.list_resources(rt)) {
+                                    if let Some(idx) =
+                                        entries.iter().position(|e| e.name == name && e.namespace == namespace)
+                                    {
+                                        self.resource_state.select(Some(idx));
+                                    }
+                                    self.resource_counts.insert(rt, entries.len());
+                                    self.resources = entries;
+                                }
+                                // Select the matching nav item
+                                if let Some(nav_idx) = self
+                                    .nav_items
+                                    .iter()
+                                    .position(|item| matches!(&item.kind, NavItemKind::Resource(r) if *r == rt))
+                                {
+                                    self.nav_state.select(Some(nav_idx));
+                                }
+                            }
+                            self.pending_load = Some(PendingLoad::ResourceDetail { name, namespace });
+                        },
+                        | PaletteEntryKind::Command(cmd) => {
+                            let cmd = cmd.clone();
+                            self.palette_open = false;
+                            self.execute_palette_command(cmd);
+                        },
+                    }
+                }
+            },
+            | KeyCode::Tab => {
+                // Toggle between local and global search
+                let was_global = self.palette_global;
+                self.palette_global = !was_global;
+                if self.palette_global && self.palette_all_resources.is_empty() {
+                    for (_, types) in ResourceType::all_by_category() {
+                        for rt in types {
+                            if rt == ResourceType::Event {
+                                continue;
+                            }
+                            if let Ok(entries) = self.rt.block_on(self.kube.list_resources(rt)) {
+                                if !entries.is_empty() {
+                                    self.palette_all_resources.push((rt, entries));
+                                }
+                            }
+                        }
+                    }
+                }
+                self.palette_cursor = 0;
+                self.update_palette_results();
+            },
+            | KeyCode::Up => {
+                if self.palette_cursor > 0 {
+                    self.palette_cursor -= 1;
+                }
+            },
+            | KeyCode::Down => {
+                if !self.palette_results.is_empty() && self.palette_cursor < self.palette_results.len() - 1 {
+                    self.palette_cursor += 1;
+                }
+            },
+            | KeyCode::Backspace => {
+                self.palette_buf.pop();
+                self.palette_cursor = 0;
+                self.update_palette_results();
+            },
+            | KeyCode::Char(c) => {
+                self.palette_buf.push(c);
+                self.palette_cursor = 0;
+                self.update_palette_results();
+            },
+            | _ => {},
+        }
+    }
+
+    fn execute_palette_command(&mut self, cmd: PaletteCommand) {
+        match cmd {
+            | PaletteCommand::Restart => self.restart_selected_workload(),
+            | PaletteCommand::Scale => self.open_scale_input(),
+            | PaletteCommand::Delete => self.open_delete_confirm(),
+            | PaletteCommand::PortForward => self.open_port_forward_dialog(),
+            | PaletteCommand::Exec => self.open_exec_shell(true),
+            | PaletteCommand::Create => self.start_create_resource(),
+            | PaletteCommand::SwitchContext => self.open_context_selector(),
+            | PaletteCommand::SwitchNamespace => {
+                self.pending_load = Some(PendingLoad::Namespaces);
+            },
+            | PaletteCommand::OpenKubeconfig => {
+                let default = self
+                    .kube
+                    .kubeconfig_path()
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("KUBECONFIG").ok())
+                    .unwrap_or_else(|| "~/.kube/config".to_string());
+                self.popup = Some(Popup::KubeconfigInput { buf: default });
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Help palette
+    // -----------------------------------------------------------------------
+
+    pub fn help_entries(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+        // (key, description, context)
+        let mut entries: Vec<(&str, &str, &str)> = vec![
+            // Global
+            ("Ctrl+C", "Force quit", "Global"),
+            ("q", "Quit / back", "Global"),
+            ("Esc", "Back / dismiss", "Global"),
+            ("?", "Help (this palette)", "Global"),
+            ("Ctrl+P", "Command palette", "Global"),
+            ("p", "Pause/resume auto-refresh", "Global"),
+            // Main view - navigation
+            ("j/k", "Navigate sidebar or resource table", "Main"),
+            ("Enter", "Open detail / focus right panel", "Main"),
+            ("Tab", "Toggle sidebar / table focus", "Main"),
+            ("r", "Focus resource table", "Main"),
+            // Main view - actions
+            ("c", "Switch cluster context", "Main"),
+            ("n", "Switch namespace", "Main"),
+            ("O", "Open kubeconfig", "Main"),
+            ("/", "Filter resources by regex", "Main"),
+            ("x", "Clear filter", "Main"),
+            ("e", "Edit resource ($EDITOR)", "Main"),
+            ("l", "Open logs (workloads)", "Main"),
+            ("F", "Port forward", "Main"),
+            ("D", "Delete resource", "Main"),
+            ("R", "Restart workload", "Main"),
+            ("S", "Scale workload", "Main"),
+            ("y", "Copy resource name", "Main"),
+            ("d", "Mark / diff resources", "Main"),
+            ("C", "Create new resource", "Main"),
+            // Detail view
+            ("v", "Cycle Smart / YAML view", "Detail"),
+            ("j/k", "Scroll or navigate entries", "Detail"),
+            ("s", "Enter/leave label selection", "Detail"),
+            ("Space", "Expand/collapse or decode", "Detail"),
+            ("y", "Copy value or YAML", "Detail"),
+            ("e", "Edit resource", "Detail"),
+            ("l", "Open logs", "Detail"),
+            ("F", "Port forward", "Detail"),
+            ("D", "Delete resource", "Detail"),
+            ("R", "Restart workload", "Detail"),
+            ("S", "Scale workload", "Detail"),
+            ("w", "Toggle watch mode", "Detail"),
+            // Log view
+            ("f", "Toggle follow (live streaming)", "Logs"),
+            ("/", "Filter by regex", "Logs"),
+            ("x", "Clear filter", "Logs"),
+            ("p", "Select pod", "Logs"),
+            ("c", "Select container", "Logs"),
+            ("G/g", "Jump to bottom/top", "Logs"),
+            // Edit diff
+            ("v", "Cycle inline / side-by-side", "Edit Diff"),
+            ("Enter", "Apply changes", "Edit Diff"),
+            ("e", "Re-edit", "Edit Diff"),
+            // Port forwards
+            ("j/k", "Navigate list", "Port Forwards"),
+            ("p", "Pause/resume forward", "Port Forwards"),
+            ("d", "Cancel forward", "Port Forwards"),
+        ];
+
+        if self.experimental {
+            entries.push(("x", "Exec shell ($TERMINAL/$TERM_PROGRAM)", "Main"));
+            entries.push(("X", "Exec custom cmd/terminal", "Main"));
+            entries.push(("x", "Exec shell ($TERMINAL/$TERM_PROGRAM)", "Detail"));
+            entries.push(("X", "Exec custom cmd/terminal", "Detail"));
+        }
+
+        entries
+    }
+
+    pub fn filtered_help_entries(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+        let query = self.help_buf.to_lowercase();
+        self.help_entries()
+            .into_iter()
+            .filter(|(key, desc, ctx)| {
+                if query.is_empty() {
+                    return true;
+                }
+                let haystack = format!("{} {} {}", key, desc, ctx).to_lowercase();
+                query.split_whitespace().all(|word| haystack.contains(word))
+            })
+            .collect()
+    }
+
+    fn handle_help_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Esc => {
+                self.help_open = false;
+            },
+            | KeyCode::Up => {
+                if self.help_cursor > 0 {
+                    self.help_cursor -= 1;
+                }
+            },
+            | KeyCode::Down => {
+                let count = self.filtered_help_entries().len();
+                if count > 0 && self.help_cursor < count.saturating_sub(1) {
+                    self.help_cursor += 1;
+                }
+            },
+            | KeyCode::Backspace => {
+                self.help_buf.pop();
+                self.help_cursor = 0;
+                self.help_scroll = 0;
+            },
+            | KeyCode::Char(c) => {
+                self.help_buf.push(c);
+                self.help_cursor = 0;
+                self.help_scroll = 0;
+            },
+            | _ => {},
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Delete
     // -----------------------------------------------------------------------
 
@@ -2747,11 +3441,11 @@ fn compute_diff(original: &str, edited: &str) -> Vec<(DiffKind, String)> {
             | ChangeTag::Delete => DiffKind::Removed,
         };
         let prefix = match kind {
-            | DiffKind::Context => "  ",
-            | DiffKind::Added => "+ ",
-            | DiffKind::Removed => "- ",
+            | DiffKind::Context => " ",
+            | DiffKind::Added => "+",
+            | DiffKind::Removed => "-",
         };
-        lines.push((kind, format!("{}{}", prefix, change.value().trim_end())));
+        lines.push((kind, format!("{} {}", prefix, change.value().trim_end())));
     }
     lines
 }

@@ -101,6 +101,11 @@ fn run_event_loop(
             app.spawn_exec_terminal();
         }
 
+        // Handle pending create — suspend TUI, open editor, apply on save
+        if let Some(create) = app.pending_create.take() {
+            run_create_editor(terminal, &mut app, create)?;
+        }
+
         if app.should_quit {
             return Ok(());
         }
@@ -145,6 +150,50 @@ fn run_external_editor(
     match status {
         | Ok(s) if s.success() => {
             app.handle_edit_result(edit, edited_yaml);
+        },
+        | Ok(s) => {
+            app.error = Some(format!("Editor exited with status: {}", s));
+        },
+        | Err(e) => {
+            app.error = Some(format!("Failed to run editor '{}': {}", editor, e));
+        },
+    }
+
+    Ok(())
+}
+
+fn run_create_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut app::App,
+    create: app::PendingCreate,
+) -> Result<()> {
+    let tmp = tempfile::Builder::new().suffix(".yaml").tempfile()?;
+    std::fs::write(tmp.path(), &create.yaml)?;
+
+    // Suspend TUI
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    terminal.show_cursor()?;
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
+        if std::process::Command::new("vim").arg("--version").output().is_ok() {
+            "vim".into()
+        } else {
+            "vi".into()
+        }
+    });
+
+    let status = std::process::Command::new(&editor).arg(tmp.path()).status();
+    let yaml = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+
+    // Restore TUI
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()?;
+
+    match status {
+        | Ok(s) if s.success() => {
+            app.handle_create_result(yaml);
         },
         | Ok(s) => {
             app.error = Some(format!("Editor exited with status: {}", s));

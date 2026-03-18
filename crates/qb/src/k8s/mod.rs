@@ -138,6 +138,36 @@ impl ResourceType {
         }
     }
 
+    pub fn singular_name(&self) -> &'static str {
+        match self {
+            | Self::Deployment => "deployment",
+            | Self::StatefulSet => "statefulset",
+            | Self::DaemonSet => "daemonset",
+            | Self::ReplicaSet => "replicaset",
+            | Self::Pod => "pod",
+            | Self::CronJob => "cronjob",
+            | Self::Job => "job",
+            | Self::HorizontalPodAutoscaler => "hpa",
+            | Self::ConfigMap => "configmap",
+            | Self::Secret => "secret",
+            | Self::Service => "service",
+            | Self::Ingress => "ingress",
+            | Self::Endpoints => "endpoints",
+            | Self::NetworkPolicy => "networkpolicy",
+            | Self::PersistentVolumeClaim => "pvc",
+            | Self::PersistentVolume => "pv",
+            | Self::StorageClass => "storageclass",
+            | Self::ServiceAccount => "serviceaccount",
+            | Self::Role => "role",
+            | Self::RoleBinding => "rolebinding",
+            | Self::ClusterRole => "clusterrole",
+            | Self::ClusterRoleBinding => "clusterrolebinding",
+            | Self::Node => "node",
+            | Self::Namespace => "namespace",
+            | Self::Event => "event",
+        }
+    }
+
     pub fn column_headers(&self) -> Vec<&'static str> {
         match self {
             | Self::Deployment => vec!["NAME", "READY", "UP-TO-DATE", "AVAILABLE", "AGE"],
@@ -649,6 +679,80 @@ impl KubeClient {
         };
         let pp = kube::api::PostParams::default();
         let result = api.replace(name, &pp, &obj).await.context("Failed to apply resource")?;
+        let val = serde_json::to_value(&result)?;
+        Ok(val)
+    }
+
+    pub async fn restart_workload(&self, rt: ResourceType, ns: &str, name: &str) -> Result<()> {
+        let ar = rt.api_resource();
+        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.clone(), ns, &ar);
+        let now = Timestamp::now().to_string();
+        let patch = serde_json::json!({
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "kubectl.kubernetes.io/restartedAt": now
+                        }
+                    }
+                }
+            }
+        });
+        let pp = kube::api::PatchParams::default();
+        api.patch(name, &pp, &kube::api::Patch::Merge(&patch))
+            .await
+            .context("Failed to restart workload")?;
+        Ok(())
+    }
+
+    pub async fn create_resource_yaml(&self, yaml: &str) -> Result<Value> {
+        let value: Value = serde_yaml::from_str(yaml).context("Invalid YAML")?;
+
+        // Extract apiVersion, kind, metadata from the YAML to determine the API
+        // resource
+        let api_version = value.get("apiVersion").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let namespace = value
+            .get("metadata")
+            .and_then(|m| m.get("namespace"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+
+        if kind.is_empty() || api_version.is_empty() {
+            anyhow::bail!("YAML must contain apiVersion and kind");
+        }
+
+        // Parse the group and version from apiVersion (e.g., "apps/v1" -> group="apps",
+        // version="v1")
+        let (group, version) = if api_version.contains('/') {
+            let parts: Vec<&str> = api_version.splitn(2, '/').collect();
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            (String::new(), api_version.to_string())
+        };
+
+        // Build plural from kind (simple lowercase + s, covers most cases)
+        let plural = format!("{}s", kind.to_lowercase());
+
+        let ar = kube::api::ApiResource {
+            group,
+            version,
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            plural,
+        };
+
+        let obj: kube::api::DynamicObject = serde_yaml::from_str(yaml).context("Invalid YAML for DynamicObject")?;
+        // If no namespace in YAML, use current namespace (or "default")
+        let effective_ns = if namespace.is_empty() {
+            self.current_namespace.as_deref().unwrap_or("default")
+        } else {
+            namespace
+        };
+        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.clone(), effective_ns, &ar);
+
+        let pp = kube::api::PostParams::default();
+        let result = api.create(&pp, &obj).await.context("Failed to create resource")?;
         let val = serde_json::to_value(&result)?;
         Ok(val)
     }
