@@ -62,7 +62,7 @@ use {
 // Resource type definitions
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResourceType {
     // Workloads
     Deployment,
@@ -169,6 +169,23 @@ impl ResourceType {
     }
 
     pub fn supports_logs(&self) -> bool {
+        matches!(
+            self,
+            Self::Deployment
+                | Self::StatefulSet
+                | Self::DaemonSet
+                | Self::ReplicaSet
+                | Self::Pod
+                | Self::CronJob
+                | Self::Job
+        )
+    }
+
+    pub fn supports_scale(&self) -> bool {
+        matches!(self, Self::Deployment | Self::StatefulSet | Self::ReplicaSet)
+    }
+
+    pub fn supports_exec(&self) -> bool {
         matches!(
             self,
             Self::Deployment
@@ -295,6 +312,14 @@ pub struct PodInfo {
     pub containers: Vec<String>,
 }
 
+pub struct RelatedEvent {
+    pub type_: String,
+    pub reason: String,
+    pub message: String,
+    pub count: i32,
+    pub last_seen: String,
+}
+
 // ---------------------------------------------------------------------------
 // Cluster stats
 // ---------------------------------------------------------------------------
@@ -336,6 +361,7 @@ pub struct ClusterStatsData {
 pub struct KubeClient {
     client: Client,
     kubeconfig: Kubeconfig,
+    kubeconfig_path: Option<String>,
     current_context: String,
     current_namespace: Option<String>,
 }
@@ -370,9 +396,14 @@ impl KubeClient {
         Ok(Self {
             client,
             kubeconfig,
+            kubeconfig_path,
             current_context,
             current_namespace,
         })
+    }
+
+    pub fn kubeconfig_path(&self) -> Option<&str> {
+        self.kubeconfig_path.as_deref()
     }
 
     pub fn contexts(&self) -> Vec<String> {
@@ -489,8 +520,8 @@ impl KubeClient {
                     .unwrap_or_default(),
                 cpu_capacity: get_res(capacity, "cpu"),
                 cpu_allocatable: get_res(allocatable, "cpu"),
-                mem_capacity: get_res(capacity, "memory"),
-                mem_allocatable: get_res(allocatable, "memory"),
+                mem_capacity: format_memory_gb(&get_res(capacity, "memory")),
+                mem_allocatable: format_memory_gb(&get_res(allocatable, "memory")),
                 pods_capacity: get_res(capacity, "pods"),
                 pods_allocatable: get_res(allocatable, "pods"),
                 age: format_age(n.metadata.creation_timestamp.as_ref()),
@@ -620,6 +651,65 @@ impl KubeClient {
         let result = api.replace(name, &pp, &obj).await.context("Failed to apply resource")?;
         let val = serde_json::to_value(&result)?;
         Ok(val)
+    }
+
+    pub async fn delete_resource(&self, rt: ResourceType, ns: &str, name: &str) -> Result<()> {
+        let ar = rt.api_resource();
+        let api: Api<kube::api::DynamicObject> = if rt.is_cluster_scoped() {
+            Api::all_with(self.client.clone(), &ar)
+        } else {
+            Api::namespaced_with(self.client.clone(), ns, &ar)
+        };
+        let dp = kube::api::DeleteParams::default();
+        api.delete(name, &dp).await.context("Failed to delete resource")?;
+        Ok(())
+    }
+
+    pub async fn scale_resource(&self, rt: ResourceType, ns: &str, name: &str, replicas: u32) -> Result<()> {
+        let ar = rt.api_resource();
+        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.clone(), ns, &ar);
+        let patch = serde_json::json!({ "spec": { "replicas": replicas } });
+        let pp = kube::api::PatchParams::default();
+        api.patch(name, &pp, &kube::api::Patch::Merge(&patch))
+            .await
+            .context("Failed to scale resource")?;
+        Ok(())
+    }
+
+    pub async fn fetch_related_events(&self, ns: &str, resource_name: &str) -> Result<Vec<RelatedEvent>> {
+        let api: Api<Event> = if ns.is_empty() {
+            Api::all(self.client.clone())
+        } else {
+            Api::namespaced(self.client.clone(), ns)
+        };
+        let lp = ListParams::default().fields(&format!("involvedObject.name={}", resource_name));
+        let list = api.list(&lp).await.context("Failed to fetch events")?;
+        let mut events: Vec<RelatedEvent> = list
+            .items
+            .iter()
+            .map(|e| {
+                let last_seen = e
+                    .last_timestamp
+                    .as_ref()
+                    .map(|t| format_age(Some(t)))
+                    .or_else(|| {
+                        e.event_time.as_ref().map(|t| {
+                            let dur = jiff::Timestamp::now().duration_since(t.0);
+                            format_duration(dur)
+                        })
+                    })
+                    .unwrap_or_else(|| "-".into());
+                RelatedEvent {
+                    type_: e.type_.clone().unwrap_or_default(),
+                    reason: e.reason.clone().unwrap_or_default(),
+                    message: e.message.clone().unwrap_or_default(),
+                    count: e.count.unwrap_or(1),
+                    last_seen,
+                }
+            })
+            .collect();
+        events.reverse();
+        Ok(events)
     }
 
     // -- Generic list helper -------------------------------------------------
@@ -1383,6 +1473,42 @@ fn format_duration(dur: jiff::SignedDuration) -> String {
         format!("{}m", mins)
     } else {
         format!("{}s", secs)
+    }
+}
+
+/// Parse a Kubernetes memory quantity string (e.g. "16384Ki", "8Gi",
+/// "16777216000") and format it as gigabytes with one decimal place.
+fn format_memory_gb(raw: &str) -> String {
+    if raw == "-" || raw.is_empty() {
+        return raw.to_string();
+    }
+
+    let bytes: f64 = if let Some(val) = raw.strip_suffix("Ki") {
+        val.parse::<f64>().unwrap_or(0.0) * 1024.0
+    } else if let Some(val) = raw.strip_suffix("Mi") {
+        val.parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0
+    } else if let Some(val) = raw.strip_suffix("Gi") {
+        val.parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0 * 1024.0
+    } else if let Some(val) = raw.strip_suffix("Ti") {
+        val.parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0 * 1024.0 * 1024.0
+    } else if let Some(val) = raw.strip_suffix('K') {
+        val.parse::<f64>().unwrap_or(0.0) * 1000.0
+    } else if let Some(val) = raw.strip_suffix('M') {
+        val.parse::<f64>().unwrap_or(0.0) * 1_000_000.0
+    } else if let Some(val) = raw.strip_suffix('G') {
+        val.parse::<f64>().unwrap_or(0.0) * 1_000_000_000.0
+    } else if let Some(val) = raw.strip_suffix('T') {
+        val.parse::<f64>().unwrap_or(0.0) * 1_000_000_000_000.0
+    } else {
+        // Plain bytes
+        raw.parse::<f64>().unwrap_or(0.0)
+    };
+
+    let gb = bytes / (1024.0 * 1024.0 * 1024.0);
+    if gb >= 10.0 {
+        format!("{:.0}Gi", gb)
+    } else {
+        format!("{:.1}Gi", gb)
     }
 }
 

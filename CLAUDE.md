@@ -18,13 +18,16 @@ crates/qb/src/
   args.rs          CLI argument parsing (clap derive)
   k8s/mod.rs       K8s API client, resource types, pod resolution, log fetching, cluster stats,
                    resource editing (replace via DynamicObject)
-  tui/mod.rs       Terminal setup, event loop (render → load → poll logs → poll input),
+  portforward.rs   Port forward manager: background tasks, auto-restart, pod resolution,
+                   port extraction helpers, pause/resume/cancel lifecycle
+  tui/mod.rs       Terminal setup, event loop (render → load → poll logs → poll pf → poll input),
                    external editor invocation (suspend/resume terminal)
   tui/app.rs       App struct (all state), key/mouse handlers, deferred loading, filter state,
-                   dict entry selection/expansion, edit flow (diff, apply, re-edit)
+                   dict entry selection/expansion, edit flow (diff, apply, re-edit),
+                   port forward dialog + creation flow
   tui/ui.rs        Rendering: main view, detail view, log view, events log, cluster stats,
-                   edit diff view (inline + side-by-side), popups, breadcrumb with refresh
-                   indicator, hotkey bars, node grid cards, gauge bars
+                   port forwards view, edit diff view (inline + side-by-side), popups,
+                   breadcrumb with refresh indicator, hotkey bars, node grid cards, gauge bars
   tui/smart.rs     Per-resource-type structured renderers, SecretDetailState, DictState,
                    selectable labels/annotations, structured resource requests/limits
   tui/logs.rs      LogViewState, follow-mode streaming, regex filter
@@ -66,7 +69,7 @@ crates/qb/src/
 | `Ctrl+C` | Force quit |
 | `q` | Quit / back |
 | `Esc` | Back / dismiss |
-| `p` | Pause/resume auto-refresh (except log view where p = pod selector) |
+| `p` | Pause/resume auto-refresh (except log view, port forwards view) |
 
 ### Main View
 
@@ -82,6 +85,11 @@ crates/qb/src/
 | `x` | Clear filter |
 | `e` | Edit selected resource ($EDITOR) |
 | `l` | Open logs (workload resources) |
+| `F` | Create port forward (popup, for workload/service resources) |
+| `D` | Delete selected resource (confirmation popup) |
+| `S` | Scale workload (Deployment/StatefulSet/ReplicaSet) |
+| `x` | Exec into pod (when no filter active) — opens /bin/sh |
+| `X` | Exec with custom command/container (popup) |
 
 ### Detail View
 
@@ -94,6 +102,19 @@ crates/qb/src/
 | `y` | Copy: selected entry value, full YAML, or secret |
 | `e` | Edit resource ($EDITOR) |
 | `l` | Open logs (workload resources) |
+| `F` | Create port forward (popup) |
+| `D` | Delete resource (confirmation popup) |
+| `S` | Scale workload |
+| `x` | Exec into pod (/bin/sh) |
+| `X` | Exec with custom command/container (popup) |
+
+### Port Forwards View
+
+| Key | Action |
+|-----|--------|
+| `j`/`k` | Navigate port forward list |
+| `p` | Pause/resume selected forward |
+| `d` | Cancel (delete) selected forward |
 
 ### Edit Diff View
 
@@ -117,16 +138,23 @@ crates/qb/src/
 | `j`/`k` | Scroll |
 | `G`/`g` | Jump to bottom/top |
 
-## Resource Categories
+## Sidebar Structure
 
-Categories are ordered in the sidebar as:
+The sidebar has two super-categories:
 
+**CLUSTER** (all K8s resource categories):
 1. **Cluster** — Overview (stats), Nodes, Namespaces, Events
 2. **Workloads** — Deployments, StatefulSets, DaemonSets, ReplicaSets, Pods, CronJobs, Jobs, HPAs
 3. **Network** — Services, Ingresses, Endpoints, NetworkPolicies
 4. **Config** — ConfigMaps, Secrets
 5. **RBAC** — ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
 6. **Storage** — PVCs, PVs, StorageClasses
+
+**GLOBAL** (cross-cluster features):
+- **Port Forwards** — View, pause, resume, cancel active port forwards
+
+Super-categories and categories are non-selectable headers (`NavItemKind::SuperCategory`,
+`NavItemKind::Category`). Navigation with j/k skips over them.
 
 Cluster-scoped resources (Node, Namespace, PV, StorageClass, ClusterRole, ClusterRoleBinding)
 use `list_cluster`/`get_value_cluster` helpers instead of the namespaced variants.
@@ -169,6 +197,59 @@ Press `e` on any resource (from list or detail view) to edit it. The flow:
 5. On error, shows message and offers `e` to re-edit or `Esc` to cancel
 6. On success, returns to detail view with refreshed data
 
+### Port Forwarding
+
+Press `F` on any workload or service resource to create a port forward. The flow:
+1. Popup shows available ports (from `spec.ports` for Services, container ports for workloads)
+2. Navigate ports with `j`/`k`, edit local port number (defaults to same as remote)
+3. `Enter` creates the forward, `Esc` cancels
+4. Port forwards run as background tokio tasks with auto-restart on failure
+5. View all forwards in the GLOBAL > Port Forwards sidebar item
+
+Port forward architecture:
+- `PortForwardManager` in `portforward.rs` owns all entries and communicates with tasks via
+  `mpsc` channels (same pattern as log streaming)
+- Each forward binds a local `TcpListener` and for each connection resolves the current pod
+  (via label selector for services/deployments, direct name for pods)
+- Pod resolution per-connection means forwards survive pod restarts and rolling updates
+- Reconnection with exponential backoff (up to 10 retries per connection)
+- `cancel_tx`/`pause_tx` watch channels control lifecycle from the UI
+- Status updates flow from background tasks → `PfUpdate` channel → `poll_updates()`
+- `PfTarget::DirectPod` for pod forwards, `PfTarget::LabelSelector` for service/deployment
+
+### Delete Resource
+
+Press `D` on any resource (from list or detail view). Confirmation popup with Enter/y to
+confirm, Esc/n to cancel. Uses `Api::delete` via the dynamic API. After deletion, refreshes
+the resource list. If in detail view, returns to main view.
+
+### Scale Workloads
+
+Press `S` on Deployment, StatefulSet, or ReplicaSet. Popup shows current replica count and
+an editable field for the new count. Uses `Api::patch` with `Patch::Merge` to update
+`spec.replicas`. `ResourceType::supports_scale()` gates which types support this.
+
+### Container Exec/Shell
+
+Press `x` for quick exec (`/bin/sh` into first container of first pod). Press `X` for the
+full dialog: choose container (Tab/Up/Down), edit command string (split on whitespace for
+argv). The flow suspends TUI (like editor), opens an interactive session via kube exec API
+with TTY mode, and restores TUI on session end. Uses `Api::<Pod>::exec` with `AttachParams`
+and bidirectional async I/O between terminal stdin/stdout and pod streams.
+
+### Describe-Style Events
+
+The detail smart view automatically shows related events at the bottom, fetched via
+`KubeClient::fetch_related_events` using a `involvedObject.name` field selector. Events
+display type icon (green dot / yellow warning), age, repeat count, reason, and message.
+Fetched alongside the detail value in `load_resource_detail`.
+
+### Resource Count Badges
+
+Sidebar nav items show cached resource counts as `(N)` badges. Counts are updated in
+`load_resources()` and stored in `App::resource_counts: HashMap<ResourceType, usize>`.
+Only types that have been loaded at least once show counts.
+
 ### Pod/Container Selection
 
 In the log view, `p` and `c` open popup list selectors (not cycling). Lists include "All" as
@@ -178,7 +259,8 @@ the first entry. Navigate with j/k, select with Enter.
 
 `p` toggles auto-refresh globally (main view, detail view). When paused, the breadcrumb shows
 `⏸ paused` and log stream polling is suppressed. In the log view, `p` is the pod selector
-instead — use `f` (follow) to control live streaming there.
+instead — use `f` (follow) to control live streaming there. In the port forwards view, `p`
+pauses/resumes the selected port forward instead.
 
 ## Coding Standards
 
@@ -279,7 +361,7 @@ for exhaustive matching. No `unreachable!()` in dispatch.
 
 ## Dependencies
 
-- **kube** + **k8s-openapi** — K8s API client. Timestamps use `jiff` (not chrono).
+- **kube** + **k8s-openapi** — K8s API client. `ws` feature enables port forwarding. Timestamps use `jiff` (not chrono).
 - **ratatui** + **crossterm** — TUI framework.
 - **rustls** with `ring` feature — TLS crypto provider (must be explicit since rustls 0.23+).
 - **jiff** — Time arithmetic (duration formatting, age display). Replaced chrono.

@@ -11,7 +11,10 @@ use {
         },
         smart,
     },
-    crate::k8s::ResourceType,
+    crate::{
+        k8s::ResourceType,
+        portforward::PortForwardStatus,
+    },
     ratatui::{
         prelude::*,
         widgets::*,
@@ -130,7 +133,7 @@ fn render_main(f: &mut Frame, app: &mut App) {
             Constraint::Min(3),                // main area
             Constraint::Length(filter_height), // filter bar
             Constraint::Length(1),             // error line
-            Constraint::Length(1),             // hotkey tab bar
+            Constraint::Length(2),             // hotkey tab bar (2 lines for wrapping)
         ])
         .split(f.area());
 
@@ -166,35 +169,70 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|item| {
             let style = match &item.kind {
+                | NavItemKind::SuperCategory => {
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                },
                 | NavItemKind::Category => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 | NavItemKind::Resource(rt) => {
-                    if app.selected_resource_type == Some(*rt) {
+                    if app.selected_resource_type == Some(*rt) && !app.showing_port_forwards {
                         Style::default().fg(Color::Green)
                     } else {
                         Style::default().fg(Color::White)
                     }
                 },
                 | NavItemKind::ClusterStats => {
-                    if app.is_showing_cluster_stats() {
+                    if app.is_showing_cluster_stats() && !app.showing_port_forwards {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::White)
+                    }
+                },
+                | NavItemKind::PortForwards => {
+                    if app.showing_port_forwards {
                         Style::default().fg(Color::Green)
                     } else {
                         Style::default().fg(Color::White)
                     }
                 },
             };
-            ListItem::new(item.label.as_str()).style(style)
+            // Append resource count badge if available
+            let label = if let NavItemKind::Resource(rt) = &item.kind {
+                if let Some(&count) = app.resource_counts.get(rt) {
+                    format!("{} ({})", item.label, count)
+                } else {
+                    item.label.clone()
+                }
+            } else {
+                item.label.clone()
+            };
+            ListItem::new(label).style(style)
         })
         .collect();
 
     let focused = app.focus == Focus::Nav;
     let border_color = if focused { Color::Cyan } else { Color::DarkGray };
 
+    // Show active port forward count in nav title
+    let pf_count = app
+        .pf_manager
+        .entries()
+        .iter()
+        .filter(|e| e.status.is_running())
+        .count();
+    let title = if pf_count > 0 {
+        format!(" Resources (PF:{}) ", pf_count)
+    } else {
+        " Resources ".to_string()
+    };
+
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border_color))
-                .title(" Resources "),
+                .title(title),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
         .highlight_symbol("▶ ");
@@ -207,6 +245,12 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
+    // Port forwards view
+    if app.is_showing_port_forwards() {
+        render_port_forwards(f, app, area);
+        return;
+    }
+
     // Cluster stats overview
     if app.is_showing_cluster_stats() {
         render_cluster_stats(f, app, area);
@@ -823,7 +867,7 @@ fn render_detail(f: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(1), // breadcrumb
             Constraint::Min(3),    // content
-            Constraint::Length(1), // hotkey bar
+            Constraint::Length(2), // hotkey bar
         ])
         .split(f.area());
 
@@ -851,7 +895,7 @@ fn render_detail(f: &mut Frame, app: &mut App) {
     f.render_widget(paragraph, outer[1]);
 
     let bar = build_detail_hotkey_bar(app);
-    f.render_widget(Paragraph::new(bar), outer[2]);
+    f.render_widget(Paragraph::new(bar).wrap(Wrap { trim: false }), outer[2]);
 }
 
 // ---------------------------------------------------------------------------
@@ -878,7 +922,7 @@ fn render_edit_diff(f: &mut Frame, app: &mut App) {
             Constraint::Length(1),            // breadcrumb
             Constraint::Min(3),               // diff content
             Constraint::Length(error_height), // error
-            Constraint::Length(1),            // hotkey bar
+            Constraint::Length(2),            // hotkey bar
         ])
         .split(f.area());
 
@@ -1075,7 +1119,7 @@ fn render_edit_diff(f: &mut Frame, app: &mut App) {
         Span::styled(" Esc ", key_style),
         Span::styled(" Cancel", label_style),
     ]);
-    f.render_widget(Paragraph::new(bar), outer[3]);
+    f.render_widget(Paragraph::new(bar).wrap(Wrap { trim: false }), outer[3]);
 }
 
 fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
@@ -1104,6 +1148,48 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
             };
         }
     }
+
+    // Append related events (describe-style)
+    if !app.related_events.is_empty() {
+        let mut all_lines = lines;
+        all_lines.push(Line::from(""));
+        all_lines.push(Line::from(Span::styled(
+            "Events:",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+
+        // Header
+        all_lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<8} {:<6} {:<18} ", "AGE", "COUNT", "REASON"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("MESSAGE", Style::default().fg(Color::DarkGray)),
+        ]));
+
+        for ev in &app.related_events {
+            let type_style = if ev.type_ == "Warning" {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let icon = if ev.type_ == "Warning" { "⚠" } else { "●" };
+            let count_str = if ev.count > 1 {
+                format!("x{}", ev.count)
+            } else {
+                String::new()
+            };
+            all_lines.push(Line::from(vec![
+                Span::styled(format!("  {:<8} ", ev.last_seen), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:<6} ", count_str), Style::default().fg(Color::White)),
+                Span::styled(format!("{} {:<16} ", icon, ev.reason), type_style),
+                Span::styled(ev.message.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        return all_lines;
+    }
+
     lines
 }
 
@@ -1150,7 +1236,7 @@ fn render_logs(f: &mut Frame, app: &mut App) {
             Constraint::Length(1),             // breadcrumb
             Constraint::Min(3),                // log content
             Constraint::Length(filter_height), // filter bar
-            Constraint::Length(1),             // hotkey bar
+            Constraint::Length(2),             // hotkey bar
         ])
         .split(f.area());
 
@@ -1219,7 +1305,7 @@ fn render_logs(f: &mut Frame, app: &mut App) {
 
     // Hotkey bar
     let bar = build_log_hotkey_bar(state);
-    f.render_widget(Paragraph::new(bar), outer[3]);
+    f.render_widget(Paragraph::new(bar).wrap(Wrap { trim: false }), outer[3]);
 }
 
 fn build_log_hotkey_bar(state: &super::logs::LogViewState) -> Line<'static> {
@@ -1330,7 +1416,7 @@ fn render_hotkey_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Edit
-    if app.selected_resource_type.is_some() && app.focus == Focus::Resources {
+    if app.selected_resource_type.is_some() && app.focus == Focus::Resources && !app.showing_port_forwards {
         spans.extend([
             Span::styled(" e ", key_style),
             Span::styled(" Edit", label_style),
@@ -1338,27 +1424,93 @@ fn render_hotkey_bar(f: &mut Frame, app: &App, area: Rect) {
         ]);
     }
 
-    // Filter controls
-    spans.extend([
-        Span::styled(" / ", key_style),
-        Span::styled(" Filter", label_style),
-        sep.clone(),
-    ]);
-    if !app.resource_filter_text.is_empty() {
+    // Port forward
+    if app.selected_resource_type.is_some() && app.focus == Focus::Resources && !app.showing_port_forwards {
+        let rt = app.selected_resource_type.unwrap();
+        let supports_pf = matches!(
+            rt,
+            ResourceType::Service
+                | ResourceType::Deployment
+                | ResourceType::StatefulSet
+                | ResourceType::DaemonSet
+                | ResourceType::ReplicaSet
+                | ResourceType::Pod
+                | ResourceType::Job
+                | ResourceType::CronJob
+        );
+        if supports_pf {
+            spans.extend([
+                Span::styled(" F ", key_style),
+                Span::styled(" PortFwd", label_style),
+                sep.clone(),
+            ]);
+        }
+
+        // Scale
+        if rt.supports_scale() {
+            spans.extend([
+                Span::styled(" S ", key_style),
+                Span::styled(" Scale", label_style),
+                sep.clone(),
+            ]);
+        }
+
+        // Exec (experimental only, hide when filter active since x clears filter)
+        if app.experimental && rt.supports_exec() && app.resource_filter_text.is_empty() {
+            spans.extend([
+                Span::styled(" x ", key_style),
+                Span::styled(" Exec", label_style),
+                sep.clone(),
+            ]);
+        }
+
+        // Delete
         spans.extend([
-            Span::styled(" x ", key_style),
-            Span::styled(" Clear", label_style),
+            Span::styled(" D ", key_style),
+            Span::styled(" Delete", label_style),
             sep.clone(),
         ]);
     }
 
-    // Pause toggle
-    let pause_label = if app.paused { " Resume" } else { " Pause" };
-    spans.extend([
-        Span::styled(" p ", key_style),
-        Span::styled(pause_label, label_style),
-        sep.clone(),
-    ]);
+    // Port forwards view hotkeys
+    if app.showing_port_forwards && app.focus == Focus::Resources {
+        if !app.pf_manager.entries().is_empty() {
+            spans.extend([
+                Span::styled(" p ", key_style),
+                Span::styled(" Pause/Resume", label_style),
+                sep.clone(),
+                Span::styled(" d ", key_style),
+                Span::styled(" Cancel", label_style),
+                sep.clone(),
+            ]);
+        }
+    }
+
+    // Filter controls
+    if !app.showing_port_forwards {
+        spans.extend([
+            Span::styled(" / ", key_style),
+            Span::styled(" Filter", label_style),
+            sep.clone(),
+        ]);
+        if !app.resource_filter_text.is_empty() {
+            spans.extend([
+                Span::styled(" x ", key_style),
+                Span::styled(" Clear", label_style),
+                sep.clone(),
+            ]);
+        }
+    }
+
+    // Pause toggle (auto-refresh, not port forward pause)
+    if !app.showing_port_forwards {
+        let pause_label = if app.paused { " Resume" } else { " Pause" };
+        spans.extend([
+            Span::styled(" p ", key_style),
+            Span::styled(pause_label, label_style),
+            sep.clone(),
+        ]);
+    }
     if app.paused {
         spans.push(Span::styled(
             " ⏸ PAUSED ",
@@ -1367,10 +1519,16 @@ fn render_hotkey_bar(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled("  ", Style::default()));
     }
 
-    spans.extend([Span::styled(" q ", key_style), Span::styled(" Quit", label_style)]);
+    spans.extend([
+        Span::styled(" O ", key_style),
+        Span::styled(" Kubeconfig", label_style),
+        sep,
+        Span::styled(" q ", key_style),
+        Span::styled(" Quit", label_style),
+    ]);
 
     let bar = Line::from(spans);
-    f.render_widget(Paragraph::new(bar), area);
+    f.render_widget(Paragraph::new(bar).wrap(Wrap { trim: false }), area);
 }
 
 /// Context-sensitive hotkey bar for the detail view.
@@ -1486,6 +1644,108 @@ fn build_detail_hotkey_bar(app: &App) -> Line<'static> {
 // Popup overlay
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Port forwards view
+// ---------------------------------------------------------------------------
+
+fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
+    let entries = app.pf_manager.entries();
+
+    let focused = app.focus == Focus::Resources;
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+
+    if entries.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(" Port Forwards ");
+        let text = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No active port forwards",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Press [F] on a resource to create one",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(block);
+        f.render_widget(text, area);
+        return;
+    }
+
+    // Sync table state with cursor
+    app.pf_table_state
+        .select(if entries.is_empty() { None } else { Some(app.pf_cursor) });
+
+    // Build table rows
+    let header = Row::new(vec!["STATUS", "LOCAL", "REMOTE", "CLUSTER", "RESOURCE", "POD", "CONNS"])
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .bottom_margin(0);
+
+    let rows: Vec<Row> = entries
+        .iter()
+        .map(|entry| {
+            let status_style = match &entry.status {
+                | PortForwardStatus::Active => Style::default().fg(Color::Green),
+                | PortForwardStatus::Paused => Style::default().fg(Color::Yellow),
+                | PortForwardStatus::Reconnecting { .. } => Style::default().fg(Color::Yellow),
+                | PortForwardStatus::Error(_) => Style::default().fg(Color::Red),
+                | PortForwardStatus::Starting => Style::default().fg(Color::Cyan),
+                | PortForwardStatus::Cancelled => Style::default().fg(Color::DarkGray),
+            };
+
+            let status_text = match &entry.status {
+                | PortForwardStatus::Reconnecting { attempt } => format!("Retry({})", attempt),
+                | PortForwardStatus::Error(msg) => {
+                    if msg.len() > 20 {
+                        format!("Err:{:.20}", msg)
+                    } else {
+                        format!("Err:{}", msg)
+                    }
+                },
+                | other => other.display().to_string(),
+            };
+
+            Row::new(vec![
+                Cell::from(Span::styled(status_text, status_style)),
+                Cell::from(format!(":{}", entry.local_port)),
+                Cell::from(format!(":{}", entry.remote_port)),
+                Cell::from(entry.context.as_str()),
+                Cell::from(entry.resource_label.as_str()),
+                Cell::from(entry.pod_name.as_str()),
+                Cell::from(entry.connections.to_string()),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(rows, [
+        Constraint::Length(12),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Min(14),
+        Constraint::Min(18),
+        Constraint::Min(18),
+        Constraint::Length(6),
+    ])
+    .header(header)
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(" Port Forwards "),
+    );
+
+    f.render_stateful_widget(table, area, &mut app.pf_table_state);
+}
+
+// ---------------------------------------------------------------------------
+// Popup overlays
+// ---------------------------------------------------------------------------
+
 fn render_popup(f: &mut Frame, app: &mut App) {
     let current_context = app.kube.current_context().to_string();
     let current_namespace = app.kube.current_namespace().map(|s| s.to_string());
@@ -1495,9 +1755,27 @@ fn render_popup(f: &mut Frame, app: &mut App) {
         | None => return,
     };
 
-    let area = centered_rect(50, 60, f.area());
-    app.area_popup = area;
-    f.render_widget(Clear, area);
+    // PortForwardCreate / ConfirmDelete / ScaleInput / ExecShell use their own
+    // smaller area
+    let area = if matches!(popup, Popup::ExecShell { .. } | Popup::KubeconfigInput { .. }) {
+        let a = centered_rect(60, 65, f.area());
+        app.area_popup = a;
+        f.render_widget(Clear, a);
+        a
+    } else if matches!(
+        popup,
+        Popup::PortForwardCreate(_) | Popup::ConfirmDelete { .. } | Popup::ScaleInput { .. }
+    ) {
+        let a = centered_rect(45, 50, f.area());
+        app.area_popup = a;
+        f.render_widget(Clear, a);
+        a
+    } else {
+        let a = centered_rect(50, 60, f.area());
+        app.area_popup = a;
+        f.render_widget(Clear, a);
+        a
+    };
 
     match popup {
         | Popup::ContextSelect { items, state } => {
@@ -1587,6 +1865,186 @@ fn render_popup(f: &mut Frame, app: &mut App) {
                 .highlight_symbol("▶ ");
 
             f.render_stateful_widget(list, area, state);
+        },
+        | Popup::PortForwardCreate(dialog) => {
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                format!(" {}/{}", dialog.resource_type.display_name(), dialog.resource_name),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+
+            // Port list
+            for (i, port) in dialog.ports.iter().enumerate() {
+                let marker = if i == dialog.port_cursor { "▶ " } else { "  " };
+                let port_label = if port.name.is_empty() {
+                    format!("{}{}/{}", marker, port.container_port, port.protocol)
+                } else {
+                    format!("{}{}/{} ({})", marker, port.container_port, port.protocol, port.name)
+                };
+                let style = if i == dialog.port_cursor {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(Span::styled(port_label, style)));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(" Local port: ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{}_", dialog.local_port_buf),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " Enter=Create  Esc=Cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Port Forward ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::ConfirmDelete {
+            name, resource_type, ..
+        } => {
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  Delete {}/{}?", resource_type.display_name(), name),
+                Style::default().fg(Color::Red),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("  Press [Enter/y] to confirm, [Esc/n] to cancel"));
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" Confirm Delete ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::ScaleInput {
+            name,
+            resource_type,
+            current,
+            buf,
+            ..
+        } => {
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  {}/{}", resource_type.display_name(), name),
+                Style::default().fg(Color::Cyan),
+            )));
+            lines.push(Line::from(format!("  Current replicas: {}", current)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("  New replicas: {}▎", buf)));
+            lines.push(Line::from(""));
+            lines.push(Line::from("  Press [Enter] to apply, [Esc] to cancel"));
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Scale ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::ExecShell {
+            pod_name,
+            containers,
+            container_cursor,
+            command_buf,
+            terminal_buf,
+            editing_terminal,
+            ..
+        } => {
+            let cmd_style = if !*editing_terminal {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let term_style = if *editing_terminal {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  Pod: {}", pod_name),
+                Style::default().fg(Color::Cyan),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("  Container:"));
+            for (i, c) in containers.iter().enumerate() {
+                let marker = if i == *container_cursor { "▶ " } else { "  " };
+                let style = if i == *container_cursor {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(format!("    {}{}", marker, c), style)));
+            }
+            lines.push(Line::from(""));
+            let cmd_cursor = if !*editing_terminal { "▎" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled("  Command:  ", Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{}{}", command_buf, cmd_cursor), cmd_style),
+            ]));
+            let term_cursor = if *editing_terminal { "▎" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled("  Terminal:  ", Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{}{}", terminal_buf, term_cursor), term_style),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Tab] switch field  [Up/Down] container  [Enter] exec  [Esc] cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Exec Shell ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::KubeconfigInput { buf } => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Path: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{}▎", buf),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [Enter] load  [Esc] cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Open Kubeconfig ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
         },
     }
 }

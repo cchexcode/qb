@@ -5,6 +5,7 @@ use {
 
 mod args;
 mod k8s;
+mod portforward;
 mod tui;
 
 #[tokio::main]
@@ -15,7 +16,7 @@ async fn main() -> Result<()> {
             println!("qb {}", env!("CARGO_PKG_VERSION"));
         },
         | None => {
-            tui::run(cli.kubeconfig, cli.context, cli.namespace).await?;
+            tui::run(None, None, None, cli.experimental).await?;
         },
     }
     Ok(())

@@ -24,23 +24,28 @@ use {
     std::io,
 };
 
-pub async fn run(kubeconfig: Option<String>, context: Option<String>, namespace: Option<String>) -> Result<()> {
+pub async fn run(
+    kubeconfig: Option<String>,
+    context: Option<String>,
+    namespace: Option<String>,
+    experimental: bool,
+) -> Result<()> {
     let kube_client = KubeClient::new(kubeconfig, context, namespace).await?;
 
     tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
-        run_tui(kube_client, rt)
+        run_tui(kube_client, rt, experimental)
     })
 }
 
-fn run_tui(kube_client: KubeClient, rt: tokio::runtime::Handle) -> Result<()> {
+fn run_tui(kube_client: KubeClient, rt: tokio::runtime::Handle, experimental: bool) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_event_loop(&mut terminal, kube_client, rt);
+    let result = run_event_loop(&mut terminal, kube_client, rt, experimental);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
@@ -53,8 +58,9 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     kube_client: KubeClient,
     rt: tokio::runtime::Handle,
+    experimental: bool,
 ) -> Result<()> {
-    let mut app = app::App::new(kube_client, rt);
+    let mut app = app::App::new(kube_client, rt, experimental);
 
     loop {
         terminal.draw(|f| ui::render(f, &mut app))?;
@@ -64,6 +70,9 @@ fn run_event_loop(
 
         // Poll log stream for new lines
         app.poll_log_stream();
+
+        // Poll port forward status updates
+        app.poll_port_forwards();
 
         // Check if auto-refresh is due
         app.maybe_auto_refresh();
@@ -85,6 +94,11 @@ fn run_event_loop(
         // Handle pending editor invocation — suspend TUI, run editor, resume
         if let Some(edit) = app.pending_edit.take() {
             run_external_editor(terminal, &mut app, edit)?;
+        }
+
+        // Spawn exec in a new terminal window
+        if app.pending_exec.is_some() {
+            app.spawn_exec_terminal();
         }
 
         if app.should_quit {

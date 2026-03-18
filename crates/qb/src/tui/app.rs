@@ -3,11 +3,20 @@ use {
         logs::LogViewState,
         smart::SecretDetailState,
     },
-    crate::k8s::{
-        ClusterStatsData,
-        KubeClient,
-        ResourceEntry,
-        ResourceType,
+    crate::{
+        k8s::{
+            ClusterStatsData,
+            KubeClient,
+            RelatedEvent,
+            ResourceEntry,
+            ResourceType,
+        },
+        portforward::{
+            self,
+            PfTarget,
+            PortForwardManager,
+            PortInfo,
+        },
     },
     crossterm::event::{
         KeyCode,
@@ -79,6 +88,13 @@ pub struct PendingEdit {
     pub yaml: String,
 }
 
+pub struct PendingExec {
+    pub pod_name: String,
+    pub namespace: String,
+    pub container: String,
+    pub command: Vec<String>,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum DetailMode {
     Smart,
@@ -87,10 +103,57 @@ pub enum DetailMode {
 
 #[allow(clippy::enum_variant_names)]
 pub enum Popup {
-    ContextSelect { items: Vec<String>, state: ListState },
-    NamespaceSelect { items: Vec<String>, state: ListState },
-    PodSelect { items: Vec<String>, state: ListState },
-    ContainerSelect { items: Vec<String>, state: ListState },
+    ContextSelect {
+        items: Vec<String>,
+        state: ListState,
+    },
+    NamespaceSelect {
+        items: Vec<String>,
+        state: ListState,
+    },
+    PodSelect {
+        items: Vec<String>,
+        state: ListState,
+    },
+    ContainerSelect {
+        items: Vec<String>,
+        state: ListState,
+    },
+    PortForwardCreate(PfCreateDialog),
+    ConfirmDelete {
+        name: String,
+        namespace: String,
+        resource_type: ResourceType,
+    },
+    ScaleInput {
+        name: String,
+        namespace: String,
+        resource_type: ResourceType,
+        current: u32,
+        buf: String,
+    },
+    ExecShell {
+        pod_name: String,
+        namespace: String,
+        containers: Vec<String>,
+        container_cursor: usize,
+        command_buf: String,
+        terminal_buf: String,
+        editing_terminal: bool,
+    },
+    KubeconfigInput {
+        buf: String,
+    },
+}
+
+pub struct PfCreateDialog {
+    pub resource_type: ResourceType,
+    pub resource_name: String,
+    pub namespace: String,
+    pub target: PfTarget,
+    pub ports: Vec<PortInfo>,
+    pub port_cursor: usize,
+    pub local_port_buf: String,
 }
 
 pub enum PendingLoad {
@@ -113,9 +176,11 @@ pub struct NavItem {
 }
 
 pub enum NavItemKind {
+    SuperCategory,
     Category,
     Resource(ResourceType),
     ClusterStats,
+    PortForwards,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +206,7 @@ pub struct App {
     pub resources: Vec<ResourceEntry>,
     pub resource_state: TableState,
     pub selected_resource_type: Option<ResourceType>,
+    pub resource_counts: std::collections::HashMap<ResourceType, usize>,
 
     // Cluster stats (shown when "Overview" is selected)
     pub cluster_stats: Option<ClusterStatsData>,
@@ -154,9 +220,12 @@ pub struct App {
     pub secret_state: Option<SecretDetailState>,
     pub detail_name: String,
     pub detail_namespace: String,
+    pub related_events: Vec<RelatedEvent>,
 
-    // Edit
+    // Edit / Exec
     pub pending_edit: Option<PendingEdit>,
+    pub pending_exec: Option<PendingExec>,
+    pub exec_terminal_override: Option<String>,
     pub edit_ctx: Option<EditContext>,
     /// Tracks which label/annotation keys are expanded in smart view.
     pub expanded_keys: std::collections::HashSet<String>,
@@ -175,6 +244,7 @@ pub struct App {
     pub view: View,
     pub popup: Option<Popup>,
     pub should_quit: bool,
+    pub experimental: bool,
     pub status: String,
     pub error: Option<String>,
     pub pending_load: Option<PendingLoad>,
@@ -197,6 +267,12 @@ pub struct App {
     pub paused: bool,
     pub last_refresh: std::time::Instant,
 
+    // Port forwards
+    pub pf_manager: PortForwardManager,
+    pub showing_port_forwards: bool,
+    pub pf_cursor: usize,
+    pub pf_table_state: TableState,
+
     // Click areas — updated each render by ui.rs
     pub area_nav: ratatui::layout::Rect,
     pub area_resources: ratatui::layout::Rect,
@@ -204,10 +280,15 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(kube: KubeClient, rt: tokio::runtime::Handle) -> Self {
+    pub fn new(kube: KubeClient, rt: tokio::runtime::Handle, experimental: bool) -> Self {
         let nav_items = Self::build_nav_items();
         let mut nav_state = ListState::default();
-        nav_state.select(Some(1));
+        // Select first selectable item (skip SuperCategory + Category headers)
+        let first_selectable = nav_items
+            .iter()
+            .position(|item| Self::is_selectable_nav(&item.kind))
+            .unwrap_or(0);
+        nav_state.select(Some(first_selectable));
 
         let mut app = Self {
             kube,
@@ -217,6 +298,7 @@ impl App {
             resources: Vec::new(),
             resource_state: TableState::default(),
             selected_resource_type: None,
+            resource_counts: std::collections::HashMap::new(),
             cluster_stats: None,
             cluster_stats_scroll: 0,
             detail_value: Value::Null,
@@ -226,7 +308,10 @@ impl App {
             secret_state: None,
             detail_name: String::new(),
             detail_namespace: String::new(),
+            related_events: Vec::new(),
             pending_edit: None,
+            pending_exec: None,
+            exec_terminal_override: None,
             edit_ctx: None,
             expanded_keys: std::collections::HashSet::new(),
             dict_entries: Vec::new(),
@@ -245,10 +330,15 @@ impl App {
             view: View::Main,
             popup: None,
             should_quit: false,
+            experimental,
             status: String::new(),
             error: None,
             pending_load: Some(PendingLoad::ClusterStats),
             last_refresh: std::time::Instant::now(),
+            pf_manager: PortForwardManager::new(),
+            showing_port_forwards: false,
+            pf_cursor: 0,
+            pf_table_state: TableState::default(),
             area_nav: ratatui::layout::Rect::default(),
             area_resources: ratatui::layout::Rect::default(),
             area_popup: ratatui::layout::Rect::default(),
@@ -259,25 +349,43 @@ impl App {
 
     fn build_nav_items() -> Vec<NavItem> {
         let mut items = Vec::new();
+
+        // ── CLUSTER super-category ──
+        items.push(NavItem {
+            label: "CLUSTER".to_string(),
+            kind: NavItemKind::SuperCategory,
+        });
+
         for (cat, types) in ResourceType::all_by_category() {
             items.push(NavItem {
-                label: cat.display_name().to_string(),
+                label: format!("  {}", cat.display_name()),
                 kind: NavItemKind::Category,
             });
             // Add "Overview" as the first item under Cluster
             if cat == crate::k8s::Category::Cluster {
                 items.push(NavItem {
-                    label: "  Overview".to_string(),
+                    label: "    Overview".to_string(),
                     kind: NavItemKind::ClusterStats,
                 });
             }
             for rt in types {
                 items.push(NavItem {
-                    label: format!("  {}", rt.display_name()),
+                    label: format!("    {}", rt.display_name()),
                     kind: NavItemKind::Resource(rt),
                 });
             }
         }
+
+        // ── GLOBAL super-category ──
+        items.push(NavItem {
+            label: "GLOBAL".to_string(),
+            kind: NavItemKind::SuperCategory,
+        });
+        items.push(NavItem {
+            label: "  Port Forwards".to_string(),
+            kind: NavItemKind::PortForwards,
+        });
+
         items
     }
 
@@ -423,6 +531,7 @@ impl App {
                         });
                     }
                     self.resources = entries;
+                    self.resource_counts.insert(rt, self.resources.len());
                     let new_idx = prev_selected
                         .and_then(|(name, ns)| self.resources.iter().position(|e| e.name == name && e.namespace == ns))
                         .or_else(|| {
@@ -460,6 +569,7 @@ impl App {
         if self.view == View::Main
             && self.popup.is_none()
             && self.pending_load.is_none()
+            && !self.showing_port_forwards
             && self.last_refresh.elapsed() >= std::time::Duration::from_secs(2)
         {
             if self.is_showing_cluster_stats() {
@@ -498,6 +608,7 @@ impl App {
     fn do_switch_context(&mut self, ctx: &str) {
         match self.rt.block_on(self.kube.switch_context(ctx)) {
             | Ok(()) => {
+                self.showing_port_forwards = false;
                 self.pending_load = Some(PendingLoad::Resources);
                 self.error = None;
             },
@@ -528,6 +639,11 @@ impl App {
                     self.dict_line_offsets.clear();
                     self.view = View::Detail;
                     self.error = None;
+                    // Fetch related events for describe-style view
+                    self.related_events = self
+                        .rt
+                        .block_on(self.kube.fetch_related_events(ns, name))
+                        .unwrap_or_default();
                 },
                 | Err(e) => {
                     self.error = Some(format!("Failed to load resource: {}", e));
@@ -683,6 +799,14 @@ impl App {
                         None
                     }
                 },
+                | Some(Popup::PortForwardCreate(_)) => {
+                    // Handled by its own key handler; click inside dismissed
+                    None
+                },
+                | Some(Popup::ConfirmDelete { .. })
+                | Some(Popup::ScaleInput { .. })
+                | Some(Popup::ExecShell { .. })
+                | Some(Popup::KubeconfigInput { .. }) => None,
                 | None => None,
             };
             self.popup = None;
@@ -697,11 +821,14 @@ impl App {
             // Click on nav sidebar — select resource type and load it
             if self.area_nav.contains(pos) {
                 self.focus = Focus::Nav;
-                let inner_y = pos.y.saturating_sub(self.area_nav.y + 1) as usize;
+                // Account for list scroll offset so clicks target the correct item
+                let visual_y = pos.y.saturating_sub(self.area_nav.y + 1) as usize;
+                let inner_y = visual_y + self.nav_state.offset();
                 if inner_y < self.nav_items.len() {
                     match &self.nav_items[inner_y].kind {
                         | NavItemKind::Resource(_) => {
                             self.nav_state.select(Some(inner_y));
+                            self.showing_port_forwards = false;
                             if let Some(rt) = self.selected_nav_resource_type() {
                                 if self.selected_resource_type != Some(rt) {
                                     self.selected_resource_type = Some(rt);
@@ -715,12 +842,19 @@ impl App {
                         },
                         | NavItemKind::ClusterStats => {
                             self.nav_state.select(Some(inner_y));
+                            self.showing_port_forwards = false;
                             self.selected_resource_type = None;
                             self.clear_resource_filter();
                             self.cluster_stats_scroll = 0;
                             self.pending_load = Some(PendingLoad::ClusterStats);
                         },
-                        | NavItemKind::Category => {},
+                        | NavItemKind::PortForwards => {
+                            self.nav_state.select(Some(inner_y));
+                            self.selected_resource_type = None;
+                            self.showing_port_forwards = true;
+                            self.clear_resource_filter();
+                        },
+                        | NavItemKind::SuperCategory | NavItemKind::Category => {},
                     }
                 }
                 return;
@@ -767,15 +901,26 @@ impl App {
         if self.popup.is_some() {
             // Scroll popup list
             if let Some(popup) = &mut self.popup {
-                let (items_len, state) = match popup {
+                match popup {
                     | Popup::ContextSelect { items, state }
                     | Popup::NamespaceSelect { items, state }
                     | Popup::PodSelect { items, state }
-                    | Popup::ContainerSelect { items, state } => (items.len(), state),
-                };
-                let current = state.selected().unwrap_or(0) as i32;
-                let next = (current + delta).clamp(0, items_len.saturating_sub(1) as i32) as usize;
-                state.select(Some(next));
+                    | Popup::ContainerSelect { items, state } => {
+                        let current = state.selected().unwrap_or(0) as i32;
+                        let next = (current + delta).clamp(0, items.len().saturating_sub(1) as i32) as usize;
+                        state.select(Some(next));
+                    },
+                    | Popup::PortForwardCreate(d) => {
+                        let current = d.port_cursor as i32;
+                        let next = (current + delta).clamp(0, d.ports.len().saturating_sub(1) as i32) as usize;
+                        d.port_cursor = next;
+                        d.local_port_buf = d.ports[next].container_port.to_string();
+                    },
+                    | Popup::ConfirmDelete { .. }
+                    | Popup::ScaleInput { .. }
+                    | Popup::ExecShell { .. }
+                    | Popup::KubeconfigInput { .. } => {},
+                }
             }
             return;
         }
@@ -847,10 +992,12 @@ impl App {
             return;
         }
 
-        // [p] Toggle pause — global, works in any view (except popups/filter editing)
+        // [p] Toggle pause — global, works in any view (except popups/filter
+        // editing/port forwards/logs)
         if key.code == KeyCode::Char('p') && self.popup.is_none() && !self.resource_filter_editing {
-            // Don't consume 'p' in log view (used for pod selector) or edit diff view
-            if self.view != View::Logs && self.view != View::EditDiff {
+            // Don't consume 'p' in: log view (pod selector), edit diff, port forwards view
+            // (pause/resume)
+            if self.view != View::Logs && self.view != View::EditDiff && !self.showing_port_forwards {
                 self.paused = !self.paused;
                 self.status = if self.paused {
                     "Paused — auto-refresh disabled".into()
@@ -899,6 +1046,20 @@ impl App {
             },
             | KeyCode::Char('n') => {
                 self.pending_load = Some(PendingLoad::Namespaces);
+            },
+            | KeyCode::Char('O') => {
+                let default = self
+                    .kube
+                    .kubeconfig_path()
+                    .or_else(|| std::env::var("KUBECONFIG").ok().as_deref().map(|_| ""))
+                    .unwrap_or("~/.kube/config")
+                    .to_string();
+                let default = if default.is_empty() {
+                    std::env::var("KUBECONFIG").unwrap_or_else(|_| "~/.kube/config".to_string())
+                } else {
+                    default
+                };
+                self.popup = Some(Popup::KubeconfigInput { buf: default });
             },
             | KeyCode::Char('/') => {
                 self.begin_resource_filter();
@@ -956,7 +1117,13 @@ impl App {
     /// Load whichever resource type or cluster stats is currently highlighted
     /// in the nav.
     fn load_nav_selection(&mut self) {
-        if self.is_nav_cluster_stats() {
+        if self.is_nav_port_forwards() {
+            self.selected_resource_type = None;
+            self.showing_port_forwards = true;
+            self.clear_resource_filter();
+            self.view = View::Main;
+        } else if self.is_nav_cluster_stats() {
+            self.showing_port_forwards = false;
             if !self.is_showing_cluster_stats() {
                 self.selected_resource_type = None;
                 self.clear_resource_filter();
@@ -964,6 +1131,7 @@ impl App {
                 self.pending_load = Some(PendingLoad::ClusterStats);
             }
         } else if let Some(rt) = self.selected_nav_resource_type() {
+            self.showing_port_forwards = false;
             if self.selected_resource_type != Some(rt) {
                 self.selected_resource_type = Some(rt);
                 self.events_scroll = 0;
@@ -975,8 +1143,23 @@ impl App {
         }
     }
 
+    fn is_nav_port_forwards(&self) -> bool {
+        self.nav_state
+            .selected()
+            .and_then(|idx| self.nav_items.get(idx))
+            .map(|item| matches!(item.kind, NavItemKind::PortForwards))
+            .unwrap_or(false)
+    }
+
+    pub fn is_showing_port_forwards(&self) -> bool {
+        self.showing_port_forwards
+    }
+
     fn is_selectable_nav(kind: &NavItemKind) -> bool {
-        matches!(kind, NavItemKind::Resource(_) | NavItemKind::ClusterStats)
+        matches!(
+            kind,
+            NavItemKind::Resource(_) | NavItemKind::ClusterStats | NavItemKind::PortForwards
+        )
     }
 
     fn nav_up(&mut self) {
@@ -1015,6 +1198,10 @@ impl App {
     }
 
     fn handle_resource_key(&mut self, key: KeyEvent) {
+        if self.showing_port_forwards {
+            self.handle_port_forwards_key(key);
+            return;
+        }
         if self.is_showing_cluster_stats() {
             // Cluster stats: scroll only
             match key.code {
@@ -1087,6 +1274,21 @@ impl App {
             },
             | KeyCode::Char('e') => {
                 self.start_edit_from_list();
+            },
+            | KeyCode::Char('F') => {
+                self.open_port_forward_dialog();
+            },
+            | KeyCode::Char('D') => {
+                self.open_delete_confirm();
+            },
+            | KeyCode::Char('S') => {
+                self.open_scale_input();
+            },
+            | KeyCode::Char('x') if self.experimental && self.resource_filter_text.is_empty() => {
+                self.open_exec_shell(false);
+            },
+            | KeyCode::Char('X') if self.experimental => {
+                self.open_exec_shell(true);
             },
             | _ => {},
         }
@@ -1232,6 +1434,22 @@ impl App {
             // [l] Open logs (for workload resources)
             | KeyCode::Char('l') => {
                 self.open_logs_for_selected();
+            },
+            // [F] Port forward
+            | KeyCode::Char('F') => {
+                self.open_port_forward_dialog();
+            },
+            | KeyCode::Char('D') => {
+                self.open_delete_confirm_detail();
+            },
+            | KeyCode::Char('S') => {
+                self.open_scale_input_detail();
+            },
+            | KeyCode::Char('x') if self.experimental => {
+                self.open_exec_shell(false);
+            },
+            | KeyCode::Char('X') if self.experimental => {
+                self.open_exec_shell(true);
             },
             | _ => {},
         }
@@ -1442,6 +1660,28 @@ impl App {
     }
 
     fn handle_popup_key(&mut self, key: KeyEvent) {
+        // Port forward create popup has its own handler
+        if matches!(self.popup, Some(Popup::PortForwardCreate(_))) {
+            self.handle_pf_create_popup_key(key);
+            return;
+        }
+        if matches!(self.popup, Some(Popup::ConfirmDelete { .. })) {
+            self.handle_confirm_delete_key(key);
+            return;
+        }
+        if matches!(self.popup, Some(Popup::ScaleInput { .. })) {
+            self.handle_scale_input_key(key);
+            return;
+        }
+        if matches!(self.popup, Some(Popup::ExecShell { .. })) {
+            self.handle_exec_shell_key(key);
+            return;
+        }
+        if matches!(self.popup, Some(Popup::KubeconfigInput { .. })) {
+            self.handle_kubeconfig_input_key(key);
+            return;
+        }
+
         match key.code {
             | KeyCode::Esc => {
                 self.popup = None;
@@ -1453,6 +1693,11 @@ impl App {
                         | Popup::NamespaceSelect { state, .. }
                         | Popup::PodSelect { state, .. }
                         | Popup::ContainerSelect { state, .. } => state,
+                        | Popup::PortForwardCreate(_)
+                        | Popup::ConfirmDelete { .. }
+                        | Popup::ScaleInput { .. }
+                        | Popup::ExecShell { .. }
+                        | Popup::KubeconfigInput { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
                     if current > 0 {
@@ -1467,6 +1712,11 @@ impl App {
                         | Popup::NamespaceSelect { items, state }
                         | Popup::PodSelect { items, state }
                         | Popup::ContainerSelect { items, state } => (items.len(), state),
+                        | Popup::PortForwardCreate(_)
+                        | Popup::ConfirmDelete { .. }
+                        | Popup::ScaleInput { .. }
+                        | Popup::ExecShell { .. }
+                        | Popup::KubeconfigInput { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
                     if current + 1 < items_len {
@@ -1515,6 +1765,11 @@ impl App {
                             None
                         }
                     },
+                    | Some(Popup::PortForwardCreate(_))
+                    | Some(Popup::ConfirmDelete { .. })
+                    | Some(Popup::ScaleInput { .. })
+                    | Some(Popup::ExecShell { .. })
+                    | Some(Popup::KubeconfigInput { .. }) => unreachable!(),
                     | None => None,
                 };
                 self.popup = None;
@@ -1585,6 +1840,723 @@ impl App {
         let sel = log_state.selected_container.map(|i| i + 1).unwrap_or(0);
         state.select(Some(sel));
         self.popup = Some(Popup::ContainerSelect { items, state });
+    }
+
+    // -----------------------------------------------------------------------
+    // Port forwards
+    // -----------------------------------------------------------------------
+
+    fn handle_port_forwards_key(&mut self, key: KeyEvent) {
+        let count = self.pf_manager.entries().len();
+        match key.code {
+            | KeyCode::Up | KeyCode::Char('k') => {
+                if self.pf_cursor > 0 {
+                    self.pf_cursor -= 1;
+                    self.pf_table_state.select(Some(self.pf_cursor));
+                }
+            },
+            | KeyCode::Down | KeyCode::Char('j') => {
+                if count > 0 && self.pf_cursor < count.saturating_sub(1) {
+                    self.pf_cursor += 1;
+                    self.pf_table_state.select(Some(self.pf_cursor));
+                }
+            },
+            // [p] Pause/resume selected forward
+            | KeyCode::Char('p') => {
+                if let Some(entry) = self.pf_manager.entries().get(self.pf_cursor) {
+                    let id = entry.id;
+                    if matches!(entry.status, portforward::PortForwardStatus::Paused) {
+                        self.pf_manager.resume(id);
+                    } else if entry.status.is_running() {
+                        self.pf_manager.pause(id);
+                    }
+                }
+            },
+            // [d] Cancel (delete) selected forward
+            | KeyCode::Char('d') => {
+                if let Some(entry) = self.pf_manager.entries().get(self.pf_cursor) {
+                    let id = entry.id;
+                    self.pf_manager.cancel(id);
+                    self.pf_manager.remove_cancelled();
+                    let new_count = self.pf_manager.entries().len();
+                    if new_count == 0 {
+                        self.pf_cursor = 0;
+                    } else {
+                        self.pf_cursor = self.pf_cursor.min(new_count.saturating_sub(1));
+                    }
+                }
+            },
+            | _ => {},
+        }
+    }
+
+    fn open_port_forward_dialog(&mut self) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) => rt,
+            | None => return,
+        };
+
+        // Get the selected resource entry
+        let visible = self.visible_resource_indices();
+        let vis_pos = self
+            .resource_state
+            .selected()
+            .and_then(|sel| visible.iter().position(|&i| i == sel))
+            .unwrap_or(0);
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+            | Some(e) => e,
+            | None => return,
+        };
+        let name = entry.name.clone();
+        let namespace = entry.namespace.clone();
+
+        // Fetch the resource value to extract ports and selector
+        let value = match self.rt.block_on(self.kube.get_resource(rt, &namespace, &name)) {
+            | Ok(v) => v,
+            | Err(e) => {
+                self.error = Some(format!("Failed to fetch resource: {}", e));
+                return;
+            },
+        };
+
+        let ports = portforward::extract_ports(rt, &value);
+        if ports.is_empty() {
+            self.error = Some("No ports found on this resource".into());
+            return;
+        }
+
+        // Determine target: selector-based or direct pod
+        let target = if rt == ResourceType::Pod {
+            PfTarget::DirectPod { pod_name: name.clone() }
+        } else {
+            match portforward::extract_selector(rt, &value) {
+                | Some(selector) => PfTarget::LabelSelector { selector },
+                | None => {
+                    self.error = Some("Cannot resolve pod selector for this resource".into());
+                    return;
+                },
+            }
+        };
+
+        let default_port = ports[0].container_port.to_string();
+
+        self.popup = Some(Popup::PortForwardCreate(PfCreateDialog {
+            resource_type: rt,
+            resource_name: name,
+            namespace,
+            target,
+            ports,
+            port_cursor: 0,
+            local_port_buf: default_port,
+        }));
+    }
+
+    fn handle_pf_create_popup_key(&mut self, key: KeyEvent) {
+        let dialog = match &mut self.popup {
+            | Some(Popup::PortForwardCreate(d)) => d,
+            | _ => return,
+        };
+
+        match key.code {
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Up | KeyCode::Char('k') => {
+                if dialog.port_cursor > 0 {
+                    dialog.port_cursor -= 1;
+                    dialog.local_port_buf = dialog.ports[dialog.port_cursor].container_port.to_string();
+                }
+            },
+            | KeyCode::Down | KeyCode::Char('j') => {
+                if dialog.port_cursor + 1 < dialog.ports.len() {
+                    dialog.port_cursor += 1;
+                    dialog.local_port_buf = dialog.ports[dialog.port_cursor].container_port.to_string();
+                }
+            },
+            | KeyCode::Backspace => {
+                dialog.local_port_buf.pop();
+            },
+            | KeyCode::Char(c) if c.is_ascii_digit() => {
+                dialog.local_port_buf.push(c);
+            },
+            | KeyCode::Enter => {
+                self.confirm_port_forward_create();
+            },
+            | _ => {},
+        }
+    }
+
+    fn confirm_port_forward_create(&mut self) {
+        let dialog = match &self.popup {
+            | Some(Popup::PortForwardCreate(d)) => d,
+            | _ => return,
+        };
+
+        let local_port: u16 = match dialog.local_port_buf.parse() {
+            | Ok(p) if p > 0 => p,
+            | _ => {
+                self.error = Some("Invalid local port".into());
+                return;
+            },
+        };
+
+        let remote_port = dialog.ports[dialog.port_cursor].container_port;
+        let namespace = dialog.namespace.clone();
+        let resource_label = format!("{}/{}", dialog.resource_type.display_name(), dialog.resource_name);
+        let target = dialog.target.clone();
+
+        // Resolve pod name for display (best effort)
+        let pod_name = match &target {
+            | PfTarget::DirectPod { pod_name } => pod_name.clone(),
+            | PfTarget::LabelSelector { .. } => "(resolving)".to_string(),
+        };
+
+        let context = self.kube.current_context().to_string();
+        let client = self.kube.client().clone();
+
+        self.pf_manager.create(
+            client,
+            &self.rt,
+            namespace,
+            pod_name,
+            context,
+            resource_label.clone(),
+            local_port,
+            remote_port,
+            target,
+        );
+
+        self.popup = None;
+        self.status = format!("Port forward created: :{} -> :{}", local_port, remote_port);
+        self.error = None;
+    }
+
+    /// Poll port forward status updates (called every event loop tick).
+    pub fn poll_port_forwards(&mut self) {
+        self.pf_manager.poll_updates();
+    }
+
+    // -----------------------------------------------------------------------
+    // Exec — spawn new terminal window
+    // -----------------------------------------------------------------------
+
+    /// Spawn a new terminal window running kubectl exec.
+    pub fn spawn_exec_terminal(&mut self) {
+        let exec = match self.pending_exec.take() {
+            | Some(e) => e,
+            | None => return,
+        };
+
+        let terminal_app = match self.exec_terminal_override.take().or_else(resolve_terminal_app) {
+            | Some(t) => t,
+            | None => {
+                self.error = Some("Set $TERMINAL or $TERM_PROGRAM to specify your terminal emulator".into());
+                return;
+            },
+        };
+
+        let context = self.kube.current_context().to_string();
+        let kubeconfig_flag = self
+            .kube
+            .kubeconfig_path()
+            .map(|p| format!(" --kubeconfig {}", p))
+            .unwrap_or_default();
+        let cmd_str = exec.command.join(" ");
+
+        let kubectl_cmd = format!(
+            "kubectl exec -it {} -n {} -c {} --context {}{} -- {} ; exit",
+            exec.pod_name, exec.namespace, exec.container, context, kubeconfig_flag, cmd_str,
+        );
+
+        let result = spawn_terminal_window(&terminal_app, &kubectl_cmd);
+
+        match result {
+            | Ok(_) => {
+                self.status = format!("Opened shell in {}: {}/{}", terminal_app, exec.pod_name, exec.container);
+                self.error = None;
+            },
+            | Err(e) => {
+                self.error = Some(format!("Failed to open '{}': {}", terminal_app, e));
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal resolution helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve the terminal application to use. Checks $TERMINAL, then
+/// platform-specific defaults.
+fn resolve_terminal_app() -> Option<String> {
+    for var in ["TERMINAL", "TERM_PROGRAM"] {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Spawn a new terminal window running a command.
+fn spawn_terminal_window(terminal_app: &str, command: &str) -> Result<std::process::Child, std::io::Error> {
+    let tmp = tempfile::Builder::new()
+        .prefix("qb-exec-")
+        .suffix(".sh")
+        .tempfile()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(tmp.path(), format!("#!/bin/sh\n{}\n", command))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let path = tmp.into_temp_path();
+    let path_str = path.to_string_lossy().to_string();
+    std::mem::forget(path); // keep alive for the spawned terminal
+
+    // Apple Terminal.app has no CLI binary — must use osascript
+    if matches!(terminal_app, "Apple_Terminal" | "Terminal" | "Terminal.app") {
+        return std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+                path_str
+            ))
+            .spawn();
+    }
+
+    // All other terminals: run binary directly with -e to get a NEW window
+    std::process::Command::new(terminal_app)
+        .arg("-e")
+        .arg(&path_str)
+        .spawn()
+}
+
+impl App {
+    // -----------------------------------------------------------------------
+    // Delete
+    // -----------------------------------------------------------------------
+
+    fn open_delete_confirm(&mut self) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) => rt,
+            | None => return,
+        };
+        let visible = self.visible_resource_indices();
+        let vis_pos = self
+            .resource_state
+            .selected()
+            .and_then(|sel| visible.iter().position(|&i| i == sel))
+            .unwrap_or(0);
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+            | Some(e) => e,
+            | None => return,
+        };
+        self.popup = Some(Popup::ConfirmDelete {
+            name: entry.name.clone(),
+            namespace: entry.namespace.clone(),
+            resource_type: rt,
+        });
+    }
+
+    fn open_delete_confirm_detail(&mut self) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) => rt,
+            | None => return,
+        };
+        if self.detail_name.is_empty() {
+            return;
+        }
+        self.popup = Some(Popup::ConfirmDelete {
+            name: self.detail_name.clone(),
+            namespace: self.detail_namespace.clone(),
+            resource_type: rt,
+        });
+    }
+
+    fn handle_confirm_delete_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Enter | KeyCode::Char('y') => {
+                let (name, namespace, rt) = match &self.popup {
+                    | Some(Popup::ConfirmDelete {
+                        name,
+                        namespace,
+                        resource_type,
+                    }) => (name.clone(), namespace.clone(), *resource_type),
+                    | _ => return,
+                };
+                self.popup = None;
+                match self.rt.block_on(self.kube.delete_resource(rt, &namespace, &name)) {
+                    | Ok(()) => {
+                        self.status = format!("Deleted {}/{}", rt.display_name(), name);
+                        self.error = None;
+                        if self.view == View::Detail {
+                            self.view = View::Main;
+                            self.focus = Focus::Resources;
+                        }
+                        self.pending_load = Some(PendingLoad::Resources);
+                    },
+                    | Err(e) => {
+                        self.error = Some(format!("Delete failed: {}", e));
+                    },
+                }
+            },
+            | KeyCode::Esc | KeyCode::Char('n') => {
+                self.popup = None;
+            },
+            | _ => {},
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Scale
+    // -----------------------------------------------------------------------
+
+    fn open_scale_input(&mut self) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) if rt.supports_scale() => rt,
+            | _ => return,
+        };
+        let visible = self.visible_resource_indices();
+        let vis_pos = self
+            .resource_state
+            .selected()
+            .and_then(|sel| visible.iter().position(|&i| i == sel))
+            .unwrap_or(0);
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+            | Some(e) => e,
+            | None => return,
+        };
+        let name = entry.name.clone();
+        let namespace = entry.namespace.clone();
+        // Try to read current replicas from the resource value
+        let current = self
+            .rt
+            .block_on(self.kube.get_resource(rt, &namespace, &name))
+            .ok()
+            .and_then(|v| v.get("spec").and_then(|s| s.get("replicas")).and_then(|r| r.as_u64()))
+            .unwrap_or(1) as u32;
+        self.popup = Some(Popup::ScaleInput {
+            name,
+            namespace,
+            resource_type: rt,
+            current,
+            buf: current.to_string(),
+        });
+    }
+
+    fn open_scale_input_detail(&mut self) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) if rt.supports_scale() => rt,
+            | _ => return,
+        };
+        if self.detail_name.is_empty() {
+            return;
+        }
+        let current = self
+            .detail_value
+            .get("spec")
+            .and_then(|s| s.get("replicas"))
+            .and_then(|r| r.as_u64())
+            .unwrap_or(1) as u32;
+        self.popup = Some(Popup::ScaleInput {
+            name: self.detail_name.clone(),
+            namespace: self.detail_namespace.clone(),
+            resource_type: rt,
+            current,
+            buf: current.to_string(),
+        });
+    }
+
+    fn handle_scale_input_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Enter => {
+                let (name, namespace, rt, replicas) = match &self.popup {
+                    | Some(Popup::ScaleInput {
+                        name,
+                        namespace,
+                        resource_type,
+                        buf,
+                        ..
+                    }) => {
+                        match buf.parse::<u32>() {
+                            | Ok(r) => (name.clone(), namespace.clone(), *resource_type, r),
+                            | Err(_) => {
+                                self.error = Some("Invalid replica count".into());
+                                self.popup = None;
+                                return;
+                            },
+                        }
+                    },
+                    | _ => return,
+                };
+                self.popup = None;
+                match self
+                    .rt
+                    .block_on(self.kube.scale_resource(rt, &namespace, &name, replicas))
+                {
+                    | Ok(()) => {
+                        self.status = format!("Scaled {}/{} to {} replicas", rt.display_name(), name, replicas);
+                        self.error = None;
+                        self.pending_load = Some(PendingLoad::Resources);
+                    },
+                    | Err(e) => {
+                        self.error = Some(format!("Scale failed: {}", e));
+                    },
+                }
+            },
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Backspace => {
+                if let Some(Popup::ScaleInput { buf, .. }) = &mut self.popup {
+                    buf.pop();
+                }
+            },
+            | KeyCode::Char(c) if c.is_ascii_digit() => {
+                if let Some(Popup::ScaleInput { buf, .. }) = &mut self.popup {
+                    buf.push(c);
+                }
+            },
+            | _ => {},
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Exec
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Kubeconfig
+    // -----------------------------------------------------------------------
+
+    fn handle_kubeconfig_input_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Enter => {
+                let path = match &self.popup {
+                    | Some(Popup::KubeconfigInput { buf }) => buf.clone(),
+                    | _ => return,
+                };
+                self.popup = None;
+                // Expand ~ to home dir
+                let expanded = if path.starts_with('~') {
+                    if let Some(home) = std::env::var("HOME").ok() {
+                        path.replacen('~', &home, 1)
+                    } else {
+                        path
+                    }
+                } else {
+                    path
+                };
+                match self.rt.block_on(KubeClient::new(Some(expanded), None, None)) {
+                    | Ok(new_client) => {
+                        self.pf_manager.cancel_all();
+                        self.kube = new_client;
+                        self.selected_resource_type = None;
+                        self.showing_port_forwards = false;
+                        self.resource_counts.clear();
+                        self.cluster_stats_scroll = 0;
+                        self.pending_load = Some(PendingLoad::ClusterStats);
+                        self.error = None;
+                        self.status = "Kubeconfig loaded".into();
+                        // Re-select overview
+                        let first = self
+                            .nav_items
+                            .iter()
+                            .position(|item| Self::is_selectable_nav(&item.kind))
+                            .unwrap_or(0);
+                        self.nav_state.select(Some(first));
+                    },
+                    | Err(e) => {
+                        self.error = Some(format!("Failed to load kubeconfig: {}", e));
+                    },
+                }
+            },
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Backspace => {
+                if let Some(Popup::KubeconfigInput { buf }) = &mut self.popup {
+                    buf.pop();
+                }
+            },
+            | KeyCode::Char(c) => {
+                if let Some(Popup::KubeconfigInput { buf }) = &mut self.popup {
+                    buf.push(c);
+                }
+            },
+            | _ => {},
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Exec
+    // -----------------------------------------------------------------------
+
+    fn open_exec_shell(&mut self, custom_command: bool) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) if rt.supports_exec() => rt,
+            | _ => return,
+        };
+        // Resolve pod and containers
+        let (name, namespace) = if self.view == View::Detail {
+            (self.detail_name.clone(), self.detail_namespace.clone())
+        } else {
+            let visible = self.visible_resource_indices();
+            let vis_pos = self
+                .resource_state
+                .selected()
+                .and_then(|sel| visible.iter().position(|&i| i == sel))
+                .unwrap_or(0);
+            match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+                | Some(e) => (e.name.clone(), e.namespace.clone()),
+                | None => return,
+            }
+        };
+        match self.rt.block_on(self.kube.find_pods(rt, &namespace, &name)) {
+            | Ok(pods) if !pods.is_empty() => {
+                let pod = &pods[0];
+                let pod_name = pod.name.clone();
+                let containers = pod.containers.clone();
+                if custom_command {
+                    // Show popup to choose container and enter command
+                    self.popup = Some(Popup::ExecShell {
+                        pod_name,
+                        namespace,
+                        containers,
+                        container_cursor: 0,
+                        command_buf: "/bin/sh".to_string(),
+                        terminal_buf: resolve_terminal_app().unwrap_or_default(),
+                        editing_terminal: false,
+                    });
+                } else {
+                    // Direct exec with /bin/sh into first container
+                    let container = containers.first().cloned().unwrap_or_default();
+                    self.pending_exec = Some(PendingExec {
+                        pod_name,
+                        namespace,
+                        container,
+                        command: vec!["/bin/sh".to_string()],
+                    });
+                }
+            },
+            | Ok(_) => {
+                self.error = Some("No pods found for this resource".into());
+            },
+            | Err(e) => {
+                self.error = Some(format!("Failed to find pods: {}", e));
+            },
+        }
+    }
+
+    fn handle_exec_shell_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Enter => {
+                let (pod_name, namespace, container, command, terminal) = match &self.popup {
+                    | Some(Popup::ExecShell {
+                        pod_name,
+                        namespace,
+                        containers,
+                        container_cursor,
+                        command_buf,
+                        terminal_buf,
+                        ..
+                    }) => {
+                        let container = containers.get(*container_cursor).cloned().unwrap_or_default();
+                        let cmd = if command_buf.is_empty() {
+                            "/bin/sh".to_string()
+                        } else {
+                            command_buf.clone()
+                        };
+                        (
+                            pod_name.clone(),
+                            namespace.clone(),
+                            container,
+                            cmd,
+                            terminal_buf.clone(),
+                        )
+                    },
+                    | _ => return,
+                };
+                self.popup = None;
+                self.exec_terminal_override = Some(terminal);
+                self.pending_exec = Some(PendingExec {
+                    pod_name,
+                    namespace,
+                    container,
+                    command: command.split_whitespace().map(String::from).collect(),
+                });
+            },
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Up => {
+                if let Some(Popup::ExecShell {
+                    container_cursor,
+                    editing_terminal,
+                    ..
+                }) = &mut self.popup
+                {
+                    if !*editing_terminal && *container_cursor > 0 {
+                        *container_cursor -= 1;
+                    }
+                }
+            },
+            | KeyCode::Down => {
+                if let Some(Popup::ExecShell {
+                    containers,
+                    container_cursor,
+                    editing_terminal,
+                    ..
+                }) = &mut self.popup
+                {
+                    if !*editing_terminal && *container_cursor + 1 < containers.len() {
+                        *container_cursor += 1;
+                    }
+                }
+            },
+            | KeyCode::Tab => {
+                // Tab toggles between command/terminal editing and container selection
+                if let Some(Popup::ExecShell { editing_terminal, .. }) = &mut self.popup {
+                    *editing_terminal = !*editing_terminal;
+                }
+            },
+            | KeyCode::Backspace => {
+                if let Some(Popup::ExecShell {
+                    command_buf,
+                    terminal_buf,
+                    editing_terminal,
+                    ..
+                }) = &mut self.popup
+                {
+                    if *editing_terminal {
+                        terminal_buf.pop();
+                    } else {
+                        command_buf.pop();
+                    }
+                }
+            },
+            | KeyCode::Char(c) => {
+                if let Some(Popup::ExecShell {
+                    command_buf,
+                    terminal_buf,
+                    editing_terminal,
+                    ..
+                }) = &mut self.popup
+                {
+                    if *editing_terminal {
+                        terminal_buf.push(c);
+                    } else {
+                        command_buf.push(c);
+                    }
+                }
+            },
+            | _ => {},
+        }
     }
 
     // -----------------------------------------------------------------------

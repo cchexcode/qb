@@ -6,17 +6,9 @@ use clap::{
 #[derive(Parser)]
 #[command(name = "qb", about = "Kubernetes resource browser")]
 pub struct Cli {
-    /// Path to kubeconfig file
-    #[arg(long, env = "KUBECONFIG")]
-    pub kubeconfig: Option<String>,
-
-    /// Kubernetes context to use
-    #[arg(long, short = 'c')]
-    pub context: Option<String>,
-
-    /// Namespace to use
-    #[arg(long, short = 'n')]
-    pub namespace: Option<String>,
+    /// Enable experimental features (exec shell, etc.)
+    #[arg(short = 'e', long = "experimental")]
+    pub experimental: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,
