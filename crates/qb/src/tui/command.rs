@@ -101,6 +101,15 @@ pub fn palette_commands(flags: &CmdFlags) -> Vec<&'static Cmd> {
         .collect()
 }
 
+/// Returns commands for the help screen filtered to the current context.
+pub fn help_entries_for_context(ctx: Ctx, flags: &CmdFlags) -> Vec<&'static Cmd> {
+    COMMANDS
+        .iter()
+        .filter(|cmd| cmd.contexts.contains(&ctx) || cmd.contexts.contains(&Ctx::Global))
+        .filter(|cmd| cmd.available.map(|f| f(flags)).unwrap_or(true))
+        .collect()
+}
+
 /// Returns all commands for the help screen (all contexts, all commands).
 pub fn help_entries(flags: &CmdFlags) -> Vec<&'static Cmd> {
     COMMANDS

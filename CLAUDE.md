@@ -76,7 +76,7 @@ Keyboard-only. All navigation uses vim-style bindings.
 | `Ctrl+C` | Force quit |
 | `q` | Quit / back |
 | `Esc` | Back / dismiss popup or selection |
-| `?` | Help |
+| `?` | Help (context-only by default, `Tab` to show all) |
 | `Ctrl+P` | Command palette |
 | `p` | Pause/resume auto-refresh (except log view, port forwards view) |
 
@@ -375,6 +375,10 @@ for exhaustive matching. No `unreachable!()` in dispatch.
   - The command palette (`palette_commands` in command.rs)
   To add a new command: add a `Cmd` entry to `COMMANDS`, add the key handler in the appropriate
   `handle_*_key` method, and it automatically appears in the hotkey bar, help, and palette.
+  **MUST**: Every command MUST have correct `contexts` — the help screen defaults to showing
+  only commands available in the current context. `help_entries_for_context()` filters by
+  context + Global. Users press `Tab` to toggle to the full list. If a command's context is
+  wrong, it will be invisible in the help screen when the user needs it most.
 - **Deferred loading**: Queue a `PendingLoad` variant → `process_pending_load()` runs it after
   the next render. Never call `block_on` inside a key handler directly.
 - **Selection preservation**: When refreshing a list, save the selected item's `(name, namespace)`

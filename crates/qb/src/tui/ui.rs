@@ -1807,7 +1807,17 @@ fn render_help(f: &mut Frame, app: &mut App) {
     }
 
     let count = entries.len();
-    let title = format!(" Keybindings ({})  |  Esc to close ", count);
+    let mode_label = if app.help_context_only {
+        let ctx = app.current_context();
+        format!("{}", ctx.label())
+    } else {
+        "All".to_string()
+    };
+    let toggle_hint = if app.help_context_only { "All" } else { "Context" };
+    let title = format!(
+        " Keybindings — {} ({})  |  Tab: {}  |  Esc to close ",
+        mode_label, count, toggle_hint
+    );
 
     let block = Block::default()
         .borders(Borders::ALL)

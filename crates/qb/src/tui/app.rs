@@ -349,6 +349,7 @@ pub struct App {
     pub help_buf: String,
     pub help_cursor: usize,
     pub help_scroll: usize,
+    pub help_context_only: bool,
 
     // Port forwards
     pub pf_manager: PortForwardManager,
@@ -435,6 +436,7 @@ impl App {
             help_buf: String::new(),
             help_cursor: 0,
             help_scroll: 0,
+            help_context_only: true,
             pf_manager: PortForwardManager::new(),
             showing_port_forwards: false,
             pf_cursor: 0,
@@ -981,6 +983,7 @@ impl App {
             self.help_open = true;
             self.help_buf.clear();
             self.help_cursor = 0;
+            self.help_context_only = true;
             return;
         }
 
@@ -3035,7 +3038,11 @@ impl App {
 
     pub fn filtered_help_entries(&self) -> Vec<&'static super::command::Cmd> {
         let flags = self.cmd_flags();
-        let entries = super::command::help_entries(&flags);
+        let entries = if self.help_context_only {
+            super::command::help_entries_for_context(self.current_context(), &flags)
+        } else {
+            super::command::help_entries(&flags)
+        };
         let query = self.help_buf.to_lowercase();
         if query.is_empty() {
             return entries;
@@ -3080,6 +3087,11 @@ impl App {
                 if count > 0 {
                     self.help_cursor = (self.help_cursor + 10).min(count.saturating_sub(1));
                 }
+            },
+            | KeyCode::Tab => {
+                self.help_context_only = !self.help_context_only;
+                self.help_cursor = 0;
+                self.help_scroll = 0;
             },
             | KeyCode::Backspace => {
                 self.help_buf.pop();
