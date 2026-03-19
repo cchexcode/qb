@@ -216,16 +216,7 @@ impl ResourceType {
     }
 
     pub fn supports_exec(&self) -> bool {
-        matches!(
-            self,
-            Self::Deployment
-                | Self::StatefulSet
-                | Self::DaemonSet
-                | Self::ReplicaSet
-                | Self::Pod
-                | Self::CronJob
-                | Self::Job
-        )
+        matches!(self, Self::Pod)
     }
 
     pub fn is_cluster_scoped(&self) -> bool {
