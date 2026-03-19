@@ -274,7 +274,6 @@ impl ResourceType {
 
     pub fn all_by_category() -> Vec<(Category, Vec<ResourceType>)> {
         vec![
-            (Category::Cluster, vec![Self::Node, Self::Namespace, Self::Event]),
             (Category::Workloads, vec![
                 Self::Deployment,
                 Self::StatefulSet,
@@ -292,6 +291,11 @@ impl ResourceType {
                 Self::NetworkPolicy,
             ]),
             (Category::Config, vec![Self::ConfigMap, Self::Secret]),
+            (Category::Storage, vec![
+                Self::PersistentVolumeClaim,
+                Self::PersistentVolume,
+                Self::StorageClass,
+            ]),
             (Category::Rbac, vec![
                 Self::ServiceAccount,
                 Self::Role,
@@ -299,11 +303,7 @@ impl ResourceType {
                 Self::ClusterRole,
                 Self::ClusterRoleBinding,
             ]),
-            (Category::Storage, vec![
-                Self::PersistentVolumeClaim,
-                Self::PersistentVolume,
-                Self::StorageClass,
-            ]),
+            (Category::Cluster, vec![Self::Node, Self::Namespace, Self::Event]),
         ]
     }
 }
@@ -366,6 +366,7 @@ pub struct RelatedEvent {
 pub struct NodeStats {
     pub name: String,
     pub status: String,
+    pub unschedulable: bool,
     pub roles: String,
     pub version: String,
     pub os_arch: String,
@@ -383,6 +384,7 @@ pub struct ClusterStatsData {
     pub node_count: usize,
     pub nodes_ready: usize,
     pub nodes_not_ready: usize,
+    pub nodes_cordoned: usize,
     pub namespace_count: usize,
     pub pod_count: usize,
     pub pods_running: usize,
@@ -553,9 +555,18 @@ impl KubeClient {
                     .unwrap_or_else(|| "-".into())
             };
 
+            let unschedulable = n.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false);
+            let node_status = match (is_ready, unschedulable) {
+                | (true, false) => "Ready".to_string(),
+                | (true, true) => "Ready,SchedulingDisabled".to_string(),
+                | (false, false) => "NotReady".to_string(),
+                | (false, true) => "NotReady,SchedulingDisabled".to_string(),
+            };
+
             node_stats.push(NodeStats {
                 name: meta_name(&n.metadata),
-                status: if is_ready { "Ready".into() } else { "NotReady".into() },
+                status: node_status,
+                unschedulable,
                 roles: if roles.is_empty() { "<none>".into() } else { roles },
                 version: info.map(|i| i.kubelet_version.clone()).unwrap_or_default(),
                 os_arch: info
@@ -649,11 +660,14 @@ impl KubeClient {
             0
         };
 
+        let nodes_cordoned = node_stats.iter().filter(|n| n.unschedulable).count();
+
         Ok(ClusterStatsData {
             server_version,
             node_count: node_list.items.len(),
             nodes_ready,
             nodes_not_ready,
+            nodes_cordoned,
             namespace_count: ns_count,
             pod_count,
             pods_running,
@@ -878,6 +892,72 @@ impl KubeClient {
             .await
             .context("Failed to scale resource")?;
         Ok(())
+    }
+
+    /// Cordon a node (mark as unschedulable).
+    pub async fn cordon_node(&self, name: &str) -> Result<()> {
+        let api: Api<Node> = Api::all(self.client.clone());
+        let patch = serde_json::json!({ "spec": { "unschedulable": true } });
+        let pp = kube::api::PatchParams::default();
+        api.patch(name, &pp, &kube::api::Patch::Merge(&patch))
+            .await
+            .context("Failed to cordon node")?;
+        Ok(())
+    }
+
+    /// Uncordon a node (mark as schedulable).
+    pub async fn uncordon_node(&self, name: &str) -> Result<()> {
+        let api: Api<Node> = Api::all(self.client.clone());
+        let patch = serde_json::json!({ "spec": { "unschedulable": false } });
+        let pp = kube::api::PatchParams::default();
+        api.patch(name, &pp, &kube::api::Patch::Merge(&patch))
+            .await
+            .context("Failed to uncordon node")?;
+        Ok(())
+    }
+
+    /// Drain a node: cordon it, then evict all non-DaemonSet, non-mirror pods.
+    pub async fn drain_node(&self, name: &str) -> Result<usize> {
+        // Step 1: cordon
+        self.cordon_node(name).await?;
+
+        // Step 2: list pods on this node
+        let pod_api: Api<Pod> = Api::all(self.client.clone());
+        let lp = ListParams::default().fields(&format!("spec.nodeName={}", name));
+        let pods = pod_api.list(&lp).await.context("Failed to list pods on node")?;
+
+        let mut evicted = 0;
+        for pod in &pods.items {
+            let meta = &pod.metadata;
+            let pod_name = meta.name.as_deref().unwrap_or("");
+            let ns = meta.namespace.as_deref().unwrap_or("default");
+
+            // Skip DaemonSet-owned pods
+            if let Some(owners) = &meta.owner_references {
+                if owners.iter().any(|o| o.kind == "DaemonSet") {
+                    continue;
+                }
+            }
+
+            // Skip mirror pods (created by kubelet)
+            if let Some(annotations) = &meta.annotations {
+                if annotations.contains_key("kubernetes.io/config.mirror") {
+                    continue;
+                }
+            }
+
+            // Evict the pod
+            let ns_api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+            let ep = kube::api::EvictParams::default();
+            match ns_api.evict(pod_name, &ep).await {
+                | Ok(_) => evicted += 1,
+                | Err(_) => {
+                    // Continue — some pods may have PDBs blocking eviction
+                },
+            }
+        }
+
+        Ok(evicted)
     }
 
     pub async fn fetch_related_events(&self, ns: &str, resource_name: &str) -> Result<Vec<RelatedEvent>> {
@@ -2582,13 +2662,17 @@ impl KubeClient {
         let status = n.status.as_ref();
         let conditions = status.and_then(|s| s.conditions.as_ref());
         let ready = conditions
-            .and_then(|conds| {
-                conds
-                    .iter()
-                    .find(|c| c.type_ == "Ready")
-                    .map(|c| if c.status == "True" { "Ready" } else { "NotReady" })
-            })
-            .unwrap_or("Unknown");
+            .and_then(|conds| conds.iter().find(|c| c.type_ == "Ready").map(|c| c.status == "True"))
+            .unwrap_or(false);
+        let unschedulable = n.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false);
+
+        let status_str = match (ready, unschedulable) {
+            | (true, false) => "Ready".to_string(),
+            | (true, true) => "Ready,SchedulingDisabled".to_string(),
+            | (false, false) => "NotReady".to_string(),
+            | (false, true) => "NotReady,SchedulingDisabled".to_string(),
+        };
+
         let roles = n
             .metadata
             .labels
@@ -2612,7 +2696,7 @@ impl KubeClient {
             name: meta_name(&n.metadata),
             namespace: String::new(),
             columns: vec![
-                ready.to_string(),
+                status_str,
                 if roles.is_empty() { "<none>".into() } else { roles },
                 version,
                 format_age(n.metadata.creation_timestamp.as_ref()),

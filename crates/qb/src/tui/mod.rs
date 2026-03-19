@@ -1,4 +1,5 @@
 pub mod app;
+pub mod command;
 pub mod logs;
 pub mod smart;
 pub mod ui;
@@ -99,6 +100,11 @@ fn run_event_loop(
             run_create_editor(terminal, &mut app, create)?;
         }
 
+        // Handle pending metadata edit — suspend TUI, open editor, apply on save
+        if let Some(meta_edit) = app.pending_metadata_edit.take() {
+            run_metadata_editor(terminal, &mut app, meta_edit)?;
+        }
+
         if app.should_quit {
             return Ok(());
         }
@@ -187,6 +193,48 @@ fn run_create_editor(
     match status {
         | Ok(s) if s.success() => {
             app.handle_create_result(yaml);
+        },
+        | Ok(s) => {
+            app.error = Some(format!("Editor exited with status: {}", s));
+        },
+        | Err(e) => {
+            app.error = Some(format!("Failed to run editor '{}': {}", editor, e));
+        },
+    }
+
+    Ok(())
+}
+
+fn run_metadata_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut app::App,
+    edit: app::PendingMetadataEdit,
+) -> Result<()> {
+    let tmp = tempfile::Builder::new().suffix(".yaml").tempfile()?;
+    std::fs::write(tmp.path(), &edit.yaml)?;
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
+        if std::process::Command::new("vim").arg("--version").output().is_ok() {
+            "vim".into()
+        } else {
+            "vi".into()
+        }
+    });
+
+    let status = std::process::Command::new(&editor).arg(tmp.path()).status();
+    let edited_yaml = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    match status {
+        | Ok(s) if s.success() => {
+            app.handle_metadata_edit_result(edit, edited_yaml);
         },
         | Ok(s) => {
             app.error = Some(format!("Editor exited with status: {}", s));

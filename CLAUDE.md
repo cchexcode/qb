@@ -25,6 +25,8 @@ crates/qb/src/
   tui/app.rs       App struct (all state), key handlers, deferred loading, filter state,
                    dict entry selection/expansion, edit flow (diff, apply, re-edit),
                    port forward dialog + creation flow
+  tui/command.rs   Command registry — single source of truth for all keybindings.
+                   Drives hotkey bars, help screen, and command palette.
   tui/ui.rs        Rendering: main view, detail view, log view, events log, cluster stats,
                    port forwards view, edit diff view (inline + side-by-side), popups,
                    breadcrumb with refresh indicator, hotkey bars, node grid cards, gauge bars
@@ -59,6 +61,9 @@ crates/qb/src/
     (secret values, label/annotation values).
 12. **Edit via $EDITOR** — `e` opens the resource YAML in `$EDITOR` (falls back to vim → vi).
     On save, shows a diff preview (inline or side-by-side) with apply/re-edit/cancel options.
+13. **All text editing uses $EDITOR** — Labels, annotations, resource YAML, and new resources
+    are all edited by opening `$EDITOR` with YAML content. No inline character-by-character
+    editing for structured data. The TUI suspends, editor runs, TUI resumes on close.
 
 ## Key Bindings Summary
 
@@ -102,7 +107,7 @@ Keyboard-only. All navigation uses vim-style bindings.
 | `y` | Copy resource name |
 | `d` | Mark / diff resources |
 | `C` | Create new resource |
-| `x` | Exec into pod (experimental, when no filter active) |
+| `X` | Exec into pod (experimental) |
 
 ### Detail View
 
@@ -126,7 +131,7 @@ Keyboard-only. All navigation uses vim-style bindings.
 | `S` | Scale workload |
 | `w` | Toggle watch mode (auto-refresh detail) |
 | `Tab` | Toggle related resources selection |
-| `x` | Exec into pod (experimental) |
+| `X` | Exec into pod (experimental) |
 
 ### Log View
 
@@ -172,21 +177,20 @@ Keyboard-only. All navigation uses vim-style bindings.
 
 ## Sidebar Structure
 
-The sidebar has two super-categories:
+The sidebar is a flat list with category headers (non-selectable) and selectable items.
+Overview is always the first item and the default landing screen.
 
-**CLUSTER** (all K8s resource categories):
-1. **Cluster** — Overview (stats), Nodes, Namespaces, Events
-2. **Workloads** — Deployments, StatefulSets, DaemonSets, ReplicaSets, Pods, CronJobs, Jobs, HPAs
-3. **Network** — Services, Ingresses, Endpoints, NetworkPolicies
-4. **Config** — ConfigMaps, Secrets
-5. **RBAC** — ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
-6. **Storage** — PVCs, PVs, StorageClasses
+1. **Overview** — Cluster stats, health, node grid (default on startup)
+2. **WORKLOADS** — Deployments, StatefulSets, DaemonSets, ReplicaSets, Pods, CronJobs, Jobs, HPAs
+3. **NETWORK** — Services, Ingresses, Endpoints, NetworkPolicies
+4. **CONFIG** — ConfigMaps, Secrets
+5. **STORAGE** — PVCs, PVs, StorageClasses
+6. **RBAC** — ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
+7. **CLUSTER** — Nodes, Namespaces, Events
+8. **FORWARDING** — Port Forwards (view, pause, resume, cancel)
 
-**GLOBAL** (cross-cluster features):
-- **Port Forwards** — View, pause, resume, cancel active port forwards
-
-Super-categories and categories are non-selectable headers (`NavItemKind::SuperCategory`,
-`NavItemKind::Category`). Navigation with j/k skips over them.
+Categories are non-selectable headers (`NavItemKind::Category`). Navigation with j/k
+skips over them.
 
 Cluster-scoped resources (Node, Namespace, PV, StorageClass, ClusterRole, ClusterRoleBinding)
 use `list_cluster`/`get_value_cluster` helpers instead of the namespaced variants.
@@ -363,6 +367,14 @@ for exhaustive matching. No `unreachable!()` in dispatch.
 
 ### Patterns to follow
 
+- **Command registry** (`tui/command.rs`): All commands are defined once in a static `COMMANDS`
+  table. Each `Cmd` has key label, display label, description, contexts, hotkey visibility,
+  palette eligibility, and an optional availability predicate. This single table drives:
+  - The hotkey bar (`build_hotkey_bar` in ui.rs)
+  - The help screen (`filtered_help_entries` in app.rs)
+  - The command palette (`palette_commands` in command.rs)
+  To add a new command: add a `Cmd` entry to `COMMANDS`, add the key handler in the appropriate
+  `handle_*_key` method, and it automatically appears in the hotkey bar, help, and palette.
 - **Deferred loading**: Queue a `PendingLoad` variant → `process_pending_load()` runs it after
   the next render. Never call `block_on` inside a key handler directly.
 - **Selection preservation**: When refreshing a list, save the selected item's `(name, namespace)`

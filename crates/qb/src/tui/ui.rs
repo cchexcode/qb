@@ -4,8 +4,6 @@ use {
             App,
             DetailMode,
             Focus,
-            MetadataEditKind,
-            MetadataEditMode,
             NavItemKind,
             Popup,
             View,
@@ -53,79 +51,108 @@ pub fn render(f: &mut Frame, app: &mut App) {
 // ---------------------------------------------------------------------------
 
 fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
-    let sep_style = Style::default().fg(Color::DarkGray);
-    let seg_style = Style::default().fg(Color::White);
-    let active_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray).bg(Color::DarkGray);
+    let seg = Style::default().fg(Color::White).bg(Color::DarkGray);
+    let active = Style::default()
+        .fg(Color::Cyan)
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let sep = Span::styled(" › ", dim);
 
-    let mut spans: Vec<Span> = vec![Span::styled(" ", Style::default())];
+    let mut spans: Vec<Span> = vec![Span::styled(" ", dim)];
 
-    let push_seg = |spans: &mut Vec<Span>, text: String, is_last: bool| {
-        let style = if is_last { active_style } else { seg_style };
-        spans.push(Span::styled(text, style));
-        if !is_last {
-            spans.push(Span::styled(" > ", sep_style));
-        }
-    };
-
-    // Cluster context
     let ctx = app.kube.current_context().to_string();
-    let is_main_only = app.view == View::Main;
-    push_seg(&mut spans, ctx, is_main_only && app.selected_resource_type.is_none());
+    let is_top = app.view == View::Main && app.selected_resource_type.is_none();
+    spans.push(Span::styled(ctx, if is_top { active } else { seg }));
 
     // Namespace
+    spans.push(sep.clone());
     let ns = app.kube.namespace_display().to_string();
-    push_seg(&mut spans, ns, false);
+    spans.push(Span::styled(ns, seg));
 
     // Resource type
     if let Some(rt) = app.selected_resource_type {
-        let rt_name = rt.display_name().to_string();
-        let is_last_rt = is_main_only;
-        push_seg(&mut spans, rt_name, is_last_rt);
+        spans.push(sep.clone());
+        let is_last = app.view == View::Main;
+        spans.push(Span::styled(
+            rt.display_name().to_string(),
+            if is_last { active } else { seg },
+        ));
 
-        // Selected resource name (in detail or log view)
+        // Resource name (detail/logs)
         if app.view == View::Detail || app.view == View::Logs {
-            let res_name = app
+            let name = app
                 .resource_state
                 .selected()
                 .and_then(|idx| app.resources.get(idx))
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| "?".into());
+            spans.push(sep.clone());
             let is_detail = app.view == View::Detail;
-            push_seg(&mut spans, res_name, is_detail);
+            spans.push(Span::styled(name, if is_detail { active } else { seg }));
         }
 
-        // Log view suffix
         if app.view == View::Logs {
-            if let Some(log_state) = &app.log_state {
-                push_seg(&mut spans, log_state.source_display(), false);
-                push_seg(&mut spans, "logs".to_string(), true);
-            }
+            spans.push(sep.clone());
+            spans.push(Span::styled("logs", active));
         }
     }
 
-    // Right-align the refresh indicator
+    if app.view == View::EditDiff {
+        spans.push(sep.clone());
+        spans.push(Span::styled("edit", active));
+    }
+
+    // Badges (filter, error, status)
+    if !app.resource_filter_text.is_empty() && app.view == View::Main {
+        spans.push(Span::styled("  ", dim));
+        spans.push(Span::styled(
+            format!(" /{} ", app.resource_filter_text),
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
+
+    if let Some(err) = &app.error {
+        spans.push(Span::styled("  ", dim));
+        let truncated = if err.len() > 60 {
+            format!("{}…", &err[..60])
+        } else {
+            err.clone()
+        };
+        spans.push(Span::styled(
+            format!(" {} ", truncated),
+            Style::default().fg(Color::White).bg(Color::Red),
+        ));
+    }
+
+    // Right side: last update time — always visible
     let elapsed = app.last_refresh.elapsed().as_secs();
-    let refresh_text = if app.paused {
+    let right_text = if app.paused {
         " ⏸ paused ".to_string()
     } else if elapsed < 2 {
         " ⟳ just now ".to_string()
-    } else {
+    } else if elapsed < 60 {
         format!(" ⟳ {}s ago ", elapsed)
+    } else {
+        format!(" ⟳ {}m{}s ago ", elapsed / 60, elapsed % 60)
     };
-    let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let area_width = area.width as usize;
-    let pad = area_width.saturating_sub(left_width + refresh_text.len());
-    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(Color::DarkGray)));
-    let refresh_style = if app.paused {
+
+    let left_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let area_w = area.width as usize;
+    let pad = area_w.saturating_sub(left_w + right_text.len());
+    spans.push(Span::styled(" ".repeat(pad), dim));
+
+    let right_style = if app.paused {
         Style::default().fg(Color::Yellow).bg(Color::DarkGray)
     } else {
         Style::default().fg(Color::White).bg(Color::DarkGray)
     };
-    spans.push(Span::styled(refresh_text, refresh_style));
+    spans.push(Span::styled(right_text, right_style));
 
-    let line = Line::from(spans);
-    let bar = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
-    f.render_widget(bar, area);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray)),
+        area,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -133,22 +160,15 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_main(f: &mut Frame, app: &mut App) {
-    let has_filter_bar = app.resource_filter_editing || !app.resource_filter_text.is_empty();
-    let filter_height = if has_filter_bar { 1 } else { 0 };
-    let status_height = if app.error.is_some() {
-        1
-    } else {
-        app.recent_status(3).len().min(3) as u16
-    };
+    let has_filter_bar = app.resource_filter_editing;
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),             // breadcrumb
-            Constraint::Min(3),                // main area
-            Constraint::Length(filter_height), // filter bar
-            Constraint::Length(status_height), // status/error line(s)
-            Constraint::Length(2),             // hotkey tab bar (2 lines for wrapping)
+            Constraint::Length(1),                                  // breadcrumb
+            Constraint::Min(3),                                     // main area
+            Constraint::Length(if has_filter_bar { 1 } else { 0 }), // filter bar (editing only)
+            Constraint::Length(1),                                  // hotkey bar
         ])
         .split(f.area());
 
@@ -156,7 +176,7 @@ fn render_main(f: &mut Frame, app: &mut App) {
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(40)])
+        .constraints([Constraint::Length(26), Constraint::Min(40)])
         .split(outer[1]);
 
     render_nav(f, app, cols[0]);
@@ -166,8 +186,8 @@ fn render_main(f: &mut Frame, app: &mut App) {
         render_resource_filter_bar(f, app, outer[2]);
     }
 
-    render_error(f, app, outer[3]);
-    render_hotkey_bar(f, app, outer[4]);
+    let bar = build_hotkey_bar(app);
+    f.render_widget(Paragraph::new(bar), outer[3]);
 }
 
 // ---------------------------------------------------------------------------
@@ -180,12 +200,7 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|item| {
             let style = match &item.kind {
-                | NavItemKind::SuperCategory => {
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                },
-                | NavItemKind::Category => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                | NavItemKind::Category => Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
                 | NavItemKind::Resource(rt) => {
                     if app.selected_resource_type == Some(*rt) && !app.showing_port_forwards {
                         Style::default().fg(Color::Green)
@@ -350,6 +365,16 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
                     | _ => Style::default(),
                 };
                 Row::new(cells).style(style)
+            } else if rt == ResourceType::Node {
+                let status = entry.columns.first().map(|s| s.as_str()).unwrap_or("");
+                let style = if status.contains("SchedulingDisabled") {
+                    Style::default().fg(Color::Yellow)
+                } else if status.contains("NotReady") {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                Row::new(cells).style(style)
             } else {
                 Row::new(cells)
             };
@@ -474,13 +499,20 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
     let lbl = Style::default().fg(Color::Cyan);
     let val = Style::default().fg(Color::White);
     let bold = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
-    let is_ready = node.status == "Ready";
-    let status_style = if is_ready {
-        Style::default().fg(Color::Green)
-    } else {
+    let status_style = if node.unschedulable {
+        Style::default().fg(Color::Yellow)
+    } else if node.status.contains("NotReady") {
         Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Green)
     };
-    let status_icon = if is_ready { "●" } else { "○" };
+    let status_icon = if node.unschedulable {
+        "⊘"
+    } else if node.status.contains("NotReady") {
+        "○"
+    } else {
+        "●"
+    };
     let inner = w.saturating_sub(4); // │ + space ... space + │
 
     // Helper: pad a set of spans to exactly `inner` visible chars, then wrap in │ …
@@ -525,8 +557,16 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
         Span::styled("╮", dim),
     ]);
 
-    // Role
-    card.push(row(vec![Span::styled(role_display, dim)]));
+    // Role + status
+    if node.unschedulable {
+        card.push(row(vec![Span::styled(role_display, dim)]));
+        card.push(row(vec![Span::styled(
+            "⊘ CORDONED",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )]));
+    } else {
+        card.push(row(vec![Span::styled(role_display, dim)]));
+    }
 
     // Separator
     card.push(vec![Span::styled(format!("├{}┤", "─".repeat(bar_w)), dim)]);
@@ -621,15 +661,24 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ── Top stat cards row ──────────────────────────────────
     let card_w = 20;
-    let node_style = if stats.nodes_not_ready > 0 { bad } else { good };
+    let node_style = if stats.nodes_not_ready > 0 {
+        bad
+    } else if stats.nodes_cordoned > 0 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        good
+    };
+    let node_value = if stats.nodes_cordoned > 0 {
+        format!(
+            "{} ready, {} cordoned / {}",
+            stats.nodes_ready, stats.nodes_cordoned, stats.node_count
+        )
+    } else {
+        format!("{} ready / {}", stats.nodes_ready, stats.node_count)
+    };
     let cards: Vec<Vec<Line>> = vec![
         stat_card("K8s", &stats.server_version, value, card_w),
-        stat_card(
-            "Nodes",
-            &format!("{} ready / {}", stats.nodes_ready, stats.node_count),
-            node_style,
-            card_w,
-        ),
+        stat_card("Nodes", &node_value, node_style, card_w),
         stat_card("Namespaces", &stats.namespace_count.to_string(), value, card_w),
         stat_card("Deployments", &stats.deployment_count.to_string(), value, card_w),
         stat_card("Services", &stats.service_count.to_string(), value, card_w),
@@ -664,6 +713,12 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(Color::Red),
             )));
         }
+        if stats.nodes_cordoned > 0 {
+            warnings.push(Line::from(Span::styled(
+                format!("  ⊘ {} node(s) cordoned (scheduling disabled)", stats.nodes_cordoned),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
         if stats.nodes_with_pressure > 0 {
             warnings.push(Line::from(Span::styled(
                 format!("  ⚠ {} node(s) with resource pressure", stats.nodes_with_pressure),
@@ -672,7 +727,7 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
         }
         if stats.recent_warnings > 0 {
             warnings.push(Line::from(Span::styled(
-                format!("  ⚠ {} warning event(s) in last 15 minutes", stats.recent_warnings),
+                format!("  ⚠ {} warning event(s) in last hour", stats.recent_warnings),
                 Style::default().fg(Color::Yellow),
             )));
         }
@@ -957,7 +1012,7 @@ fn render_detail(f: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(1), // breadcrumb
             Constraint::Min(3),    // content
-            Constraint::Length(2), // hotkey bar
+            Constraint::Length(1), // hotkey bar
         ])
         .split(f.area());
 
@@ -987,8 +1042,8 @@ fn render_detail(f: &mut Frame, app: &mut App) {
         .scroll((app.detail_scroll, 0));
     f.render_widget(paragraph, outer[1]);
 
-    let bar = build_detail_hotkey_bar(app);
-    f.render_widget(Paragraph::new(bar).wrap(Wrap { trim: false }), outer[2]);
+    let bar = build_hotkey_bar(app);
+    f.render_widget(Paragraph::new(bar), outer[2]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,39 +1061,16 @@ fn render_edit_diff(f: &mut Frame, app: &mut App) {
         | None => return,
     };
 
-    let has_error = ctx.error.is_some();
-    let error_height = if has_error { 2 } else { 0 };
-
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),            // breadcrumb
-            Constraint::Min(3),               // diff content
-            Constraint::Length(error_height), // error
-            Constraint::Length(2),            // hotkey bar
+            Constraint::Length(1), // breadcrumb
+            Constraint::Min(3),    // diff content
+            Constraint::Length(1), // hotkey bar
         ])
         .split(f.area());
 
-    // Breadcrumb
-    let mode_label = match ctx.diff_mode {
-        | DiffMode::Inline => "Inline",
-        | DiffMode::SideBySide => "Side-by-Side",
-    };
-    let breadcrumb = Line::from(vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(
-            format!(" Edit: {}/{} ", ctx.resource_type.display_name(), ctx.name),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" — Review changes [{}]", mode_label),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    f.render_widget(
-        Paragraph::new(breadcrumb).style(Style::default().bg(Color::DarkGray)),
-        outer[0],
-    );
+    render_breadcrumb(f, app, outer[0]);
 
     // Diff content
     let added = ctx.diff_lines.iter().filter(|(k, _)| *k == DiffKind::Added).count();
@@ -1198,46 +1230,9 @@ fn render_edit_diff(f: &mut Frame, app: &mut App) {
         },
     }
 
-    // Error display
-    if let Some(err) = &ctx.error {
-        let err_lines = vec![
-            Line::from(vec![
-                Span::styled(" ERROR: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                Span::styled(err.clone(), Style::default().fg(Color::Red)),
-            ]),
-            Line::from(Span::styled(
-                " Press [e] to re-edit or [Esc] to cancel",
-                Style::default().fg(Color::Yellow),
-            )),
-        ];
-        f.render_widget(Paragraph::new(err_lines), outer[2]);
-    }
-
     // Hotkey bar
-    let key_style = Style::default().fg(Color::Black).bg(Color::Yellow);
-    let label_style = Style::default().fg(Color::White);
-    let sep = Span::styled("  ", Style::default());
-    let view_label = match ctx.diff_mode {
-        | DiffMode::Inline => " Side-by-Side",
-        | DiffMode::SideBySide => " Inline",
-    };
-    let bar = Line::from(vec![
-        Span::styled(" Enter ", key_style),
-        Span::styled(" Apply", label_style),
-        sep.clone(),
-        Span::styled(" v ", key_style),
-        Span::styled(view_label, label_style),
-        sep.clone(),
-        Span::styled(" e ", key_style),
-        Span::styled(" Re-edit", label_style),
-        sep.clone(),
-        Span::styled(" j/k ", key_style),
-        Span::styled(" Scroll", label_style),
-        sep.clone(),
-        Span::styled(" Esc ", key_style),
-        Span::styled(" Cancel", label_style),
-    ]);
-    f.render_widget(Paragraph::new(bar).wrap(Wrap { trim: false }), outer[3]);
+    let bar = build_hotkey_bar(app);
+    f.render_widget(Paragraph::new(bar), outer[2]);
 }
 
 fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
@@ -1413,7 +1408,7 @@ fn render_logs(f: &mut Frame, app: &mut App) {
             Constraint::Length(1),             // breadcrumb
             Constraint::Min(3),                // log content
             Constraint::Length(filter_height), // filter bar
-            Constraint::Length(2),             // hotkey bar
+            Constraint::Length(1),             // hotkey bar
         ])
         .split(f.area());
 
@@ -1517,457 +1512,121 @@ fn render_logs(f: &mut Frame, app: &mut App) {
     }
 
     // Hotkey bar
-    let bar = build_log_hotkey_bar(state);
-    f.render_widget(Paragraph::new(bar).wrap(Wrap { trim: false }), outer[3]);
+    let bar = build_hotkey_bar(app);
+    f.render_widget(Paragraph::new(bar), outer[3]);
 }
 
-fn build_log_hotkey_bar(state: &super::logs::LogViewState) -> Line<'static> {
+/// Build the hotkey bar for any context from the command registry.
+/// Dynamic labels (Follow/Unfollow, Pause/Resume, etc.) are applied here.
+fn build_hotkey_bar(app: &App) -> Line<'static> {
+    use super::command::{
+        self,
+        Ctx,
+    };
+
     let key_style = Style::default().fg(Color::Black).bg(Color::Yellow);
     let label_style = Style::default().fg(Color::White);
+    let badge_style = Style::default().fg(Color::Black).bg(Color::Green);
     let sep = Span::styled("  ", Style::default());
 
-    let follow_label = if state.following { " Unfollow" } else { " Follow" };
+    let ctx = app.current_context();
+    let flags = app.cmd_flags();
+    let commands = command::hotkey_bar(ctx, &flags);
+    let mut spans: Vec<Span> = Vec::new();
 
-    let mut spans = vec![
-        Span::styled(" Esc ", key_style),
-        Span::styled(" Back", label_style),
-        sep.clone(),
-        Span::styled(" / ", key_style),
-        Span::styled(" Filter", label_style),
-        sep.clone(),
-        Span::styled(" f ", key_style),
-        Span::styled(follow_label.to_string(), label_style),
-        sep.clone(),
-    ];
-
-    if state.pods.len() > 1 {
-        spans.extend([
-            Span::styled(" p ", key_style),
-            Span::styled(format!(" Pod: {}", state.pod_label()), label_style),
-            sep.clone(),
-        ]);
-    }
-
-    if state.active_containers().len() > 1 {
-        spans.extend([
-            Span::styled(" c ", key_style),
-            Span::styled(format!(" Container: {}", state.container_label()), label_style),
-            sep.clone(),
-        ]);
-    }
-
-    if !state.filter_text.is_empty() {
-        spans.extend([
-            Span::styled(" x ", key_style),
-            Span::styled(" Clear filter", label_style),
-            sep.clone(),
-        ]);
-    }
-
-    let wrap_label = if state.wrap { " Unwrap" } else { " Wrap" };
-    spans.extend([
-        Span::styled(" w ", key_style),
-        Span::styled(wrap_label, label_style),
-        sep.clone(),
-    ]);
-
-    spans.extend([
-        Span::styled(" t ", key_style),
-        Span::styled(
-            if state.since_seconds.is_some() {
-                " Time*"
-            } else {
-                " Time"
+    for cmd in &commands {
+        // Dynamic label overrides based on current state
+        let label: String = match (cmd.key, ctx) {
+            | ("f", Ctx::Logs) => {
+                if flags.following {
+                    " Unfollow".into()
+                } else {
+                    " Follow".into()
+                }
             },
-            label_style,
-        ),
-        sep.clone(),
-    ]);
+            | ("w", Ctx::Logs) => {
+                if flags.wrapping {
+                    " Unwrap".into()
+                } else {
+                    " Wrap".into()
+                }
+            },
+            | ("t", Ctx::Logs) => {
+                if flags.has_since {
+                    " Time*".into()
+                } else {
+                    " Time".into()
+                }
+            },
+            | ("w", Ctx::Detail) => {
+                if flags.detail_auto_refresh {
+                    " Unwatch".into()
+                } else {
+                    " Watch".into()
+                }
+            },
+            | ("p", Ctx::Logs) => {
+                if let Some(s) = &app.log_state {
+                    format!(" Pod: {}", s.pod_label())
+                } else {
+                    " Pod".into()
+                }
+            },
+            | ("c", Ctx::Logs) => {
+                if let Some(s) = &app.log_state {
+                    format!(" Container: {}", s.container_label())
+                } else {
+                    " Container".into()
+                }
+            },
+            | ("K", _) => {
+                if flags.node_cordoned {
+                    " Uncordon".into()
+                } else {
+                    " Cordon".into()
+                }
+            },
+            | ("d", Ctx::Resources) => {
+                if flags.diff_mark_set {
+                    " Diff*".into()
+                } else {
+                    " Diff".into()
+                }
+            },
+            | ("c", Ctx::Nav | Ctx::Resources | Ctx::ClusterStats) => {
+                format!(" {}", app.kube.current_context())
+            },
+            | ("n", Ctx::Nav | Ctx::Resources | Ctx::ClusterStats) => {
+                if app.kube.is_all_namespaces() {
+                    " All".into()
+                } else {
+                    format!(" {}", app.kube.current_namespace().unwrap_or("All"))
+                }
+            },
+            | _ => format!(" {}", cmd.label),
+        };
 
-    spans.extend([
-        Span::styled(" Y ", key_style),
-        Span::styled(" Copy All", label_style),
-        sep.clone(),
-    ]);
-
-    Line::from(spans)
-}
-
-// ---------------------------------------------------------------------------
-// Error bar
-// ---------------------------------------------------------------------------
-
-fn render_error(f: &mut Frame, app: &App, area: Rect) {
-    if let Some(err) = &app.error {
-        let text = Paragraph::new(Line::from(vec![
-            Span::styled(" ERROR: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::styled(err.as_str(), Style::default().fg(Color::Red)),
-        ]));
-        f.render_widget(text, area);
-    } else {
-        // Show recent status messages
-        let recent = app.recent_status(3);
-        if !recent.is_empty() {
-            let lines: Vec<Line> = recent
-                .iter()
-                .enumerate()
-                .map(|(i, msg)| {
-                    let style = if i == 0 {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
-                    Line::from(Span::styled(format!(" {}", msg), style))
-                })
-                .collect();
-            f.render_widget(Paragraph::new(lines), area);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Gitui-style hotkey tab bar
-// ---------------------------------------------------------------------------
-
-fn render_hotkey_bar(f: &mut Frame, app: &App, area: Rect) {
-    let ctx = app.kube.current_context();
-    let ns_display = app.kube.namespace_display();
-
-    let key_style = Style::default().fg(Color::Black).bg(Color::Yellow);
-    let label_style = Style::default().fg(Color::White);
-    let sep = Span::styled("  ", Style::default());
-
-    let mut spans = vec![
-        Span::styled(" r ", key_style),
-        Span::styled(" Resources", label_style),
-        sep.clone(),
-        Span::styled(" c ", key_style),
-        Span::styled(format!(" {}", ctx), label_style),
-        sep.clone(),
-        Span::styled(" n ", key_style),
-        Span::styled(format!(" {}", ns_display), label_style),
-        sep.clone(),
-    ];
-
-    // Show [l] Logs for workload resources
-    if app.selected_resource_type.map(|rt| rt.supports_logs()).unwrap_or(false) {
-        spans.extend([
-            Span::styled(" l ", key_style),
-            Span::styled(" Logs", label_style),
-            sep.clone(),
-        ]);
+        spans.push(Span::styled(format!(" {} ", cmd.key), key_style));
+        spans.push(Span::styled(label, label_style));
+        spans.push(sep.clone());
     }
 
-    // Events log-style navigation hints
-    if app.selected_resource_type == Some(ResourceType::Event) && app.focus == Focus::Resources {
-        spans.extend([
-            Span::styled(" j/k ", key_style),
-            Span::styled(" Scroll", label_style),
-            sep.clone(),
-            Span::styled(" G ", key_style),
-            Span::styled(" Bottom", label_style),
-            sep.clone(),
-            Span::styled(" Enter ", key_style),
-            Span::styled(" Detail", label_style),
-            sep.clone(),
-        ]);
-    }
-
-    // Edit
-    if app.selected_resource_type.is_some() && app.focus == Focus::Resources && !app.showing_port_forwards {
-        spans.extend([
-            Span::styled(" e ", key_style),
-            Span::styled(" Edit", label_style),
-            sep.clone(),
-        ]);
-    }
-
-    // Port forward
-    if app.selected_resource_type.is_some() && app.focus == Focus::Resources && !app.showing_port_forwards {
-        let rt = app.selected_resource_type.unwrap();
-        let supports_pf = matches!(
-            rt,
-            ResourceType::Service
-                | ResourceType::Deployment
-                | ResourceType::StatefulSet
-                | ResourceType::DaemonSet
-                | ResourceType::ReplicaSet
-                | ResourceType::Pod
-                | ResourceType::Job
-                | ResourceType::CronJob
-        );
-        if supports_pf {
-            spans.extend([
-                Span::styled(" F ", key_style),
-                Span::styled(" PortFwd", label_style),
-                sep.clone(),
-            ]);
-        }
-
-        // Scale
-        if rt.supports_scale() {
-            spans.extend([
-                Span::styled(" S ", key_style),
-                Span::styled(" Scale", label_style),
-                sep.clone(),
-            ]);
-        }
-
-        // Exec (experimental only, hide when filter active since x clears filter)
-        if app.experimental && rt.supports_exec() && app.resource_filter_text.is_empty() {
-            spans.extend([
-                Span::styled(" x ", key_style),
-                Span::styled(" Exec", label_style),
-                sep.clone(),
-            ]);
-        }
-
-        // Delete
-        spans.extend([
-            Span::styled(" D ", key_style),
-            Span::styled(" Delete", label_style),
-            sep.clone(),
-        ]);
-
-        // Restart
-        if matches!(
-            rt,
-            ResourceType::Deployment | ResourceType::StatefulSet | ResourceType::DaemonSet
-        ) {
-            spans.extend([
-                Span::styled(" R ", key_style),
-                Span::styled(" Restart", label_style),
-                sep.clone(),
-            ]);
-        }
-
-        // Copy name
-        spans.extend([
-            Span::styled(" y ", key_style),
-            Span::styled(" Copy", label_style),
-            sep.clone(),
-        ]);
-
-        // Diff
-        spans.extend([
-            Span::styled(" d ", key_style),
-            Span::styled(if app.diff_mark.is_some() { " Diff*" } else { " Diff" }, label_style),
-            sep.clone(),
-        ]);
-
-        // Create
-        spans.extend([
-            Span::styled(" C ", key_style),
-            Span::styled(" Create", label_style),
-            sep.clone(),
-        ]);
-    }
-
-    // Port forwards view hotkeys
-    if app.showing_port_forwards && app.focus == Focus::Resources {
-        if !app.pf_manager.entries().is_empty() {
-            spans.extend([
-                Span::styled(" p ", key_style),
-                Span::styled(" Pause/Resume", label_style),
-                sep.clone(),
-                Span::styled(" d ", key_style),
-                Span::styled(" Cancel", label_style),
-                sep.clone(),
-            ]);
-        }
-    }
-
-    // Filter controls
-    if !app.showing_port_forwards {
-        spans.extend([
-            Span::styled(" / ", key_style),
-            Span::styled(" Filter", label_style),
-            sep.clone(),
-        ]);
-        if !app.resource_filter_text.is_empty() {
-            spans.extend([
-                Span::styled(" x ", key_style),
-                Span::styled(" Clear", label_style),
-                sep.clone(),
-            ]);
-        }
-    }
-
-    // Pause toggle (auto-refresh, not port forward pause)
-    if !app.showing_port_forwards {
-        let pause_label = if app.paused { " Resume" } else { " Pause" };
-        spans.extend([
-            Span::styled(" p ", key_style),
-            Span::styled(pause_label, label_style),
-            sep.clone(),
-        ]);
-    }
-    if app.paused {
+    // State badges at the end
+    if flags.paused
+        && matches!(
+            ctx,
+            Ctx::Nav | Ctx::Resources | Ctx::ClusterStats | Ctx::Detail | Ctx::Events
+        )
+    {
         spans.push(Span::styled(
             " ⏸ PAUSED ",
             Style::default().fg(Color::Black).bg(Color::Yellow),
         ));
-        spans.push(Span::styled("  ", Style::default()));
+        spans.push(sep.clone());
     }
-
-    spans.extend([
-        Span::styled(" ^p ", key_style),
-        Span::styled(" Palette", label_style),
-        sep.clone(),
-        Span::styled(" ? ", key_style),
-        Span::styled(" Help", label_style),
-        sep.clone(),
-        Span::styled(" O ", key_style),
-        Span::styled(" Kubeconfig", label_style),
-        sep,
-        Span::styled(" q ", key_style),
-        Span::styled(" Quit", label_style),
-    ]);
-
-    let bar = Line::from(spans);
-    f.render_widget(Paragraph::new(bar).wrap(Wrap { trim: false }), area);
-}
-
-/// Context-sensitive hotkey bar for the detail view.
-fn build_detail_hotkey_bar(app: &App) -> Line<'static> {
-    let key_style = Style::default().fg(Color::Black).bg(Color::Yellow);
-    let label_style = Style::default().fg(Color::White);
-    let sep = Span::styled("  ", Style::default());
-
-    let is_secret_smart = app.detail_mode == DetailMode::Smart
-        && app.selected_resource_type == Some(ResourceType::Secret)
-        && app.secret_state.is_some();
-
-    let mut spans = vec![
-        Span::styled(" Esc ", key_style),
-        Span::styled(" Back", label_style),
-        sep.clone(),
-    ];
-
-    // [v] cycle view
-    let view_label = match app.detail_mode {
-        | DetailMode::Smart => " YAML",
-        | DetailMode::Yaml => " Smart",
-    };
-    spans.extend([
-        Span::styled(" v ", key_style),
-        Span::styled(view_label, label_style),
-        sep.clone(),
-    ]);
-
-    if is_secret_smart {
-        spans.extend([
-            Span::styled(" j/k ", key_style),
-            Span::styled(" Navigate", label_style),
-            sep.clone(),
-            Span::styled(" Space ", key_style),
-            Span::styled(" Decode", label_style),
-            sep.clone(),
-            Span::styled(" y ", key_style),
-            Span::styled(" Copy", label_style),
-        ]);
-    } else if app.detail_mode == DetailMode::Smart {
-        let has_dict = !app.dict_entries.is_empty();
-        if app.dict_cursor.is_some() {
-            // In selection mode
-            spans.extend([
-                Span::styled(" j/k ", key_style),
-                Span::styled(" Navigate", label_style),
-                sep.clone(),
-                Span::styled(" Space ", key_style),
-                Span::styled(" Expand", label_style),
-                sep.clone(),
-                Span::styled(" y ", key_style),
-                Span::styled(" Copy", label_style),
-                sep.clone(),
-                Span::styled(" s ", key_style),
-                Span::styled(" Done", label_style),
-                sep.clone(),
-            ]);
-        } else {
-            spans.extend([
-                Span::styled(" j/k ", key_style),
-                Span::styled(" Scroll", label_style),
-                sep.clone(),
-            ]);
-            if has_dict {
-                spans.extend([
-                    Span::styled(" s ", key_style),
-                    Span::styled(" Select", label_style),
-                    sep.clone(),
-                ]);
-            }
-        }
-    } else {
-        spans.extend([
-            Span::styled(" y ", key_style),
-            Span::styled(" Copy", label_style),
-            sep.clone(),
-            Span::styled(" j/k ", key_style),
-            Span::styled(" Scroll", label_style),
-            sep.clone(),
-        ]);
-    }
-
-    spans.extend([
-        Span::styled(" PgUp/Dn ", key_style),
-        Span::styled(" Page", label_style),
-        sep.clone(),
-        Span::styled(" e ", key_style),
-        Span::styled(" Edit", label_style),
-    ]);
-
-    // Show [l] Logs for workload resources
-    if app.selected_resource_type.map(|rt| rt.supports_logs()).unwrap_or(false) {
-        spans.extend([
-            sep.clone(),
-            Span::styled(" l ", key_style),
-            Span::styled(" Logs", label_style),
-        ]);
-    }
-
-    // Related resources
-    if !app.related_resources.is_empty() {
-        if app.related_cursor.is_some() {
-            spans.extend([
-                sep.clone(),
-                Span::styled(" ◀▶ ", key_style),
-                Span::styled(" Tab", label_style),
-                sep.clone(),
-                Span::styled(" Tab ", key_style),
-                Span::styled(" Exit", label_style),
-            ]);
-        } else {
-            spans.extend([
-                sep.clone(),
-                Span::styled(" Tab ", key_style),
-                Span::styled(" Related", label_style),
-            ]);
-        }
-    }
-
-    // Watch toggle
-    let watch_label = if app.detail_auto_refresh { " Unwatch" } else { " Watch" };
-    spans.extend([
-        sep.clone(),
-        Span::styled(" w ", key_style),
-        Span::styled(watch_label, label_style),
-    ]);
-
-    // Watch indicator
-    if app.detail_auto_refresh {
-        spans.extend([
-            sep.clone(),
-            Span::styled(" ⟳ WATCH ", Style::default().fg(Color::Black).bg(Color::Green)),
-        ]);
-    }
-
-    // Pause indicator
-    if app.paused {
-        spans.extend([
-            sep,
-            Span::styled(" ⏸ PAUSED ", Style::default().fg(Color::Black).bg(Color::Yellow)),
-        ]);
+    if flags.detail_auto_refresh && ctx == Ctx::Detail {
+        spans.push(Span::styled(" ⟳ WATCH ", badge_style));
+        spans.push(sep.clone());
     }
 
     Line::from(spans)
@@ -2110,9 +1769,10 @@ fn render_help(f: &mut Frame, app: &mut App) {
     }
     app.help_scroll = app.help_scroll.min(entries.len().saturating_sub(visible_rows));
 
-    for (i, (key, desc, ctx)) in entries.iter().skip(app.help_scroll).take(visible_rows).enumerate() {
+    for (i, cmd) in entries.iter().skip(app.help_scroll).take(visible_rows).enumerate() {
         let actual_idx = i + app.help_scroll;
         let is_selected = actual_idx == app.help_cursor;
+        let ctx_label = cmd.contexts.iter().map(|c| c.label()).collect::<Vec<_>>().join(", ");
         let row_style = if is_selected {
             Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan)
         } else {
@@ -2120,16 +1780,16 @@ fn render_help(f: &mut Frame, app: &mut App) {
         };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<12}", key),
+                format!("  {:<14}", cmd.key),
                 if is_selected {
                     row_style
                 } else {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                 },
             ),
-            Span::styled(format!("{:<36}", desc), row_style),
+            Span::styled(format!("{:<36}", cmd.description), row_style),
             Span::styled(
-                format!("{}", ctx),
+                ctx_label,
                 if is_selected {
                     row_style
                 } else {
@@ -2206,15 +1866,15 @@ fn render_palette(f: &mut Frame, app: &mut App) {
         };
         let marker = if is_selected { "▶ " } else { "  " };
 
-        let kind_label = match &entry.kind {
-            | super::app::PaletteEntryKind::Resource { .. } => "",
-            | super::app::PaletteEntryKind::Command(_) => "  cmd",
+        let desc = if entry.description.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", entry.description)
         };
-        let kind_span = Span::styled(kind_label, Style::default().fg(Color::DarkGray));
 
         lines.push(Line::from(vec![
             Span::styled(format!("  {}{}", marker, entry.label), style),
-            kind_span,
+            Span::styled(desc, Style::default().fg(Color::DarkGray)),
         ]));
     }
 
@@ -2257,17 +1917,17 @@ fn render_popup(f: &mut Frame, app: &mut App) {
 
     // PortForwardCreate / ConfirmDelete / ScaleInput / ExecShell use their own
     // smaller area
-    let area = if matches!(popup, Popup::MetadataEdit { .. }) {
-        let a = centered_rect(55, 65, f.area());
-        f.render_widget(Clear, a);
-        a
-    } else if matches!(popup, Popup::ExecShell { .. } | Popup::KubeconfigInput { .. }) {
+    let area = if matches!(popup, Popup::ExecShell { .. } | Popup::KubeconfigInput { .. }) {
         let a = centered_rect(60, 65, f.area());
         f.render_widget(Clear, a);
         a
     } else if matches!(
         popup,
-        Popup::PortForwardCreate(_) | Popup::ConfirmDelete { .. } | Popup::ScaleInput { .. } | Popup::TimeFilter { .. }
+        Popup::PortForwardCreate(_)
+            | Popup::ConfirmDelete { .. }
+            | Popup::ConfirmDrain { .. }
+            | Popup::ScaleInput { .. }
+            | Popup::TimeFilter { .. }
     ) {
         let a = centered_rect(45, 50, f.area());
         f.render_widget(Clear, a);
@@ -2433,6 +2093,33 @@ fn render_popup(f: &mut Frame, app: &mut App) {
             let paragraph = Paragraph::new(lines).block(block);
             f.render_widget(paragraph, area);
         },
+        | Popup::ConfirmDrain { node_name } => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Drain node {}?", node_name),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  This will cordon the node and evict",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(Span::styled(
+                    "  all non-DaemonSet pods.",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from("  [Enter/y] confirm  [Esc/n] cancel"),
+            ];
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" Confirm Drain ");
+
+            f.render_widget(Paragraph::new(lines).block(block), area);
+        },
         | Popup::ScaleInput {
             name,
             resource_type,
@@ -2574,109 +2261,6 @@ fn render_popup(f: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(" Time Filter ");
-
-            let paragraph = Paragraph::new(lines).block(block);
-            f.render_widget(paragraph, area);
-        },
-        | Popup::MetadataEdit {
-            kind,
-            name,
-            entries,
-            cursor,
-            mode,
-            key_buf,
-            value_buf,
-            ..
-        } => {
-            let title = match kind {
-                | MetadataEditKind::Labels => " Labels ",
-                | MetadataEditKind::Annotations => " Annotations ",
-            };
-
-            let mut lines: Vec<Line> = Vec::new();
-            lines.push(Line::from(Span::styled(
-                format!("  {}", name),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(""));
-
-            if entries.is_empty() && *mode == MetadataEditMode::Browse {
-                lines.push(Line::from(Span::styled(
-                    "  (none)",
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-
-            for (i, (k, v)) in entries.iter().enumerate() {
-                let marker = if i == *cursor && *mode == MetadataEditMode::Browse {
-                    "▶ "
-                } else {
-                    "  "
-                };
-                let key_style = if i == *cursor && *mode == MetadataEditMode::Browse {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Yellow)
-                };
-                let val_display = if v.len() > 50 {
-                    format!("{}...", &v[..47])
-                } else {
-                    v.clone()
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{}{}", marker, k), key_style),
-                    Span::styled(": ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(val_display, Style::default().fg(Color::White)),
-                ]));
-            }
-
-            lines.push(Line::from(""));
-
-            match mode {
-                | MetadataEditMode::Browse => {
-                    lines.push(Line::from(Span::styled(
-                        "  [a] Add  [Enter] Edit  [d] Delete  [Esc] Close",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                },
-                | MetadataEditMode::AddKey => {
-                    lines.push(Line::from(vec![
-                        Span::styled("  Key: ", Style::default().fg(Color::Yellow)),
-                        Span::styled(
-                            format!("{}▎", key_buf),
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                    lines.push(Line::from(Span::styled(
-                        "  [Enter] next  [Esc] cancel",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                },
-                | MetadataEditMode::AddValue | MetadataEditMode::EditValue => {
-                    let prompt = if *mode == MetadataEditMode::AddValue {
-                        format!("  Value for '{}': ", key_buf)
-                    } else {
-                        let editing_key = entries.get(*cursor).map(|(k, _)| k.as_str()).unwrap_or("?");
-                        format!("  Value for '{}': ", editing_key)
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(prompt, Style::default().fg(Color::Yellow)),
-                        Span::styled(
-                            format!("{}▎", value_buf),
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                    lines.push(Line::from(Span::styled(
-                        "  [Enter] apply  [Esc] cancel",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                },
-            }
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(title);
 
             let paragraph = Paragraph::new(lines).block(block);
             f.render_widget(paragraph, area);

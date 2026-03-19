@@ -88,6 +88,15 @@ pub struct PendingEdit {
     pub yaml: String,
 }
 
+/// Set by key handler, consumed by the event loop to edit metadata in $EDITOR.
+pub struct PendingMetadataEdit {
+    pub kind: MetadataEditKind,
+    pub resource_type: ResourceType,
+    pub name: String,
+    pub namespace: String,
+    pub yaml: String,
+}
+
 pub struct PendingExec {
     pub pod_name: String,
     pub namespace: String,
@@ -101,6 +110,7 @@ pub struct PendingCreate {
 
 pub struct PaletteEntry {
     pub label: String,
+    pub description: String,
     pub kind: PaletteEntryKind,
 }
 
@@ -110,20 +120,10 @@ pub enum PaletteEntryKind {
         namespace: String,
         resource_type: Option<ResourceType>,
     },
-    Command(PaletteCommand),
-}
-
-#[derive(Clone)]
-pub enum PaletteCommand {
-    Restart,
-    Scale,
-    Delete,
-    PortForward,
-    Exec,
-    Create,
-    SwitchContext,
-    SwitchNamespace,
-    OpenKubeconfig,
+    PaletteCommand {
+        /// The key label from the command registry (e.g. "R", "S", "D").
+        key: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -136,14 +136,6 @@ pub enum DetailMode {
 pub enum MetadataEditKind {
     Labels,
     Annotations,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum MetadataEditMode {
-    Browse,
-    AddKey,
-    AddValue,
-    EditValue,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -170,6 +162,9 @@ pub enum Popup {
         namespace: String,
         resource_type: ResourceType,
     },
+    ConfirmDrain {
+        node_name: String,
+    },
     ScaleInput {
         name: String,
         namespace: String,
@@ -191,17 +186,6 @@ pub enum Popup {
     },
     TimeFilter {
         buf: String,
-    },
-    MetadataEdit {
-        kind: MetadataEditKind,
-        resource_type: ResourceType,
-        name: String,
-        namespace: String,
-        entries: Vec<(String, String)>,
-        cursor: usize,
-        mode: MetadataEditMode,
-        key_buf: String,
-        value_buf: String,
     },
 }
 
@@ -235,7 +219,6 @@ pub struct NavItem {
 }
 
 pub enum NavItemKind {
-    SuperCategory,
     Category,
     Resource(ResourceType),
     ClusterStats,
@@ -294,6 +277,7 @@ pub struct App {
     pub pending_edit: Option<PendingEdit>,
     pub pending_exec: Option<PendingExec>,
     pub pending_create: Option<PendingCreate>,
+    pub pending_metadata_edit: Option<PendingMetadataEdit>,
     pub exec_terminal_override: Option<String>,
     pub edit_ctx: Option<EditContext>,
     /// Tracks which label/annotation keys are expanded in smart view.
@@ -369,7 +353,7 @@ impl App {
     pub fn new(kube: KubeClient, rt: tokio::runtime::Handle, experimental: bool) -> Self {
         let nav_items = Self::build_nav_items();
         let mut nav_state = ListState::default();
-        // Select first selectable item (skip SuperCategory + Category headers)
+        // Select first selectable item (skip Category headers)
         let first_selectable = nav_items
             .iter()
             .position(|item| Self::is_selectable_nav(&item.kind))
@@ -404,6 +388,7 @@ impl App {
             pending_edit: None,
             pending_exec: None,
             pending_create: None,
+            pending_metadata_edit: None,
             exec_terminal_override: None,
             edit_ctx: None,
             expanded_keys: std::collections::HashSet::new(),
@@ -451,44 +436,109 @@ impl App {
         app
     }
 
+    /// Which command context the app is currently in.
+    pub fn current_context(&self) -> super::command::Ctx {
+        use super::command::Ctx;
+        match self.view {
+            | View::Detail => Ctx::Detail,
+            | View::Logs => Ctx::Logs,
+            | View::EditDiff => Ctx::EditDiff,
+            | View::Main => {
+                if self.showing_port_forwards {
+                    return Ctx::PortForwards;
+                }
+                match self.focus {
+                    | Focus::Nav => Ctx::Nav,
+                    | Focus::Resources => {
+                        if self.is_showing_cluster_stats() {
+                            Ctx::ClusterStats
+                        } else if self.selected_resource_type == Some(ResourceType::Event) {
+                            Ctx::Events
+                        } else {
+                            Ctx::Resources
+                        }
+                    },
+                }
+            },
+        }
+    }
+
+    /// Snapshot of app state for command availability checks.
+    pub fn cmd_flags(&self) -> super::command::CmdFlags {
+        let (has_pods_gt1, has_containers_gt1, following, wrapping, has_since) = if let Some(s) = &self.log_state {
+            (
+                s.pods.len() > 1,
+                s.active_containers().len() > 1,
+                s.following,
+                s.wrap,
+                s.since_seconds.is_some(),
+            )
+        } else {
+            (false, false, false, false, false)
+        };
+        super::command::CmdFlags {
+            resource_type: self.selected_resource_type,
+            experimental: self.experimental,
+            has_filter: !self.resource_filter_text.is_empty(),
+            has_pods_gt1,
+            has_containers_gt1,
+            following,
+            wrapping,
+            has_since,
+            has_dict_entries: !self.dict_entries.is_empty(),
+            dict_cursor_active: self.dict_cursor.is_some(),
+            has_related: !self.related_resources.is_empty(),
+            paused: self.paused,
+            detail_auto_refresh: self.detail_auto_refresh,
+            pf_count: self.pf_manager.entries().len(),
+            diff_mark_set: self.diff_mark.is_some(),
+            node_cordoned: if self.selected_resource_type == Some(ResourceType::Node) {
+                if self.view == View::Detail {
+                    self.detail_value
+                        .get("spec")
+                        .and_then(|s| s.get("unschedulable"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                } else {
+                    self.resource_state
+                        .selected()
+                        .and_then(|idx| self.resources.get(idx))
+                        .and_then(|e| e.columns.first())
+                        .map(|s| s.contains("SchedulingDisabled"))
+                        .unwrap_or(false)
+                }
+            } else {
+                false
+            },
+        }
+    }
+
     fn build_nav_items() -> Vec<NavItem> {
         let mut items = Vec::new();
 
-        // ── CLUSTER super-category ──
+        // Global items at the top
         items.push(NavItem {
-            label: "CLUSTER".to_string(),
-            kind: NavItemKind::SuperCategory,
+            label: " Overview".to_string(),
+            kind: NavItemKind::ClusterStats,
+        });
+        items.push(NavItem {
+            label: " Port Forwards".to_string(),
+            kind: NavItemKind::PortForwards,
         });
 
+        // Resource categories
         for (cat, types) in ResourceType::all_by_category() {
             items.push(NavItem {
-                label: format!("  {}", cat.display_name()),
+                label: cat.display_name().to_uppercase(),
                 kind: NavItemKind::Category,
             });
-            // Add "Overview" as the first item under Cluster
-            if cat == crate::k8s::Category::Cluster {
-                items.push(NavItem {
-                    label: "    Overview".to_string(),
-                    kind: NavItemKind::ClusterStats,
-                });
-            }
             for rt in types {
                 items.push(NavItem {
-                    label: format!("    {}", rt.display_name()),
+                    label: format!(" {}", rt.display_name()),
                     kind: NavItemKind::Resource(rt),
                 });
             }
         }
-
-        // ── GLOBAL super-category ──
-        items.push(NavItem {
-            label: "GLOBAL".to_string(),
-            kind: NavItemKind::SuperCategory,
-        });
-        items.push(NavItem {
-            label: "  Port Forwards".to_string(),
-            kind: NavItemKind::PortForwards,
-        });
 
         items
     }
@@ -509,18 +559,6 @@ impl App {
         if self.status_history.len() > 10 {
             self.status_history.remove(0);
         }
-    }
-
-    /// Returns the last N status messages that are less than 30 seconds old.
-    pub fn recent_status(&self, n: usize) -> Vec<&str> {
-        let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(30);
-        self.status_history
-            .iter()
-            .rev()
-            .filter(|(t, _)| *t > cutoff)
-            .take(n)
-            .map(|(_, s)| s.as_str())
-            .collect()
     }
 
     pub fn selected_nav_resource_type(&self) -> Option<ResourceType> {
@@ -1251,7 +1289,18 @@ impl App {
             | KeyCode::Char('S') => {
                 self.open_scale_input();
             },
-            | KeyCode::Char('x') if self.experimental && self.resource_filter_text.is_empty() => {
+            | KeyCode::Char('K') => {
+                self.toggle_cordon_node();
+            },
+            | KeyCode::Char('T') => {
+                if self.selected_resource_type == Some(ResourceType::Node) {
+                    let (name, _) = self.selected_resource_name_ns();
+                    if !name.is_empty() {
+                        self.popup = Some(Popup::ConfirmDrain { node_name: name });
+                    }
+                }
+            },
+            | KeyCode::Char('X') if self.experimental => {
                 self.open_exec_shell();
             },
             | _ => {},
@@ -1309,9 +1358,15 @@ impl App {
 
         match key.code {
             | KeyCode::Esc | KeyCode::Char('q') => {
-                self.dict_cursor = None;
-                self.view = View::Main;
-                self.focus = Focus::Resources;
+                // Cascading dismiss: selection → related → view
+                if self.dict_cursor.is_some() {
+                    self.dict_cursor = None;
+                } else if self.related_cursor.is_some() {
+                    self.related_cursor = None;
+                } else {
+                    self.view = View::Main;
+                    self.focus = Focus::Resources;
+                }
             },
             // [v] Cycle view: Smart → YAML → Smart
             | KeyCode::Char('v') => {
@@ -1456,8 +1511,19 @@ impl App {
             | KeyCode::Char('S') => {
                 self.open_scale_input_detail();
             },
-            | KeyCode::Char('x') if self.experimental => {
+            | KeyCode::Char('X') if self.experimental => {
                 self.open_exec_shell();
+            },
+            | KeyCode::Char('K') => {
+                self.toggle_cordon_node();
+            },
+            | KeyCode::Char('T') => {
+                if self.selected_resource_type == Some(ResourceType::Node) {
+                    let name = self.detail_name.clone();
+                    if !name.is_empty() {
+                        self.popup = Some(Popup::ConfirmDrain { node_name: name });
+                    }
+                }
             },
             // [Tab] Toggle related resource selection
             | KeyCode::Tab => {
@@ -1562,7 +1628,7 @@ impl App {
     fn dict_nav_up(&mut self) {
         match self.dict_cursor {
             | Some(0) => {
-                self.dict_cursor = None;
+                // Stay at first entry — don't exit selection mode
             },
             | Some(i) => {
                 self.dict_cursor = Some(i - 1);
@@ -1576,7 +1642,7 @@ impl App {
         let max = self.dict_entries.len().saturating_sub(1);
         match self.dict_cursor {
             | Some(i) if i >= max => {
-                self.dict_cursor = None;
+                // Stay at last entry — don't exit selection mode
             },
             | Some(i) => {
                 self.dict_cursor = Some(i + 1);
@@ -1843,6 +1909,10 @@ impl App {
             self.handle_confirm_delete_key(key);
             return;
         }
+        if matches!(self.popup, Some(Popup::ConfirmDrain { .. })) {
+            self.handle_confirm_drain_key(key);
+            return;
+        }
         if matches!(self.popup, Some(Popup::ScaleInput { .. })) {
             self.handle_scale_input_key(key);
             return;
@@ -1859,10 +1929,6 @@ impl App {
             self.handle_time_filter_key(key);
             return;
         }
-        if matches!(self.popup, Some(Popup::MetadataEdit { .. })) {
-            self.handle_metadata_edit_key(key);
-            return;
-        }
 
         match key.code {
             | KeyCode::Esc => {
@@ -1877,11 +1943,11 @@ impl App {
                         | Popup::ContainerSelect { state, .. } => state,
                         | Popup::PortForwardCreate(_)
                         | Popup::ConfirmDelete { .. }
+                        | Popup::ConfirmDrain { .. }
                         | Popup::ScaleInput { .. }
                         | Popup::ExecShell { .. }
                         | Popup::KubeconfigInput { .. }
-                        | Popup::TimeFilter { .. }
-                        | Popup::MetadataEdit { .. } => unreachable!(),
+                        | Popup::TimeFilter { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
                     if current > 0 {
@@ -1898,11 +1964,11 @@ impl App {
                         | Popup::ContainerSelect { items, state } => (items.len(), state),
                         | Popup::PortForwardCreate(_)
                         | Popup::ConfirmDelete { .. }
+                        | Popup::ConfirmDrain { .. }
                         | Popup::ScaleInput { .. }
                         | Popup::ExecShell { .. }
                         | Popup::KubeconfigInput { .. }
-                        | Popup::TimeFilter { .. }
-                        | Popup::MetadataEdit { .. } => unreachable!(),
+                        | Popup::TimeFilter { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
                     if current + 1 < items_len {
@@ -1979,11 +2045,11 @@ impl App {
                     },
                     | Some(Popup::PortForwardCreate(_))
                     | Some(Popup::ConfirmDelete { .. })
+                    | Some(Popup::ConfirmDrain { .. })
                     | Some(Popup::ScaleInput { .. })
                     | Some(Popup::ExecShell { .. })
                     | Some(Popup::KubeconfigInput { .. })
                     | Some(Popup::TimeFilter { .. })
-                    | Some(Popup::MetadataEdit { .. }) => unreachable!(),
                     | None => None,
                 };
                 self.popup = None;
@@ -2399,6 +2465,82 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Node cordon / drain
+    // -----------------------------------------------------------------------
+
+    fn toggle_cordon_node(&mut self) {
+        if self.selected_resource_type != Some(ResourceType::Node) {
+            return;
+        }
+        let (name, _) = self.selected_resource_name_ns();
+        if name.is_empty() {
+            return;
+        }
+
+        // Determine current schedulable state
+        let is_schedulable = if self.view == View::Detail {
+            // Read from the detail JSON value
+            !self
+                .detail_value
+                .get("spec")
+                .and_then(|s| s.get("unschedulable"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        } else {
+            // Read from the table columns (STATUS column)
+            self.resource_state
+                .selected()
+                .and_then(|idx| self.resources.get(idx))
+                .and_then(|e| e.columns.first())
+                .map(|status| !status.contains("SchedulingDisabled"))
+                .unwrap_or(true)
+        };
+
+        let result = if is_schedulable {
+            self.rt.block_on(self.kube.cordon_node(&name))
+        } else {
+            self.rt.block_on(self.kube.uncordon_node(&name))
+        };
+
+        match result {
+            | Ok(()) => {
+                let action = if is_schedulable { "Cordoned" } else { "Uncordoned" };
+                self.push_status(format!("{} node {}", action, name));
+                self.error = None;
+                if self.view == View::Detail {
+                    // Reload detail to reflect the change
+                    self.pending_load = Some(PendingLoad::ResourceDetail {
+                        name: name.clone(),
+                        namespace: String::new(),
+                    });
+                } else {
+                    self.pending_load = Some(PendingLoad::Resources);
+                }
+            },
+            | Err(e) => {
+                self.error = Some(format!("Cordon failed: {}", e));
+            },
+        }
+    }
+
+    /// Returns (name, namespace) of the currently selected resource.
+    fn selected_resource_name_ns(&self) -> (String, String) {
+        if self.view == View::Detail {
+            return (self.detail_name.clone(), self.detail_namespace.clone());
+        }
+        let visible = self.visible_resource_indices();
+        let vis_pos = self
+            .resource_state
+            .selected()
+            .and_then(|sel| visible.iter().position(|&i| i == sel))
+            .unwrap_or(0);
+        match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+            | Some(e) => (e.name.clone(), e.namespace.clone()),
+            | None => (String::new(), String::new()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Copy resource name
     // -----------------------------------------------------------------------
 
@@ -2577,30 +2719,14 @@ impl App {
 
         if is_command {
             let cmd_query = query.trim_start_matches('>');
-            let commands: Vec<(PaletteCommand, &str)> = vec![
-                (PaletteCommand::Restart, "Restart Workload"),
-                (PaletteCommand::Scale, "Scale Workload"),
-                (PaletteCommand::Delete, "Delete Resource"),
-                (PaletteCommand::PortForward, "Port Forward"),
-                (PaletteCommand::Create, "Create Resource"),
-                (PaletteCommand::SwitchContext, "Switch Context"),
-                (PaletteCommand::SwitchNamespace, "Switch Namespace"),
-                (PaletteCommand::OpenKubeconfig, "Open Kubeconfig"),
-            ];
-            for (cmd, label) in &commands {
-                if cmd_query.is_empty() || label.to_lowercase().contains(cmd_query) {
+            let flags = self.cmd_flags();
+            for cmd in super::command::palette_commands(&flags) {
+                let haystack = format!("{} {} {}", cmd.label, cmd.description, cmd.key).to_lowercase();
+                if cmd_query.is_empty() || haystack.contains(cmd_query) {
                     self.palette_results.push(PaletteEntry {
-                        label: label.to_string(),
-                        kind: PaletteEntryKind::Command(cmd.clone()),
-                    });
-                }
-            }
-            if self.experimental {
-                let label = "Exec Shell";
-                if cmd_query.is_empty() || label.to_lowercase().contains(cmd_query) {
-                    self.palette_results.push(PaletteEntry {
-                        label: label.to_string(),
-                        kind: PaletteEntryKind::Command(PaletteCommand::Exec),
+                        label: cmd.label.to_string(),
+                        description: cmd.description.to_string(),
+                        kind: PaletteEntryKind::PaletteCommand { key: cmd.key },
                     });
                 }
             }
@@ -2627,6 +2753,7 @@ impl App {
                         };
                         self.palette_results.push(PaletteEntry {
                             label,
+                            description: String::new(),
                             kind: PaletteEntryKind::Resource {
                                 name: entry.name.clone(),
                                 namespace: entry.namespace.clone(),
@@ -2660,6 +2787,7 @@ impl App {
                     };
                     self.palette_results.push(PaletteEntry {
                         label,
+                        description: String::new(),
                         kind: PaletteEntryKind::Resource {
                             name: entry.name.clone(),
                             namespace: entry.namespace.clone(),
@@ -2721,10 +2849,10 @@ impl App {
                             }
                             self.pending_load = Some(PendingLoad::ResourceDetail { name, namespace });
                         },
-                        | PaletteEntryKind::Command(cmd) => {
-                            let cmd = cmd.clone();
+                        | PaletteEntryKind::PaletteCommand { key } => {
+                            let key = *key;
                             self.palette_open = false;
-                            self.execute_palette_command(cmd);
+                            self.execute_palette_command(key);
                         },
                     }
                 }
@@ -2782,19 +2910,19 @@ impl App {
         }
     }
 
-    fn execute_palette_command(&mut self, cmd: PaletteCommand) {
-        match cmd {
-            | PaletteCommand::Restart => self.restart_selected_workload(),
-            | PaletteCommand::Scale => self.open_scale_input(),
-            | PaletteCommand::Delete => self.open_delete_confirm(),
-            | PaletteCommand::PortForward => self.open_port_forward_dialog(),
-            | PaletteCommand::Exec => self.open_exec_shell(),
-            | PaletteCommand::Create => self.start_create_resource(),
-            | PaletteCommand::SwitchContext => self.open_context_selector(),
-            | PaletteCommand::SwitchNamespace => {
+    fn execute_palette_command(&mut self, key: &str) {
+        match key {
+            | "R" => self.restart_selected_workload(),
+            | "S" => self.open_scale_input(),
+            | "D" => self.open_delete_confirm(),
+            | "F" => self.open_port_forward_dialog(),
+            | "X" => self.open_exec_shell(),
+            | "C" => self.start_create_resource(),
+            | "c" => self.open_context_selector(),
+            | "n" => {
                 self.pending_load = Some(PendingLoad::Namespaces);
             },
-            | PaletteCommand::OpenKubeconfig => {
+            | "O" => {
                 let default = self
                     .kube
                     .kubeconfig_path()
@@ -2803,6 +2931,7 @@ impl App {
                     .unwrap_or_else(|| "~/.kube/config".to_string());
                 self.popup = Some(Popup::KubeconfigInput { buf: default });
             },
+            | _ => {},
         }
     }
 
@@ -2810,110 +2939,24 @@ impl App {
     // Help palette
     // -----------------------------------------------------------------------
 
-    pub fn help_entries(&self) -> Vec<(&'static str, &'static str, &'static str)> {
-        // (key, description, context)
-        let mut entries: Vec<(&str, &str, &str)> = vec![
-            // Global
-            ("Ctrl+C", "Force quit", "Global"),
-            ("q", "Quit / back", "Global"),
-            ("Esc", "Back / dismiss popup or selection", "Global"),
-            ("?", "Help (this screen)", "Global"),
-            ("Ctrl+P", "Command palette", "Global"),
-            ("p", "Pause/resume auto-refresh", "Global"),
-            // Main view - navigation
-            ("j / Down", "Move down in sidebar or table", "Main"),
-            ("k / Up", "Move up in sidebar or table", "Main"),
-            ("Ctrl+d / PgDn", "Page down in table", "Main"),
-            ("Ctrl+u / PgUp", "Page up in table", "Main"),
-            ("g / Home", "Jump to top of list", "Main"),
-            ("G / End", "Jump to bottom of list", "Main"),
-            ("Enter", "Open detail / focus right panel", "Main"),
-            ("Tab", "Toggle sidebar / table focus", "Main"),
-            ("r", "Focus resource table", "Main"),
-            // Main view - actions
-            ("c", "Switch cluster context", "Main"),
-            ("n", "Switch namespace", "Main"),
-            ("O", "Open kubeconfig", "Main"),
-            ("/", "Filter resources by regex", "Main"),
-            ("x", "Clear filter", "Main"),
-            ("e", "Edit resource ($EDITOR)", "Main"),
-            ("l", "Open logs (workloads)", "Main"),
-            ("F", "Port forward", "Main"),
-            ("D", "Delete resource", "Main"),
-            ("R", "Restart workload", "Main"),
-            ("S", "Scale workload", "Main"),
-            ("y", "Copy resource name", "Main"),
-            ("d", "Mark / diff resources", "Main"),
-            ("C", "Create new resource", "Main"),
-            // Detail view - navigation
-            ("j / Down", "Scroll down or navigate entries", "Detail"),
-            ("k / Up", "Scroll up or navigate entries", "Detail"),
-            ("Ctrl+d / PgDn", "Page down", "Detail"),
-            ("Ctrl+u / PgUp", "Page up", "Detail"),
-            ("Home", "Jump to top", "Detail"),
-            // Detail view - actions
-            ("v", "Cycle Smart / YAML view", "Detail"),
-            ("s", "Enter/leave label selection", "Detail"),
-            ("Enter", "Edit selected label/annotation", "Detail"),
-            ("Space", "Expand/collapse or decode secret", "Detail"),
-            ("y", "Copy value or YAML", "Detail"),
-            ("e", "Edit resource ($EDITOR)", "Detail"),
-            ("l", "Open logs (workloads)", "Detail"),
-            ("F", "Port forward", "Detail"),
-            ("D", "Delete resource", "Detail"),
-            ("R", "Restart workload", "Detail"),
-            ("S", "Scale workload", "Detail"),
-            ("w", "Toggle watch mode (auto-refresh)", "Detail"),
-            ("Tab", "Toggle related resources selection", "Detail"),
-            // Log view - navigation
-            ("j / Down", "Move cursor down", "Logs"),
-            ("k / Up", "Move cursor up", "Logs"),
-            ("Ctrl+d / PgDn", "Page down", "Logs"),
-            ("Ctrl+u / PgUp", "Page up", "Logs"),
-            ("g / Home", "Jump to top", "Logs"),
-            ("G / End", "Jump to bottom", "Logs"),
-            // Log view - actions
-            ("f", "Toggle follow (live streaming)", "Logs"),
-            ("/", "Filter by regex", "Logs"),
-            ("x", "Clear filter", "Logs"),
-            ("p", "Select pod", "Logs"),
-            ("c", "Select container", "Logs"),
-            ("w", "Toggle line wrapping", "Logs"),
-            ("t", "Set time filter", "Logs"),
-            ("Y", "Copy all logs to clipboard", "Logs"),
-            ("Enter", "Open selected line detail", "Logs"),
-            // Edit diff
-            ("v", "Cycle inline / side-by-side diff", "Edit Diff"),
-            ("j / Down", "Scroll down", "Edit Diff"),
-            ("k / Up", "Scroll up", "Edit Diff"),
-            ("Ctrl+d / PgDn", "Page down", "Edit Diff"),
-            ("Ctrl+u / PgUp", "Page up", "Edit Diff"),
-            ("Enter", "Apply changes to cluster", "Edit Diff"),
-            ("e", "Re-edit in $EDITOR", "Edit Diff"),
-            // Port forwards
-            ("j / Down", "Navigate list", "Port Forwards"),
-            ("k / Up", "Navigate list", "Port Forwards"),
-            ("p", "Pause/resume selected forward", "Port Forwards"),
-            ("d", "Cancel (delete) selected forward", "Port Forwards"),
-        ];
-
-        if self.experimental {
-            entries.push(("x", "Exec into pod", "Main"));
-            entries.push(("x", "Exec into pod", "Detail"));
-        }
-
-        entries
-    }
-
-    pub fn filtered_help_entries(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+    pub fn filtered_help_entries(&self) -> Vec<&'static super::command::Cmd> {
+        let flags = self.cmd_flags();
+        let entries = super::command::help_entries(&flags);
         let query = self.help_buf.to_lowercase();
-        self.help_entries()
+        if query.is_empty() {
+            return entries;
+        }
+        entries
             .into_iter()
-            .filter(|(key, desc, ctx)| {
-                if query.is_empty() {
-                    return true;
-                }
-                let haystack = format!("{} {} {}", key, desc, ctx).to_lowercase();
+            .filter(|cmd| {
+                let haystack = format!(
+                    "{} {} {} {}",
+                    cmd.key,
+                    cmd.label,
+                    cmd.description,
+                    cmd.contexts.iter().map(|c| c.label()).collect::<Vec<_>>().join(" ")
+                )
+                .to_lowercase();
                 query.split_whitespace().all(|word| haystack.contains(word))
             })
             .collect()
@@ -3030,6 +3073,36 @@ impl App {
                 self.popup = None;
             },
             | _ => {},
+        }
+    }
+
+    fn handle_confirm_drain_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Enter | KeyCode::Char('y') => {
+                let node_name = match &self.popup {
+                    | Some(Popup::ConfirmDrain { node_name }) => node_name.clone(),
+                    | _ => return,
+                };
+                self.popup = None;
+                self.drain_node_by_name(&node_name);
+            },
+            | KeyCode::Esc | KeyCode::Char('n') => {
+                self.popup = None;
+            },
+            | _ => {},
+        }
+    }
+
+    fn drain_node_by_name(&mut self, name: &str) {
+        match self.rt.block_on(self.kube.drain_node(name)) {
+            | Ok(evicted) => {
+                self.push_status(format!("Drained node {} ({} pods evicted)", name, evicted));
+                self.error = None;
+                self.pending_load = Some(PendingLoad::Resources);
+            },
+            | Err(e) => {
+                self.error = Some(format!("Drain failed: {}", e));
+            },
         }
     }
 
@@ -3595,246 +3668,103 @@ impl App {
             | MetadataEditKind::Labels => "labels",
             | MetadataEditKind::Annotations => "annotations",
         };
-        let entries: Vec<(String, String)> = self
+        // Serialize the labels/annotations map as YAML for editing in $EDITOR
+        let map = self
             .detail_value
             .get("metadata")
             .and_then(|m| m.get(field))
-            .and_then(|v| v.as_object())
-            .map(|map| {
-                let mut pairs: Vec<(String, String)> = map
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                    .collect();
-                pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                pairs
-            })
-            .unwrap_or_default();
-        self.popup = Some(Popup::MetadataEdit {
+            .cloned()
+            .unwrap_or(Value::Object(serde_json::Map::new()));
+        let yaml = serde_yaml::to_string(&map).unwrap_or_else(|_| "{}\n".to_string());
+        let header = format!(
+            "# Edit {} for {}/{}\n# Save and close to apply. Empty keys are removed.\n#\n",
+            field,
+            rt.display_name(),
+            self.detail_name
+        );
+        self.pending_metadata_edit = Some(PendingMetadataEdit {
             kind,
             resource_type: rt,
             name: self.detail_name.clone(),
             namespace: self.detail_namespace.clone(),
-            entries,
-            cursor: 0,
-            mode: MetadataEditMode::Browse,
-            key_buf: String::new(),
-            value_buf: String::new(),
+            yaml: format!("{}{}", header, yaml),
         });
     }
 
-    fn handle_metadata_edit_key(&mut self, key: KeyEvent) {
-        let mode = match &self.popup {
-            | Some(Popup::MetadataEdit { mode, .. }) => *mode,
-            | _ => return,
-        };
-        match mode {
-            | MetadataEditMode::Browse => {
-                match key.code {
-                    | KeyCode::Esc => {
-                        self.popup = None;
-                    },
-                    | KeyCode::Up | KeyCode::Char('k') => {
-                        if let Some(Popup::MetadataEdit { cursor, .. }) = &mut self.popup {
-                            *cursor = cursor.saturating_sub(1);
-                        }
-                    },
-                    | KeyCode::Down | KeyCode::Char('j') => {
-                        if let Some(Popup::MetadataEdit { entries, cursor, .. }) = &mut self.popup {
-                            if *cursor + 1 < entries.len() {
-                                *cursor += 1;
-                            }
-                        }
-                    },
-                    | KeyCode::Char('a') => {
-                        if let Some(Popup::MetadataEdit {
-                            mode,
-                            key_buf,
-                            value_buf,
-                            ..
-                        }) = &mut self.popup
-                        {
-                            *mode = MetadataEditMode::AddKey;
-                            key_buf.clear();
-                            value_buf.clear();
-                        }
-                    },
-                    | KeyCode::Char('d') => {
-                        self.delete_metadata_entry();
-                    },
-                    | KeyCode::Enter => {
-                        if let Some(Popup::MetadataEdit {
-                            entries,
-                            cursor,
-                            mode,
-                            value_buf,
-                            ..
-                        }) = &mut self.popup
-                        {
-                            if let Some((_, val)) = entries.get(*cursor) {
-                                *value_buf = val.clone();
-                                *mode = MetadataEditMode::EditValue;
-                            }
-                        }
-                    },
-                    | _ => {},
-                }
-            },
-            | MetadataEditMode::AddKey => {
-                match key.code {
-                    | KeyCode::Esc => {
-                        if let Some(Popup::MetadataEdit { mode, .. }) = &mut self.popup {
-                            *mode = MetadataEditMode::Browse;
-                        }
-                    },
-                    | KeyCode::Enter => {
-                        if let Some(Popup::MetadataEdit { mode, key_buf, .. }) = &mut self.popup {
-                            if !key_buf.is_empty() {
-                                *mode = MetadataEditMode::AddValue;
-                            }
-                        }
-                    },
-                    | KeyCode::Backspace => {
-                        if let Some(Popup::MetadataEdit { key_buf, .. }) = &mut self.popup {
-                            key_buf.pop();
-                        }
-                    },
-                    | KeyCode::Char(c) => {
-                        if let Some(Popup::MetadataEdit { key_buf, .. }) = &mut self.popup {
-                            key_buf.push(c);
-                        }
-                    },
-                    | _ => {},
-                }
-            },
-            | MetadataEditMode::AddValue | MetadataEditMode::EditValue => {
-                match key.code {
-                    | KeyCode::Esc => {
-                        if let Some(Popup::MetadataEdit { mode, .. }) = &mut self.popup {
-                            *mode = MetadataEditMode::Browse;
-                        }
-                    },
-                    | KeyCode::Enter => {
-                        self.apply_metadata_edit();
-                    },
-                    | KeyCode::Backspace => {
-                        if let Some(Popup::MetadataEdit { value_buf, .. }) = &mut self.popup {
-                            value_buf.pop();
-                        }
-                    },
-                    | KeyCode::Char(c) => {
-                        if let Some(Popup::MetadataEdit { value_buf, .. }) = &mut self.popup {
-                            value_buf.push(c);
-                        }
-                    },
-                    | _ => {},
-                }
-            },
-        }
-    }
-
-    fn apply_metadata_edit(&mut self) {
-        let (kind, rt, name, namespace, key, value) = match &self.popup {
-            | Some(Popup::MetadataEdit {
-                kind,
-                resource_type,
-                name,
-                namespace,
-                mode,
-                key_buf,
-                value_buf,
-                entries,
-                cursor,
-            }) => {
-                let key = match mode {
-                    | MetadataEditMode::AddValue => key_buf.clone(),
-                    | MetadataEditMode::EditValue => entries.get(*cursor).map(|(k, _)| k.clone()).unwrap_or_default(),
-                    | _ => return,
-                };
-                (
-                    *kind,
-                    *resource_type,
-                    name.clone(),
-                    namespace.clone(),
-                    key,
-                    value_buf.clone(),
-                )
-            },
-            | _ => return,
-        };
-        let mut map = serde_json::Map::new();
-        map.insert(key.clone(), Value::String(value));
-        let result = match kind {
-            | MetadataEditKind::Labels => {
-                self.rt
-                    .block_on(self.kube.patch_metadata(rt, &namespace, &name, Some(&map), None))
-            },
-            | MetadataEditKind::Annotations => {
-                self.rt
-                    .block_on(self.kube.patch_metadata(rt, &namespace, &name, None, Some(&map)))
-            },
-        };
-        match result {
-            | Ok(_) => {
-                let kind_label = if kind == MetadataEditKind::Labels {
-                    "label"
-                } else {
-                    "annotation"
-                };
-                self.push_status(format!("Updated {} '{}' on {}", kind_label, key, name));
-                self.error = None;
-                self.pending_load = Some(PendingLoad::ResourceDetail {
-                    name: name.clone(),
-                    namespace: namespace.clone(),
-                });
-                self.popup = None;
-            },
+    pub fn handle_metadata_edit_result(&mut self, edit: PendingMetadataEdit, edited_yaml: String) {
+        // Strip comment lines
+        let cleaned: String = edited_yaml
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_map: serde_json::Map<String, Value> = match serde_yaml::from_str(&cleaned) {
+            | Ok(m) => m,
             | Err(e) => {
-                self.error = Some(format!("Patch failed: {}", e));
+                self.error = Some(format!("Invalid YAML: {}", e));
+                return;
             },
-        }
-    }
-
-    fn delete_metadata_entry(&mut self) {
-        let (kind, rt, name, namespace, key) = match &self.popup {
-            | Some(Popup::MetadataEdit {
-                kind,
-                resource_type,
-                name,
-                namespace,
-                entries,
-                cursor,
-                ..
-            }) => {
-                let key = entries.get(*cursor).map(|(k, _)| k.clone()).unwrap_or_default();
-                (*kind, *resource_type, name.clone(), namespace.clone(), key)
-            },
-            | _ => return,
         };
-        if key.is_empty() {
+
+        // Build the original map for diffing
+        let field = match edit.kind {
+            | MetadataEditKind::Labels => "labels",
+            | MetadataEditKind::Annotations => "annotations",
+        };
+        let original: serde_json::Map<String, Value> = self
+            .detail_value
+            .get("metadata")
+            .and_then(|m| m.get(field))
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+
+        // Compute patch: new keys, changed values, and removed keys (null)
+        let mut patch = serde_json::Map::new();
+        for (k, v) in &new_map {
+            if original.get(k) != Some(v) {
+                patch.insert(k.clone(), v.clone());
+            }
+        }
+        for k in original.keys() {
+            if !new_map.contains_key(k) {
+                patch.insert(k.clone(), Value::Null);
+            }
+        }
+
+        if patch.is_empty() {
+            self.push_status("No changes");
             return;
         }
-        let mut map = serde_json::Map::new();
-        map.insert(key.clone(), Value::Null); // null = remove in merge patch
-        let result = match kind {
+
+        let result = match edit.kind {
             | MetadataEditKind::Labels => {
-                self.rt
-                    .block_on(self.kube.patch_metadata(rt, &namespace, &name, Some(&map), None))
+                self.rt.block_on(self.kube.patch_metadata(
+                    edit.resource_type,
+                    &edit.namespace,
+                    &edit.name,
+                    Some(&patch),
+                    None,
+                ))
             },
             | MetadataEditKind::Annotations => {
-                self.rt
-                    .block_on(self.kube.patch_metadata(rt, &namespace, &name, None, Some(&map)))
+                self.rt.block_on(self.kube.patch_metadata(
+                    edit.resource_type,
+                    &edit.namespace,
+                    &edit.name,
+                    None,
+                    Some(&patch),
+                ))
             },
         };
         match result {
             | Ok(_) => {
-                let kind_label = if kind == MetadataEditKind::Labels {
-                    "label"
-                } else {
-                    "annotation"
-                };
-                self.push_status(format!("Removed {} '{}' from {}", kind_label, key, name));
-                self.popup = None;
-                self.pending_load = Some(PendingLoad::ResourceDetail { name, namespace });
+                self.push_status(format!("Updated {} on {}", field, edit.name));
+                self.error = None;
+                self.pending_load = Some(PendingLoad::ResourceDetail {
+                    name: edit.name,
+                    namespace: edit.namespace,
+                });
             },
             | Err(e) => {
                 self.error = Some(format!("Patch failed: {}", e));

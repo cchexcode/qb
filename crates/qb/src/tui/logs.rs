@@ -129,19 +129,6 @@ impl LogViewState {
         pairs
     }
 
-    /// Display string for the breadcrumb (what we're tailing).
-    pub fn source_display(&self) -> String {
-        let pod_part = match self.selected_pod {
-            | None => "all-pods".to_string(),
-            | Some(i) => self.pods.get(i).map(|p| p.name.clone()).unwrap_or_default(),
-        };
-        let container_part = match self.selected_container {
-            | None => "all-containers".to_string(),
-            | Some(i) => self.active_containers().get(i).cloned().unwrap_or_default(),
-        };
-        format!("{}:{}", pod_part, container_part)
-    }
-
     // -----------------------------------------------------------------------
     // Visible (filtered) lines
     // -----------------------------------------------------------------------
