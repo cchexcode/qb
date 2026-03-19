@@ -168,6 +168,9 @@ pub enum Popup {
     ConfirmDrain {
         node_name: String,
     },
+    ConfirmQuit {
+        pf_count: usize,
+    },
     TriggerCronJob {
         cronjob_name: String,
         namespace: String,
@@ -843,14 +846,27 @@ impl App {
                         .rt
                         .block_on(self.kube.fetch_related_events(ns, name))
                         .unwrap_or_default();
-                    // Always re-fetch related resources on navigation to a different resource;
-                    // only skip on watch-mode refresh of the same resource.
-                    if !is_same_resource || !self.detail_auto_refresh {
-                        self.related_resources =
-                            self.rt
-                                .block_on(self.kube.fetch_related_resources(rt, ns, name, &self.detail_value));
+                    // Always re-fetch related resources (they change as pods scale, etc.)
+                    let new_related =
+                        self.rt
+                            .block_on(self.kube.fetch_related_resources(rt, ns, name, &self.detail_value));
+                    if is_same_resource && self.detail_auto_refresh {
+                        // Preserve cursor position by matching the selected resource
+                        if let Some(cursor) = self.related_cursor {
+                            if let Some(old) = self.related_resources.get(cursor) {
+                                let old_name = &old.name;
+                                let old_ns = &old.namespace;
+                                let old_rt = old.resource_type;
+                                // Find the same resource in the new list
+                                self.related_cursor = new_related.iter().position(|r| {
+                                    r.resource_type == old_rt && r.name == *old_name && r.namespace == *old_ns
+                                });
+                            }
+                        }
+                    } else {
                         self.related_cursor = None;
                     }
+                    self.related_resources = new_related;
                 },
                 | Err(e) => {
                     self.error = Some(format!("Failed to load resource: {}", e));
@@ -944,7 +960,7 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+            self.open_confirm_quit();
             return;
         }
 
@@ -1015,7 +1031,7 @@ impl App {
 
         match key.code {
             | KeyCode::Char('q') => {
-                self.should_quit = true;
+                self.open_confirm_quit();
             },
             | KeyCode::Char('r') => {
                 self.focus = Focus::Resources;
@@ -1928,6 +1944,10 @@ impl App {
             self.handle_confirm_drain_key(key);
             return;
         }
+        if matches!(self.popup, Some(Popup::ConfirmQuit { .. })) {
+            self.handle_confirm_quit_key(key);
+            return;
+        }
         if matches!(self.popup, Some(Popup::TriggerCronJob { .. })) {
             self.handle_trigger_cronjob_key(key);
             return;
@@ -1967,6 +1987,7 @@ impl App {
                         | Popup::ExecShell { .. }
                         | Popup::KubeconfigInput { .. }
                         | Popup::TriggerCronJob { .. }
+                        | Popup::ConfirmQuit { .. }
                         | Popup::TimeFilter { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
@@ -1989,6 +2010,7 @@ impl App {
                         | Popup::ExecShell { .. }
                         | Popup::KubeconfigInput { .. }
                         | Popup::TriggerCronJob { .. }
+                        | Popup::ConfirmQuit { .. }
                         | Popup::TimeFilter { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
@@ -2071,6 +2093,7 @@ impl App {
                     | Some(Popup::ExecShell { .. })
                     | Some(Popup::KubeconfigInput { .. })
                     | Some(Popup::TriggerCronJob { .. })
+                    | Some(Popup::ConfirmQuit { .. })
                     | Some(Popup::TimeFilter { .. })
                     | None => None,
                 };
@@ -3102,6 +3125,33 @@ impl App {
                 self.help_buf.push(c);
                 self.help_cursor = 0;
                 self.help_scroll = 0;
+            },
+            | _ => {},
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Quit confirmation
+    // -----------------------------------------------------------------------
+
+    fn open_confirm_quit(&mut self) {
+        let pf_count = self
+            .pf_manager
+            .entries()
+            .iter()
+            .filter(|e| !matches!(e.status, portforward::PortForwardStatus::Cancelled))
+            .count();
+        self.popup = Some(Popup::ConfirmQuit { pf_count });
+    }
+
+    fn handle_confirm_quit_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Enter | KeyCode::Char('y') => {
+                self.popup = None;
+                self.should_quit = true;
+            },
+            | KeyCode::Esc | KeyCode::Char('n') => {
+                self.popup = None;
             },
             | _ => {},
         }

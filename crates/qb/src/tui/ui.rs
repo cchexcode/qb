@@ -1629,6 +1629,10 @@ fn build_hotkey_bar(app: &App) -> Line<'static> {
         spans.push(sep.clone());
     }
 
+    // Always show help hint
+    spans.push(Span::styled(" ? ", key_style));
+    spans.push(Span::styled(" Help", label_style));
+
     Line::from(spans)
 }
 
@@ -1936,6 +1940,7 @@ fn render_popup(f: &mut Frame, app: &mut App) {
         Popup::PortForwardCreate(_)
             | Popup::ConfirmDelete { .. }
             | Popup::ConfirmDrain { .. }
+            | Popup::ConfirmQuit { .. }
             | Popup::TriggerCronJob { .. }
             | Popup::ScaleInput { .. }
             | Popup::TimeFilter { .. }
@@ -2128,6 +2133,35 @@ fn render_popup(f: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red))
                 .title(" Confirm Drain ");
+
+            f.render_widget(Paragraph::new(lines).block(block), area);
+        },
+        | Popup::ConfirmQuit { pf_count } => {
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Quit qb?",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )),
+            ];
+            if *pf_count > 0 {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {} active port forward{} will be stopped.",
+                        pf_count,
+                        if *pf_count == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("  [Enter/y] quit  [Esc/n] cancel"));
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Confirm Quit ");
 
             f.render_widget(Paragraph::new(lines).block(block), area);
         },
