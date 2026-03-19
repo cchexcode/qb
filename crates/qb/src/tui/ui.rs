@@ -4,6 +4,8 @@ use {
             App,
             DetailMode,
             Focus,
+            MetadataEditKind,
+            MetadataEditMode,
             NavItemKind,
             Popup,
             View,
@@ -133,6 +135,11 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
 fn render_main(f: &mut Frame, app: &mut App) {
     let has_filter_bar = app.resource_filter_editing || !app.resource_filter_text.is_empty();
     let filter_height = if has_filter_bar { 1 } else { 0 };
+    let status_height = if app.error.is_some() {
+        1
+    } else {
+        app.recent_status(3).len().min(3) as u16
+    };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -140,7 +147,7 @@ fn render_main(f: &mut Frame, app: &mut App) {
             Constraint::Length(1),             // breadcrumb
             Constraint::Min(3),                // main area
             Constraint::Length(filter_height), // filter bar
-            Constraint::Length(1),             // error line
+            Constraint::Length(status_height), // status/error line(s)
             Constraint::Length(2),             // hotkey tab bar (2 lines for wrapping)
         ])
         .split(f.area());
@@ -151,10 +158,6 @@ fn render_main(f: &mut Frame, app: &mut App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(28), Constraint::Min(40)])
         .split(outer[1]);
-
-    // Store areas for mouse click handling
-    app.area_nav = cols[0];
-    app.area_resources = cols[1];
 
     render_nav(f, app, cols[0]);
     render_resources(f, app, cols[1]);
@@ -330,7 +333,27 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
             for col in &entry.columns {
                 cells.push(Cell::from(col.as_str()));
             }
-            Row::new(cells)
+            let row = if rt == ResourceType::Pod {
+                let status = entry.columns.get(1).map(|s| s.as_str()).unwrap_or("");
+                let style = match status {
+                    | "Running" => Style::default().fg(Color::Green),
+                    | "Succeeded" | "Completed" => Style::default().fg(Color::DarkGray),
+                    | "Pending" | "ContainerCreating" | "PodInitializing" => Style::default().fg(Color::Yellow),
+                    | s if s.starts_with("Init:") => Style::default().fg(Color::Yellow),
+                    | "CrashLoopBackOff"
+                    | "Error"
+                    | "OOMKilled"
+                    | "ImagePullBackOff"
+                    | "ErrImagePull"
+                    | "CreateContainerConfigError" => Style::default().fg(Color::Red),
+                    | "Terminating" => Style::default().fg(Color::DarkGray),
+                    | _ => Style::default(),
+                };
+                Row::new(cells).style(style)
+            } else {
+                Row::new(cells)
+            };
+            row
         })
         .collect();
 
@@ -626,6 +649,48 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
     }
     lines.push(Line::from(""));
 
+    // ── Health warnings ─────────────────────────────────────
+    {
+        let mut warnings: Vec<Line> = Vec::new();
+        if stats.pods_crash_loop > 0 {
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} pod(s) in CrashLoopBackOff", stats.pods_crash_loop),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        if stats.pods_error > 0 {
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} pod(s) in error state", stats.pods_error),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        if stats.nodes_with_pressure > 0 {
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} node(s) with resource pressure", stats.nodes_with_pressure),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        if stats.recent_warnings > 0 {
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} warning event(s) in last 15 minutes", stats.recent_warnings),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if warnings.is_empty() {
+            warnings.push(Line::from(Span::styled(
+                "  ✓ Cluster healthy — no warnings",
+                Style::default().fg(Color::Green),
+            )));
+        }
+        lines.push(Line::from(Span::styled(" Health", heading)));
+        lines.push(Line::from(Span::styled(
+            " ──────────────────────────────────────────────────────────",
+            dim,
+        )));
+        lines.extend(warnings);
+        lines.push(Line::from(""));
+    }
+
     // ── Pod breakdown with gauge bar ────────────────────────
     lines.push(Line::from(Span::styled(
         format!(" Pods ({})", stats.pod_count),
@@ -908,6 +973,9 @@ fn render_detail(f: &mut Frame, app: &mut App) {
         | DetailMode::Smart => render_smart_lines(app),
         | DetailMode::Yaml => render_yaml_lines(&app.detail_yaml),
     };
+
+    // Store inner height for scroll-to-cursor calculations (minus 2 for borders)
+    app.detail_area_height = outer[1].height.saturating_sub(2) as usize;
 
     let paragraph = Paragraph::new(lines)
         .block(
@@ -1199,16 +1267,77 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
         }
     }
 
-    // Append related events (describe-style)
+    let mut all_lines = lines;
+
+    // Related resources — tabbed by category
+    if !app.related_resources.is_empty() {
+        all_lines.push(Line::from(""));
+
+        // Tab bar
+        let cats = app.related_categories();
+        let in_related = app.related_cursor.is_some();
+        let mut tab_spans: Vec<Span> = vec![Span::styled("  ", Style::default())];
+        for (ci, cat) in cats.iter().enumerate() {
+            let count = app.related_resources.iter().filter(|r| r.category == *cat).count();
+            let is_active = ci == app.related_tab;
+            let style = if in_related && is_active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_active {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            tab_spans.push(Span::styled(format!(" {} ({}) ", cat, count), style));
+            if ci + 1 < cats.len() {
+                tab_spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+            }
+        }
+        if !in_related {
+            tab_spans.push(Span::styled("   [Tab] select", Style::default().fg(Color::DarkGray)));
+        } else {
+            tab_spans.push(Span::styled(
+                "   ◀▶ switch  Enter=open",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        all_lines.push(Line::from(tab_spans));
+
+        // Items for current tab only
+        app.related_line_start = all_lines.len();
+        let tab_indices = app.related_tab_indices();
+        for &idx in &tab_indices {
+            let rel = &app.related_resources[idx];
+            let is_selected = app.related_cursor == Some(idx);
+            let marker = if is_selected { "▶ " } else { "  " };
+            let type_name = rel.resource_type.singular_name();
+
+            if is_selected {
+                all_lines.push(Line::from(Span::styled(
+                    format!("  {}{}/{}  ({})", marker, type_name, rel.name, rel.info),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED),
+                )));
+            } else {
+                all_lines.push(Line::from(vec![
+                    Span::styled(format!("  {}", marker), Style::default()),
+                    Span::styled(format!("{}/", type_name), Style::default().fg(Color::Magenta)),
+                    Span::styled(rel.name.clone(), Style::default().fg(Color::White)),
+                    Span::styled(format!("  ({})", rel.info), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+        }
+    }
+
+    // Related events (describe-style)
     if !app.related_events.is_empty() {
-        let mut all_lines = lines;
         all_lines.push(Line::from(""));
         all_lines.push(Line::from(Span::styled(
             "Events:",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )));
 
-        // Header
         all_lines.push(Line::from(vec![
             Span::styled(
                 format!("  {:<8} {:<6} {:<18} ", "AGE", "COUNT", "REASON"),
@@ -1236,11 +1365,9 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
                 Span::styled(ev.message.clone(), Style::default().fg(Color::White)),
             ]));
         }
-
-        return all_lines;
     }
 
-    lines
+    all_lines
 }
 
 fn render_yaml_lines(yaml: &str) -> Vec<Line<'_>> {
@@ -1444,9 +1571,24 @@ fn build_log_hotkey_bar(state: &super::logs::LogViewState) -> Line<'static> {
         sep.clone(),
     ]);
 
-    if state.selected_line.is_some() {
-        spans.extend([Span::styled(" Enter ", key_style), Span::styled(" Open", label_style)]);
-    }
+    spans.extend([
+        Span::styled(" t ", key_style),
+        Span::styled(
+            if state.since_seconds.is_some() {
+                " Time*"
+            } else {
+                " Time"
+            },
+            label_style,
+        ),
+        sep.clone(),
+    ]);
+
+    spans.extend([
+        Span::styled(" Y ", key_style),
+        Span::styled(" Copy All", label_style),
+        sep.clone(),
+    ]);
 
     Line::from(spans)
 }
@@ -1462,6 +1604,24 @@ fn render_error(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(err.as_str(), Style::default().fg(Color::Red)),
         ]));
         f.render_widget(text, area);
+    } else {
+        // Show recent status messages
+        let recent = app.recent_status(3);
+        if !recent.is_empty() {
+            let lines: Vec<Line> = recent
+                .iter()
+                .enumerate()
+                .map(|(i, msg)| {
+                    let style = if i == 0 {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    Line::from(Span::styled(format!(" {}", msg), style))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), area);
+        }
     }
 }
 
@@ -1764,6 +1924,26 @@ fn build_detail_hotkey_bar(app: &App) -> Line<'static> {
             Span::styled(" l ", key_style),
             Span::styled(" Logs", label_style),
         ]);
+    }
+
+    // Related resources
+    if !app.related_resources.is_empty() {
+        if app.related_cursor.is_some() {
+            spans.extend([
+                sep.clone(),
+                Span::styled(" ◀▶ ", key_style),
+                Span::styled(" Tab", label_style),
+                sep.clone(),
+                Span::styled(" Tab ", key_style),
+                Span::styled(" Exit", label_style),
+            ]);
+        } else {
+            spans.extend([
+                sep.clone(),
+                Span::styled(" Tab ", key_style),
+                Span::styled(" Related", label_style),
+            ]);
+        }
     }
 
     // Watch toggle
@@ -2077,22 +2257,23 @@ fn render_popup(f: &mut Frame, app: &mut App) {
 
     // PortForwardCreate / ConfirmDelete / ScaleInput / ExecShell use their own
     // smaller area
-    let area = if matches!(popup, Popup::ExecShell { .. } | Popup::KubeconfigInput { .. }) {
+    let area = if matches!(popup, Popup::MetadataEdit { .. }) {
+        let a = centered_rect(55, 65, f.area());
+        f.render_widget(Clear, a);
+        a
+    } else if matches!(popup, Popup::ExecShell { .. } | Popup::KubeconfigInput { .. }) {
         let a = centered_rect(60, 65, f.area());
-        app.area_popup = a;
         f.render_widget(Clear, a);
         a
     } else if matches!(
         popup,
-        Popup::PortForwardCreate(_) | Popup::ConfirmDelete { .. } | Popup::ScaleInput { .. }
+        Popup::PortForwardCreate(_) | Popup::ConfirmDelete { .. } | Popup::ScaleInput { .. } | Popup::TimeFilter { .. }
     ) {
         let a = centered_rect(45, 50, f.area());
-        app.area_popup = a;
         f.render_widget(Clear, a);
         a
     } else {
         let a = centered_rect(50, 60, f.area());
-        app.area_popup = a;
         f.render_widget(Clear, a);
         a
     };
@@ -2362,6 +2543,140 @@ fn render_popup(f: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(" Open Kubeconfig ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::TimeFilter { buf } => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled("  Log time range:", Style::default().fg(Color::Cyan))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Duration: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{}▎", buf),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Examples: 30m, 2h, 1h30m, 1d",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  [Enter] apply  [Esc] cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Time Filter ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::MetadataEdit {
+            kind,
+            name,
+            entries,
+            cursor,
+            mode,
+            key_buf,
+            value_buf,
+            ..
+        } => {
+            let title = match kind {
+                | MetadataEditKind::Labels => " Labels ",
+                | MetadataEditKind::Annotations => " Annotations ",
+            };
+
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                format!("  {}", name),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+
+            if entries.is_empty() && *mode == MetadataEditMode::Browse {
+                lines.push(Line::from(Span::styled(
+                    "  (none)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            for (i, (k, v)) in entries.iter().enumerate() {
+                let marker = if i == *cursor && *mode == MetadataEditMode::Browse {
+                    "▶ "
+                } else {
+                    "  "
+                };
+                let key_style = if i == *cursor && *mode == MetadataEditMode::Browse {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                let val_display = if v.len() > 50 {
+                    format!("{}...", &v[..47])
+                } else {
+                    v.clone()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{}{}", marker, k), key_style),
+                    Span::styled(": ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(val_display, Style::default().fg(Color::White)),
+                ]));
+            }
+
+            lines.push(Line::from(""));
+
+            match mode {
+                | MetadataEditMode::Browse => {
+                    lines.push(Line::from(Span::styled(
+                        "  [a] Add  [Enter] Edit  [d] Delete  [Esc] Close",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                },
+                | MetadataEditMode::AddKey => {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Key: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{}▎", key_buf),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    lines.push(Line::from(Span::styled(
+                        "  [Enter] next  [Esc] cancel",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                },
+                | MetadataEditMode::AddValue | MetadataEditMode::EditValue => {
+                    let prompt = if *mode == MetadataEditMode::AddValue {
+                        format!("  Value for '{}': ", key_buf)
+                    } else {
+                        let editing_key = entries.get(*cursor).map(|(k, _)| k.as_str()).unwrap_or("?");
+                        format!("  Value for '{}': ", editing_key)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(prompt, Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{}▎", value_buf),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    lines.push(Line::from(Span::styled(
+                        "  [Enter] apply  [Esc] cancel",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                },
+            }
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title);
 
             let paragraph = Paragraph::new(lines).block(block);
             f.render_widget(paragraph, area);

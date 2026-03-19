@@ -132,6 +132,20 @@ pub enum DetailMode {
     Yaml,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum MetadataEditKind {
+    Labels,
+    Annotations,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum MetadataEditMode {
+    Browse,
+    AddKey,
+    AddValue,
+    EditValue,
+}
+
 #[allow(clippy::enum_variant_names)]
 pub enum Popup {
     ContextSelect {
@@ -174,6 +188,20 @@ pub enum Popup {
     },
     KubeconfigInput {
         buf: String,
+    },
+    TimeFilter {
+        buf: String,
+    },
+    MetadataEdit {
+        kind: MetadataEditKind,
+        resource_type: ResourceType,
+        name: String,
+        namespace: String,
+        entries: Vec<(String, String)>,
+        cursor: usize,
+        mode: MetadataEditMode,
+        key_buf: String,
+        value_buf: String,
     },
 }
 
@@ -253,6 +281,14 @@ pub struct App {
     pub detail_name: String,
     pub detail_namespace: String,
     pub related_events: Vec<RelatedEvent>,
+    pub related_resources: Vec<crate::k8s::RelatedResource>,
+    pub related_cursor: Option<usize>,
+    pub related_tab: usize,
+    /// Line offset where related resource items start (after tab bar). Set by
+    /// render.
+    pub related_line_start: usize,
+    /// Inner height of the detail view content area. Set by render.
+    pub detail_area_height: usize,
 
     // Edit / Exec / Create
     pub pending_edit: Option<PendingEdit>,
@@ -268,8 +304,8 @@ pub struct App {
     pub dict_entries: Vec<(String, String, String)>,
     /// Currently selected dict entry index (into dict_entries).
     pub dict_cursor: Option<usize>,
-    /// Line offsets for each dict entry (for click mapping). Populated each
-    /// render.
+    /// Line offsets for each dict entry (for scroll-to-cursor). Populated
+    /// each render.
     pub dict_line_offsets: Vec<usize>,
 
     // UI state
@@ -279,6 +315,7 @@ pub struct App {
     pub should_quit: bool,
     pub experimental: bool,
     pub status: String,
+    pub status_history: Vec<(std::time::Instant, String)>,
     pub error: Option<String>,
     pub pending_load: Option<PendingLoad>,
 
@@ -326,11 +363,6 @@ pub struct App {
     pub showing_port_forwards: bool,
     pub pf_cursor: usize,
     pub pf_table_state: TableState,
-
-    // Click areas — updated each render by ui.rs
-    pub area_nav: ratatui::layout::Rect,
-    pub area_resources: ratatui::layout::Rect,
-    pub area_popup: ratatui::layout::Rect,
 }
 
 impl App {
@@ -364,6 +396,11 @@ impl App {
             detail_name: String::new(),
             detail_namespace: String::new(),
             related_events: Vec::new(),
+            related_resources: Vec::new(),
+            related_cursor: None,
+            related_tab: 0,
+            related_line_start: 0,
+            detail_area_height: 0,
             pending_edit: None,
             pending_exec: None,
             pending_create: None,
@@ -389,6 +426,7 @@ impl App {
             should_quit: false,
             experimental,
             status: String::new(),
+            status_history: Vec::new(),
             error: None,
             pending_load: Some(PendingLoad::ClusterStats),
             last_refresh: std::time::Instant::now(),
@@ -408,9 +446,6 @@ impl App {
             showing_port_forwards: false,
             pf_cursor: 0,
             pf_table_state: TableState::default(),
-            area_nav: ratatui::layout::Rect::default(),
-            area_resources: ratatui::layout::Rect::default(),
-            area_popup: ratatui::layout::Rect::default(),
         };
         app.update_status();
         app
@@ -466,6 +501,28 @@ impl App {
         self.status = format!("ctx: {} | ns: {} | {}: {}", ctx, ns, rt_name, count);
     }
 
+    pub fn push_status(&mut self, msg: impl Into<String>) {
+        let s = msg.into();
+        self.status = s.clone();
+        self.status_history.push((std::time::Instant::now(), s));
+        // Keep only last 10 entries
+        if self.status_history.len() > 10 {
+            self.status_history.remove(0);
+        }
+    }
+
+    /// Returns the last N status messages that are less than 30 seconds old.
+    pub fn recent_status(&self, n: usize) -> Vec<&str> {
+        let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        self.status_history
+            .iter()
+            .rev()
+            .filter(|(t, _)| *t > cutoff)
+            .take(n)
+            .map(|(_, s)| s.as_str())
+            .collect()
+    }
+
     pub fn selected_nav_resource_type(&self) -> Option<ResourceType> {
         let idx = self.nav_state.selected()?;
         match &self.nav_items.get(idx)?.kind {
@@ -499,14 +556,15 @@ impl App {
     /// Returns indices into `self.resources` that match the current filter.
     pub fn visible_resource_indices(&self) -> Vec<usize> {
         if self.resource_filter_text.is_empty() {
-            return (0..self.resources.len()).collect();
+            (0..self.resources.len()).collect()
+        } else {
+            self.resources
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| self.resource_matches(e))
+                .map(|(i, _)| i)
+                .collect()
         }
-        self.resources
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| self.resource_matches(e))
-            .map(|(i, _)| i)
-            .collect()
     }
 
     fn resource_matches(&self, entry: &ResourceEntry) -> bool {
@@ -707,15 +765,23 @@ impl App {
             match self.rt.block_on(self.kube.get_resource(rt, ns, name)) {
                 | Ok(value) => {
                     self.detail_yaml = serde_yaml::to_string(&value).unwrap_or_default();
-                    self.secret_state = if rt == ResourceType::Secret {
-                        Some(SecretDetailState::from_value(&value))
+                    let is_same_resource = self.detail_name == name && self.detail_namespace == ns;
+                    if rt == ResourceType::Secret {
+                        if is_same_resource && self.detail_auto_refresh && self.secret_state.is_some() {
+                            // Preserve selection and decoded state on watch refresh
+                            if let Some(state) = &mut self.secret_state {
+                                state.update_values(&value);
+                            }
+                        } else {
+                            self.secret_state = Some(SecretDetailState::from_value(&value));
+                        }
                     } else {
-                        None
-                    };
+                        self.secret_state = None;
+                    }
                     self.detail_value = value;
                     self.detail_name = name.to_string();
                     self.detail_namespace = ns.to_string();
-                    if !self.detail_auto_refresh {
+                    if !self.detail_auto_refresh || !is_same_resource {
                         self.detail_scroll = 0;
                         self.detail_mode = DetailMode::Smart;
                         self.expanded_keys.clear();
@@ -725,11 +791,18 @@ impl App {
                     }
                     self.view = View::Detail;
                     self.error = None;
-                    // Fetch related events for describe-style view
                     self.related_events = self
                         .rt
                         .block_on(self.kube.fetch_related_events(ns, name))
                         .unwrap_or_default();
+                    // Always re-fetch related resources on navigation to a different resource;
+                    // only skip on watch-mode refresh of the same resource.
+                    if !is_same_resource || !self.detail_auto_refresh {
+                        self.related_resources =
+                            self.rt
+                                .block_on(self.kube.fetch_related_resources(rt, ns, name, &self.detail_value));
+                        self.related_cursor = None;
+                    }
                 },
                 | Err(e) => {
                     self.error = Some(format!("Failed to load resource: {}", e));
@@ -755,9 +828,15 @@ impl App {
                     .iter()
                     .flat_map(|p| p.containers.iter().map(move |c| (p.name.clone(), c.clone())))
                     .collect();
-                match self.rt.block_on(self.kube.fetch_logs_multi(ns, &pairs, 500)) {
+                let default_since = Some(3600); // 1h default
+                match self
+                    .rt
+                    .block_on(self.kube.fetch_logs_multi(ns, &pairs, 500, default_since))
+                {
                     | Ok(lines) => {
-                        self.log_state = Some(LogViewState::new(pods, ns.to_string(), lines));
+                        let mut state = LogViewState::new(pods, ns.to_string(), lines);
+                        state.since_seconds = default_since;
+                        self.log_state = Some(state);
                         self.view = View::Logs;
                         self.error = None;
                     },
@@ -782,8 +861,9 @@ impl App {
 
         let pairs = log_state.active_streams();
         let ns = log_state.namespace.clone();
+        let since = log_state.since_seconds;
 
-        match self.rt.block_on(self.kube.fetch_logs_multi(&ns, &pairs, 500)) {
+        match self.rt.block_on(self.kube.fetch_logs_multi(&ns, &pairs, 500, since)) {
             | Ok(lines) => {
                 log_state.lines = lines;
                 log_state.scroll = 0;
@@ -814,312 +894,6 @@ impl App {
     // Event handling
     // -----------------------------------------------------------------------
 
-    pub fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
-        use crossterm::event::{
-            MouseButton,
-            MouseEventKind,
-        };
-
-        let pos = ratatui::layout::Position {
-            x: event.column,
-            y: event.row,
-        };
-
-        match event.kind {
-            | MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(pos),
-            | MouseEventKind::ScrollUp => self.handle_mouse_scroll(-3),
-            | MouseEventKind::ScrollDown => self.handle_mouse_scroll(3),
-            | _ => {},
-        }
-    }
-
-    fn handle_mouse_click(&mut self, pos: ratatui::layout::Position) {
-        // Popup takes priority — click inside selects + confirms, click outside
-        // dismisses
-        if self.popup.is_some() {
-            if !self.area_popup.contains(pos) {
-                self.popup = None;
-                return;
-            }
-            // Row offset: skip top border (title is rendered in the border line)
-            let inner_y = pos.y.saturating_sub(self.area_popup.y + 1) as usize;
-            let action = match &self.popup {
-                | Some(Popup::ContextSelect { items, .. }) => {
-                    if inner_y < items.len() {
-                        Some(PendingLoad::SwitchContext(items[inner_y].clone()))
-                    } else {
-                        None
-                    }
-                },
-                | Some(Popup::NamespaceSelect { items, .. }) => {
-                    if inner_y < items.len() {
-                        let ns = &items[inner_y];
-                        if ns == ALL_NAMESPACES_LABEL {
-                            self.kube.set_namespace(None);
-                        } else {
-                            self.kube.set_namespace(Some(ns.clone()));
-                        }
-                        Some(PendingLoad::Resources)
-                    } else {
-                        None
-                    }
-                },
-                | Some(Popup::PodSelect { items, .. }) => {
-                    if inner_y < items.len() {
-                        if let Some(log_state) = &mut self.log_state {
-                            log_state.selected_pod = if inner_y == 0 { None } else { Some(inner_y - 1) };
-                            log_state.selected_container = None;
-                        }
-                        Some(PendingLoad::ReloadLogs)
-                    } else {
-                        None
-                    }
-                },
-                | Some(Popup::ContainerSelect { items, .. }) => {
-                    if inner_y < items.len() {
-                        if let Some(log_state) = &mut self.log_state {
-                            log_state.selected_container = if inner_y == 0 { None } else { Some(inner_y - 1) };
-                        }
-                        Some(PendingLoad::ReloadLogs)
-                    } else {
-                        None
-                    }
-                },
-                | Some(Popup::PortForwardCreate(_)) => {
-                    // Handled by its own key handler; click inside dismissed
-                    None
-                },
-                | Some(Popup::ConfirmDelete { .. })
-                | Some(Popup::ScaleInput { .. })
-                | Some(Popup::ExecShell { .. })
-                | Some(Popup::KubeconfigInput { .. }) => None,
-                | None => None,
-            };
-            self.popup = None;
-            if let Some(load) = action {
-                self.pending_load = Some(load);
-            }
-            return;
-        }
-
-        // Main view
-        if self.view == View::Main {
-            // Click on nav sidebar — select resource type and load it
-            if self.area_nav.contains(pos) {
-                self.focus = Focus::Nav;
-                // Account for list scroll offset so clicks target the correct item
-                let visual_y = pos.y.saturating_sub(self.area_nav.y + 1) as usize;
-                let inner_y = visual_y + self.nav_state.offset();
-                if inner_y < self.nav_items.len() {
-                    match &self.nav_items[inner_y].kind {
-                        | NavItemKind::Resource(_) => {
-                            self.nav_state.select(Some(inner_y));
-                            self.showing_port_forwards = false;
-                            if let Some(rt) = self.selected_nav_resource_type() {
-                                if self.selected_resource_type != Some(rt) {
-                                    self.selected_resource_type = Some(rt);
-                                    self.events_scroll = 0;
-                                    self.events_cursor = 0;
-                                    self.events_auto_scroll = true;
-                                    self.clear_resource_filter();
-                                    self.pending_load = Some(PendingLoad::Resources);
-                                }
-                            }
-                        },
-                        | NavItemKind::ClusterStats => {
-                            self.nav_state.select(Some(inner_y));
-                            self.showing_port_forwards = false;
-                            self.selected_resource_type = None;
-                            self.clear_resource_filter();
-                            self.cluster_stats_scroll = 0;
-                            self.pending_load = Some(PendingLoad::ClusterStats);
-                        },
-                        | NavItemKind::PortForwards => {
-                            self.nav_state.select(Some(inner_y));
-                            self.selected_resource_type = None;
-                            self.showing_port_forwards = true;
-                            self.clear_resource_filter();
-                        },
-                        | NavItemKind::SuperCategory | NavItemKind::Category => {},
-                    }
-                }
-                return;
-            }
-
-            // Click on resources table/events log — select row or scroll
-            if self.area_resources.contains(pos) {
-                self.focus = Focus::Resources;
-                if self.selected_resource_type == Some(ResourceType::Event) {
-                    // Events log: click selects the clicked event in filtered view
-                    let inner_y = pos.y.saturating_sub(self.area_resources.y + 1) as usize;
-                    let clicked = self.events_scroll.saturating_add(inner_y);
-                    let vis_len = self.visible_resource_indices().len();
-                    self.events_cursor = clicked.min(vis_len.saturating_sub(1));
-                    self.events_auto_scroll = self.events_cursor == vis_len.saturating_sub(1);
-                } else {
-                    // Skip border (1) + header row (1) = 2
-                    let inner_y = pos.y.saturating_sub(self.area_resources.y + 2) as usize;
-                    if inner_y < self.resources.len() {
-                        self.resource_state.select(Some(inner_y));
-                    }
-                }
-                return;
-            }
-        }
-
-        // Detail view — click on secret keys in smart mode
-        if self.view == View::Detail && self.is_secret_smart_view() {
-            if let Some(state) = &mut self.secret_state {
-                // Content line = click row minus top border, plus scroll offset
-                let content_line = pos.y.saturating_sub(1) as usize + self.detail_scroll as usize;
-                // Walk key_line_offsets (populated during render) to find which key was clicked
-                for (i, &offset) in state.key_line_offsets.iter().enumerate().rev() {
-                    if content_line >= offset {
-                        state.selected = i;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Log view — click to select a log line (only when not wrapping,
-        // since wrapped lines break the 1:1 row-to-line mapping)
-        if self.view == View::Logs {
-            if let Some(state) = &mut self.log_state {
-                if !state.wrap {
-                    let inner_y = pos.y.saturating_sub(2) as usize;
-                    let scroll = state.scroll;
-                    let clicked_idx = scroll + inner_y;
-                    let vis_count = state.visible_lines().len();
-                    if clicked_idx < vis_count {
-                        state.selected_line = Some(clicked_idx);
-                        state.auto_scroll = false;
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_mouse_scroll(&mut self, delta: i32) {
-        if self.help_open {
-            let count = self.filtered_help_entries().len();
-            if count > 0 {
-                let current = self.help_cursor as i32;
-                let next = (current + delta).clamp(0, count.saturating_sub(1) as i32) as usize;
-                self.help_cursor = next;
-            }
-            return;
-        }
-
-        if self.palette_open {
-            let count = self.palette_results.len();
-            if count > 0 {
-                let current = self.palette_cursor as i32;
-                let next = (current + delta).clamp(0, count.saturating_sub(1) as i32) as usize;
-                self.palette_cursor = next;
-            }
-            return;
-        }
-
-        if self.popup.is_some() {
-            // Scroll popup list
-            if let Some(popup) = &mut self.popup {
-                match popup {
-                    | Popup::ContextSelect { items, state }
-                    | Popup::NamespaceSelect { items, state }
-                    | Popup::PodSelect { items, state }
-                    | Popup::ContainerSelect { items, state } => {
-                        let current = state.selected().unwrap_or(0) as i32;
-                        let next = (current + delta).clamp(0, items.len().saturating_sub(1) as i32) as usize;
-                        state.select(Some(next));
-                    },
-                    | Popup::PortForwardCreate(d) => {
-                        let current = d.port_cursor as i32;
-                        let next = (current + delta).clamp(0, d.ports.len().saturating_sub(1) as i32) as usize;
-                        d.port_cursor = next;
-                        d.local_port_buf = d.ports[next].container_port.to_string();
-                    },
-                    | Popup::ConfirmDelete { .. }
-                    | Popup::ScaleInput { .. }
-                    | Popup::ExecShell { .. }
-                    | Popup::KubeconfigInput { .. } => {},
-                }
-            }
-            return;
-        }
-
-        if self.view == View::EditDiff {
-            if let Some(ctx) = &mut self.edit_ctx {
-                if delta < 0 {
-                    ctx.scroll = ctx.scroll.saturating_sub(delta.unsigned_abs() as u16);
-                } else {
-                    ctx.scroll = ctx.scroll.saturating_add(delta as u16);
-                }
-            }
-            return;
-        }
-
-        if self.view == View::Detail {
-            if self.is_secret_smart_view() {
-                // Scroll navigates secret keys
-                if let Some(state) = &mut self.secret_state {
-                    let current = state.selected as i32;
-                    let next = (current + delta).clamp(0, state.keys.len().saturating_sub(1) as i32) as usize;
-                    state.selected = next;
-                }
-            } else {
-                // Scroll the detail view
-                if delta < 0 {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(delta.unsigned_abs() as u16);
-                } else {
-                    self.detail_scroll = self.detail_scroll.saturating_add(delta as u16);
-                }
-            }
-            return;
-        }
-
-        // Main view — scroll the focused list/table
-        match self.focus {
-            | Focus::Nav => {
-                // Scroll nav by moving selection
-                if delta < 0 {
-                    for _ in 0..delta.unsigned_abs() {
-                        self.nav_up();
-                    }
-                } else {
-                    for _ in 0..delta {
-                        self.nav_down();
-                    }
-                }
-            },
-            | Focus::Resources => {
-                if self.is_showing_cluster_stats() {
-                    if delta < 0 {
-                        self.cluster_stats_scroll =
-                            self.cluster_stats_scroll.saturating_sub(delta.unsigned_abs() as u16);
-                    } else {
-                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(delta as u16);
-                    }
-                } else if self.selected_resource_type == Some(ResourceType::Event) {
-                    let max = self.visible_resource_indices().len().saturating_sub(1);
-                    if delta < 0 {
-                        self.events_cursor = self.events_cursor.saturating_sub(delta.unsigned_abs() as usize);
-                        self.events_auto_scroll = false;
-                    } else {
-                        self.events_cursor = (self.events_cursor + delta as usize).min(max);
-                        self.events_auto_scroll = self.events_cursor == max;
-                    }
-                } else {
-                    let current = self.resource_state.selected().unwrap_or(0) as i32;
-                    let next = (current + delta).clamp(0, self.resources.len().saturating_sub(1) as i32) as usize;
-                    if !self.resources.is_empty() {
-                        self.resource_state.select(Some(next));
-                    }
-                }
-            },
-        }
-    }
-
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
@@ -1148,11 +922,11 @@ impl App {
             // (pause/resume)
             if self.view != View::Logs && self.view != View::EditDiff && !self.showing_port_forwards {
                 self.paused = !self.paused;
-                self.status = if self.paused {
-                    "Paused — auto-refresh disabled".into()
+                self.push_status(if self.paused {
+                    "Paused — auto-refresh disabled"
                 } else {
-                    "Resumed — auto-refresh enabled".into()
-                };
+                    "Resumed — auto-refresh enabled"
+                });
                 return;
             }
         }
@@ -1262,6 +1036,18 @@ impl App {
                 self.nav_down();
                 self.load_nav_selection();
             },
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                for _ in 0..10 {
+                    self.nav_up();
+                }
+                self.load_nav_selection();
+            },
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                for _ in 0..10 {
+                    self.nav_down();
+                }
+                self.load_nav_selection();
+            },
             | KeyCode::Enter => {
                 self.load_nav_selection();
                 self.focus = Focus::Resources;
@@ -1368,10 +1154,10 @@ impl App {
                 | KeyCode::Down | KeyCode::Char('j') => {
                     self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(1);
                 },
-                | KeyCode::PageUp => {
+                | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_sub(20);
                 },
-                | KeyCode::PageDown => {
+                | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(20);
                 },
                 | KeyCode::Home => {
@@ -1416,6 +1202,18 @@ impl App {
                     }
                 }
             },
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let new_pos = vis_pos.saturating_sub(20);
+                if let Some(&idx) = visible.get(new_pos) {
+                    self.resource_state.select(Some(idx));
+                }
+            },
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let new_pos = (vis_pos + 20).min(vis_len.saturating_sub(1));
+                if let Some(&idx) = visible.get(new_pos) {
+                    self.resource_state.select(Some(idx));
+                }
+            },
             | KeyCode::Home => {
                 if let Some(&first) = visible.first() {
                     self.resource_state.select(Some(first));
@@ -1454,10 +1252,7 @@ impl App {
                 self.open_scale_input();
             },
             | KeyCode::Char('x') if self.experimental && self.resource_filter_text.is_empty() => {
-                self.open_exec_shell(false);
-            },
-            | KeyCode::Char('X') if self.experimental => {
-                self.open_exec_shell(true);
+                self.open_exec_shell();
             },
             | _ => {},
         }
@@ -1477,11 +1272,11 @@ impl App {
                 }
                 self.events_auto_scroll = self.events_cursor == max;
             },
-            | KeyCode::PageUp => {
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.events_cursor = self.events_cursor.saturating_sub(30);
                 self.events_auto_scroll = false;
             },
-            | KeyCode::PageDown => {
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.events_cursor = (self.events_cursor + 30).min(max);
                 self.events_auto_scroll = self.events_cursor == max;
             },
@@ -1554,8 +1349,36 @@ impl App {
                 }
             },
             // j/k: navigate dict entries (when selected) or secret keys, scroll otherwise
+            | KeyCode::Left => {
+                if self.related_cursor.is_some() {
+                    let cat_count = self.related_categories().len();
+                    if cat_count > 0 && self.related_tab > 0 {
+                        self.related_tab -= 1;
+                        self.related_cursor = Some(self.related_tab_indices().first().copied().unwrap_or(0));
+                        self.scroll_to_related_cursor(0);
+                    }
+                }
+            },
+            | KeyCode::Right => {
+                if self.related_cursor.is_some() {
+                    let cat_count = self.related_categories().len();
+                    if cat_count > 0 && self.related_tab + 1 < cat_count {
+                        self.related_tab += 1;
+                        self.related_cursor = Some(self.related_tab_indices().first().copied().unwrap_or(0));
+                        self.scroll_to_related_cursor(0);
+                    }
+                }
+            },
             | KeyCode::Up | KeyCode::Char('k') => {
-                if secret_smart {
+                if let Some(c) = self.related_cursor {
+                    let indices = self.related_tab_indices();
+                    if let Some(pos) = indices.iter().position(|&i| i == c) {
+                        if pos > 0 {
+                            self.related_cursor = Some(indices[pos - 1]);
+                            self.scroll_to_related_cursor(pos - 1);
+                        }
+                    }
+                } else if secret_smart {
                     if let Some(state) = &mut self.secret_state {
                         state.nav_up();
                     }
@@ -1566,7 +1389,15 @@ impl App {
                 }
             },
             | KeyCode::Down | KeyCode::Char('j') => {
-                if secret_smart {
+                if let Some(c) = self.related_cursor {
+                    let indices = self.related_tab_indices();
+                    if let Some(pos) = indices.iter().position(|&i| i == c) {
+                        if pos + 1 < indices.len() {
+                            self.related_cursor = Some(indices[pos + 1]);
+                            self.scroll_to_related_cursor(pos + 1);
+                        }
+                    }
+                } else if secret_smart {
                     if let Some(state) = &mut self.secret_state {
                         state.nav_down();
                     }
@@ -1576,10 +1407,10 @@ impl App {
                     self.detail_scroll = self.detail_scroll.saturating_add(1);
                 }
             },
-            | KeyCode::PageUp => {
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(20);
             },
-            | KeyCode::PageDown => {
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.detail_scroll = self.detail_scroll.saturating_add(20);
             },
             | KeyCode::Home => {
@@ -1616,23 +1447,116 @@ impl App {
             },
             | KeyCode::Char('w') => {
                 self.detail_auto_refresh = !self.detail_auto_refresh;
-                self.status = if self.detail_auto_refresh {
-                    "Watch mode enabled".into()
+                self.push_status(if self.detail_auto_refresh {
+                    "Watch mode enabled"
                 } else {
-                    "Watch mode disabled".into()
-                };
+                    "Watch mode disabled"
+                });
             },
             | KeyCode::Char('S') => {
                 self.open_scale_input_detail();
             },
             | KeyCode::Char('x') if self.experimental => {
-                self.open_exec_shell(false);
+                self.open_exec_shell();
             },
-            | KeyCode::Char('X') if self.experimental => {
-                self.open_exec_shell(true);
+            // [Tab] Toggle related resource selection
+            | KeyCode::Tab => {
+                if self.related_resources.is_empty() {
+                    // no-op
+                } else if self.related_cursor.is_some() {
+                    self.related_cursor = None;
+                } else {
+                    let cats = self.related_categories();
+                    if !cats.is_empty() {
+                        self.related_tab = self.related_tab.min(cats.len().saturating_sub(1));
+                        let indices = self.related_tab_indices();
+                        self.related_cursor = indices.first().copied();
+                        self.scroll_to_related_cursor(0);
+                    }
+                }
+            },
+            // [Enter] Edit selected label/annotation, or navigate to related resource
+            | KeyCode::Enter => {
+                if let Some(cursor) = self.dict_cursor {
+                    if let Some((qualified_key, ..)) = self.dict_entries.get(cursor) {
+                        let kind = if qualified_key.starts_with("Labels:") {
+                            MetadataEditKind::Labels
+                        } else {
+                            MetadataEditKind::Annotations
+                        };
+                        self.open_metadata_edit(kind);
+                    }
+                } else if let Some(cursor) = self.related_cursor {
+                    if let Some(rel) = self.related_resources.get(cursor) {
+                        self.navigate_to_related(rel.resource_type, rel.name.clone(), rel.namespace.clone());
+                    }
+                }
             },
             | _ => {},
         }
+    }
+
+    /// Returns the unique category names from related resources, in order.
+    pub fn related_categories(&self) -> Vec<&'static str> {
+        let mut cats = Vec::new();
+        for r in &self.related_resources {
+            if !cats.contains(&r.category) {
+                cats.push(r.category);
+            }
+        }
+        cats
+    }
+
+    /// Returns indices into related_resources for the currently selected tab.
+    pub fn related_tab_indices(&self) -> Vec<usize> {
+        let cats = self.related_categories();
+        let current_cat = cats.get(self.related_tab).copied().unwrap_or("");
+        self.related_resources
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.category == current_cat)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Scroll detail view to keep the related resource at `pos` visible.
+    fn scroll_to_related_cursor(&mut self, pos: usize) {
+        let target_line = self.related_line_start + pos;
+        let scroll = self.detail_scroll as usize;
+        let visible = self.detail_area_height;
+        if visible == 0 {
+            return;
+        }
+        if target_line >= scroll + visible {
+            self.detail_scroll = (target_line - visible + 1) as u16;
+        } else if target_line < scroll {
+            self.detail_scroll = target_line as u16;
+        }
+    }
+
+    fn navigate_to_related(&mut self, rt: ResourceType, name: String, namespace: String) {
+        // Switch to the related resource's type and load its detail
+        self.selected_resource_type = Some(rt);
+        self.showing_port_forwards = false;
+        self.related_cursor = None;
+        self.resource_table_state = TableState::default();
+        // Update nav selection
+        if let Some(nav_idx) = self
+            .nav_items
+            .iter()
+            .position(|item| matches!(&item.kind, NavItemKind::Resource(r) if *r == rt))
+        {
+            self.nav_state.select(Some(nav_idx));
+        }
+        // Load the resource list for this type
+        if let Ok(entries) = self.rt.block_on(self.kube.list_resources(rt)) {
+            if let Some(idx) = entries.iter().position(|e| e.name == name && e.namespace == namespace) {
+                self.resource_state.select(Some(idx));
+            }
+            self.resource_counts.insert(rt, entries.len());
+            self.resources = entries;
+        }
+        self.pending_load = Some(PendingLoad::ResourceDetail { name, namespace });
     }
 
     fn dict_nav_up(&mut self) {
@@ -1682,7 +1606,7 @@ impl App {
         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&self.detail_yaml)) {
             | Ok(()) => {
                 self.error = None;
-                self.status = format!("Copied YAML ({} bytes)", self.detail_yaml.len());
+                self.push_status(format!("Copied YAML ({} bytes)", self.detail_yaml.len()));
             },
             | Err(e) => {
                 self.error = Some(format!("Clipboard error: {}", e));
@@ -1699,7 +1623,7 @@ impl App {
                 match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
                     | Ok(()) => {
                         self.error = None;
-                        self.status = format!("Copied '{}' ({} bytes)", key, value.len());
+                        self.push_status(format!("Copied '{}' ({} bytes)", key, value.len()));
                     },
                     | Err(e) => {
                         self.error = Some(format!("Clipboard error: {}", e));
@@ -1768,6 +1692,10 @@ impl App {
             | KeyCode::Char('p') => {
                 self.open_pod_selector();
             },
+            // [Y] Copy all logs to clipboard
+            | KeyCode::Char('Y') => {
+                self.copy_logs_to_clipboard();
+            },
             // [x] Clear filter
             | KeyCode::Char('x') => {
                 if let Some(state) = &mut self.log_state {
@@ -1779,6 +1707,10 @@ impl App {
                 if let Some(state) = &mut self.log_state {
                     state.wrap = !state.wrap;
                 }
+            },
+            // [t] Time filter
+            | KeyCode::Char('t') => {
+                self.popup = Some(Popup::TimeFilter { buf: "30m".to_string() });
             },
             // [Enter] Open selected line in detail popup
             | KeyCode::Enter => {
@@ -1832,12 +1764,12 @@ impl App {
                     }
                 }
             },
-            | KeyCode::PageUp => {
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(state) = &mut self.log_state {
                     state.scroll_up(30);
                 }
             },
-            | KeyCode::PageDown => {
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(state) = &mut self.log_state {
                     state.scroll_down(30, visible_count);
                 }
@@ -1892,7 +1824,7 @@ impl App {
             match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&decoded)) {
                 | Ok(()) => {
                     self.error = None;
-                    self.status = format!("Copied '{}' to clipboard ({} bytes)", key_name, decoded.len());
+                    self.push_status(format!("Copied '{}' to clipboard ({} bytes)", key_name, decoded.len()));
                 },
                 | Err(e) => {
                     self.error = Some(format!("Clipboard error: {}", e));
@@ -1923,6 +1855,14 @@ impl App {
             self.handle_kubeconfig_input_key(key);
             return;
         }
+        if matches!(self.popup, Some(Popup::TimeFilter { .. })) {
+            self.handle_time_filter_key(key);
+            return;
+        }
+        if matches!(self.popup, Some(Popup::MetadataEdit { .. })) {
+            self.handle_metadata_edit_key(key);
+            return;
+        }
 
         match key.code {
             | KeyCode::Esc => {
@@ -1939,7 +1879,9 @@ impl App {
                         | Popup::ConfirmDelete { .. }
                         | Popup::ScaleInput { .. }
                         | Popup::ExecShell { .. }
-                        | Popup::KubeconfigInput { .. } => unreachable!(),
+                        | Popup::KubeconfigInput { .. }
+                        | Popup::TimeFilter { .. }
+                        | Popup::MetadataEdit { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
                     if current > 0 {
@@ -1958,12 +1900,40 @@ impl App {
                         | Popup::ConfirmDelete { .. }
                         | Popup::ScaleInput { .. }
                         | Popup::ExecShell { .. }
-                        | Popup::KubeconfigInput { .. } => unreachable!(),
+                        | Popup::KubeconfigInput { .. }
+                        | Popup::TimeFilter { .. }
+                        | Popup::MetadataEdit { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
                     if current + 1 < items_len {
                         state.select(Some(current + 1));
                     }
+                }
+            },
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(popup) = &mut self.popup {
+                    let state = match popup {
+                        | Popup::ContextSelect { state, .. }
+                        | Popup::NamespaceSelect { state, .. }
+                        | Popup::PodSelect { state, .. }
+                        | Popup::ContainerSelect { state, .. } => state,
+                        | _ => unreachable!(),
+                    };
+                    let current = state.selected().unwrap_or(0);
+                    state.select(Some(current.saturating_sub(10)));
+                }
+            },
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(popup) = &mut self.popup {
+                    let (items_len, state) = match popup {
+                        | Popup::ContextSelect { items, state }
+                        | Popup::NamespaceSelect { items, state }
+                        | Popup::PodSelect { items, state }
+                        | Popup::ContainerSelect { items, state } => (items.len(), state),
+                        | _ => unreachable!(),
+                    };
+                    let current = state.selected().unwrap_or(0);
+                    state.select(Some((current + 10).min(items_len.saturating_sub(1))));
                 }
             },
             | KeyCode::Enter => {
@@ -2011,7 +1981,9 @@ impl App {
                     | Some(Popup::ConfirmDelete { .. })
                     | Some(Popup::ScaleInput { .. })
                     | Some(Popup::ExecShell { .. })
-                    | Some(Popup::KubeconfigInput { .. }) => unreachable!(),
+                    | Some(Popup::KubeconfigInput { .. })
+                    | Some(Popup::TimeFilter { .. })
+                    | Some(Popup::MetadataEdit { .. }) => unreachable!(),
                     | None => None,
                 };
                 self.popup = None;
@@ -2100,6 +2072,16 @@ impl App {
             | KeyCode::Down | KeyCode::Char('j') => {
                 if count > 0 && self.pf_cursor < count.saturating_sub(1) {
                     self.pf_cursor += 1;
+                    self.pf_table_state.select(Some(self.pf_cursor));
+                }
+            },
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.pf_cursor = self.pf_cursor.saturating_sub(10);
+                self.pf_table_state.select(Some(self.pf_cursor));
+            },
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if count > 0 {
+                    self.pf_cursor = (self.pf_cursor + 10).min(count.saturating_sub(1));
                     self.pf_table_state.select(Some(self.pf_cursor));
                 }
             },
@@ -2269,7 +2251,7 @@ impl App {
         );
 
         self.popup = None;
-        self.status = format!("Port forward created: :{} -> :{}", local_port, remote_port);
+        self.push_status(format!("Port forward created: :{} -> :{}", local_port, remote_port));
         self.error = None;
     }
 
@@ -2314,7 +2296,10 @@ impl App {
 
         match result {
             | Ok(_) => {
-                self.status = format!("Opened shell in {}: {}/{}", terminal_app, exec.pod_name, exec.container);
+                self.push_status(format!(
+                    "Opened shell in {}: {}/{}",
+                    terminal_app, exec.pod_name, exec.container
+                ));
                 self.error = None;
             },
             | Err(e) => {
@@ -2404,7 +2389,7 @@ impl App {
         };
         match self.rt.block_on(self.kube.restart_workload(rt, &namespace, &name)) {
             | Ok(()) => {
-                self.status = format!("Restarted {}/{}", rt.display_name(), name);
+                self.push_status(format!("Restarted {}/{}", rt.display_name(), name));
                 self.error = None;
             },
             | Err(e) => {
@@ -2431,12 +2416,28 @@ impl App {
         let name = entry.name.clone();
         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&name)) {
             | Ok(()) => {
-                self.status = format!("Copied '{}'", name);
+                self.push_status(format!("Copied '{}'", name));
                 self.error = None;
             },
             | Err(e) => {
                 self.error = Some(format!("Clipboard error: {}", e));
             },
+        }
+    }
+
+    fn copy_logs_to_clipboard(&mut self) {
+        if let Some(state) = &self.log_state {
+            let visible = state.visible_lines();
+            let text = visible.join("\n");
+            let count = visible.len();
+            match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+                | Ok(()) => {
+                    self.push_status(format!("Copied {} log lines to clipboard", count));
+                },
+                | Err(e) => {
+                    self.error = Some(format!("Clipboard error: {}", e));
+                },
+            }
         }
     }
 
@@ -2480,7 +2481,7 @@ impl App {
                         error: None,
                     });
                     self.view = View::EditDiff;
-                    self.status = format!("Diff: {} vs {}", mark_name, name);
+                    self.push_status(format!("Diff: {} vs {}", mark_name, name));
                 },
                 | Err(e) => {
                     self.error = Some(format!("Failed to fetch resource: {}", e));
@@ -2492,7 +2493,10 @@ impl App {
                 | Ok(value) => {
                     let yaml = serde_yaml::to_string(&value).unwrap_or_default();
                     self.diff_mark = Some((name.clone(), namespace, yaml));
-                    self.status = format!("Marked '{}' for diff \u{2014} select another and press [d]", name);
+                    self.push_status(format!(
+                        "Marked '{}' for diff \u{2014} select another and press [d]",
+                        name
+                    ));
                     self.error = None;
                 },
                 | Err(e) => {
@@ -2517,12 +2521,12 @@ impl App {
 
     pub fn handle_create_result(&mut self, yaml: String) {
         if yaml.trim().is_empty() {
-            self.status = "Empty YAML, nothing created".into();
+            self.push_status("Empty YAML, nothing created");
             return;
         }
         match self.rt.block_on(self.kube.create_resource_yaml(&yaml)) {
             | Ok(_) => {
-                self.status = "Resource created".into();
+                self.push_status("Resource created");
                 self.error = None;
                 self.pending_load = Some(PendingLoad::Resources);
             },
@@ -2756,6 +2760,14 @@ impl App {
                     self.palette_cursor += 1;
                 }
             },
+            | KeyCode::PageUp => {
+                self.palette_cursor = self.palette_cursor.saturating_sub(10);
+            },
+            | KeyCode::PageDown => {
+                if !self.palette_results.is_empty() {
+                    self.palette_cursor = (self.palette_cursor + 10).min(self.palette_results.len().saturating_sub(1));
+                }
+            },
             | KeyCode::Backspace => {
                 self.palette_buf.pop();
                 self.palette_cursor = 0;
@@ -2776,7 +2788,7 @@ impl App {
             | PaletteCommand::Scale => self.open_scale_input(),
             | PaletteCommand::Delete => self.open_delete_confirm(),
             | PaletteCommand::PortForward => self.open_port_forward_dialog(),
-            | PaletteCommand::Exec => self.open_exec_shell(true),
+            | PaletteCommand::Exec => self.open_exec_shell(),
             | PaletteCommand::Create => self.start_create_resource(),
             | PaletteCommand::SwitchContext => self.open_context_selector(),
             | PaletteCommand::SwitchNamespace => {
@@ -2804,12 +2816,17 @@ impl App {
             // Global
             ("Ctrl+C", "Force quit", "Global"),
             ("q", "Quit / back", "Global"),
-            ("Esc", "Back / dismiss", "Global"),
-            ("?", "Help (this palette)", "Global"),
+            ("Esc", "Back / dismiss popup or selection", "Global"),
+            ("?", "Help (this screen)", "Global"),
             ("Ctrl+P", "Command palette", "Global"),
             ("p", "Pause/resume auto-refresh", "Global"),
             // Main view - navigation
-            ("j/k", "Navigate sidebar or resource table", "Main"),
+            ("j / Down", "Move down in sidebar or table", "Main"),
+            ("k / Up", "Move up in sidebar or table", "Main"),
+            ("Ctrl+d / PgDn", "Page down in table", "Main"),
+            ("Ctrl+u / PgUp", "Page up in table", "Main"),
+            ("g / Home", "Jump to top of list", "Main"),
+            ("G / End", "Jump to bottom of list", "Main"),
             ("Enter", "Open detail / focus right panel", "Main"),
             ("Tab", "Toggle sidebar / table focus", "Main"),
             ("r", "Focus resource table", "Main"),
@@ -2828,41 +2845,61 @@ impl App {
             ("y", "Copy resource name", "Main"),
             ("d", "Mark / diff resources", "Main"),
             ("C", "Create new resource", "Main"),
-            // Detail view
+            // Detail view - navigation
+            ("j / Down", "Scroll down or navigate entries", "Detail"),
+            ("k / Up", "Scroll up or navigate entries", "Detail"),
+            ("Ctrl+d / PgDn", "Page down", "Detail"),
+            ("Ctrl+u / PgUp", "Page up", "Detail"),
+            ("Home", "Jump to top", "Detail"),
+            // Detail view - actions
             ("v", "Cycle Smart / YAML view", "Detail"),
-            ("j/k", "Scroll or navigate entries", "Detail"),
             ("s", "Enter/leave label selection", "Detail"),
-            ("Space", "Expand/collapse or decode", "Detail"),
+            ("Enter", "Edit selected label/annotation", "Detail"),
+            ("Space", "Expand/collapse or decode secret", "Detail"),
             ("y", "Copy value or YAML", "Detail"),
-            ("e", "Edit resource", "Detail"),
-            ("l", "Open logs", "Detail"),
+            ("e", "Edit resource ($EDITOR)", "Detail"),
+            ("l", "Open logs (workloads)", "Detail"),
             ("F", "Port forward", "Detail"),
             ("D", "Delete resource", "Detail"),
             ("R", "Restart workload", "Detail"),
             ("S", "Scale workload", "Detail"),
-            ("w", "Toggle watch mode", "Detail"),
-            // Log view
+            ("w", "Toggle watch mode (auto-refresh)", "Detail"),
+            ("Tab", "Toggle related resources selection", "Detail"),
+            // Log view - navigation
+            ("j / Down", "Move cursor down", "Logs"),
+            ("k / Up", "Move cursor up", "Logs"),
+            ("Ctrl+d / PgDn", "Page down", "Logs"),
+            ("Ctrl+u / PgUp", "Page up", "Logs"),
+            ("g / Home", "Jump to top", "Logs"),
+            ("G / End", "Jump to bottom", "Logs"),
+            // Log view - actions
             ("f", "Toggle follow (live streaming)", "Logs"),
             ("/", "Filter by regex", "Logs"),
             ("x", "Clear filter", "Logs"),
             ("p", "Select pod", "Logs"),
             ("c", "Select container", "Logs"),
-            ("G/g", "Jump to bottom/top", "Logs"),
+            ("w", "Toggle line wrapping", "Logs"),
+            ("t", "Set time filter", "Logs"),
+            ("Y", "Copy all logs to clipboard", "Logs"),
+            ("Enter", "Open selected line detail", "Logs"),
             // Edit diff
-            ("v", "Cycle inline / side-by-side", "Edit Diff"),
-            ("Enter", "Apply changes", "Edit Diff"),
-            ("e", "Re-edit", "Edit Diff"),
+            ("v", "Cycle inline / side-by-side diff", "Edit Diff"),
+            ("j / Down", "Scroll down", "Edit Diff"),
+            ("k / Up", "Scroll up", "Edit Diff"),
+            ("Ctrl+d / PgDn", "Page down", "Edit Diff"),
+            ("Ctrl+u / PgUp", "Page up", "Edit Diff"),
+            ("Enter", "Apply changes to cluster", "Edit Diff"),
+            ("e", "Re-edit in $EDITOR", "Edit Diff"),
             // Port forwards
-            ("j/k", "Navigate list", "Port Forwards"),
-            ("p", "Pause/resume forward", "Port Forwards"),
-            ("d", "Cancel forward", "Port Forwards"),
+            ("j / Down", "Navigate list", "Port Forwards"),
+            ("k / Up", "Navigate list", "Port Forwards"),
+            ("p", "Pause/resume selected forward", "Port Forwards"),
+            ("d", "Cancel (delete) selected forward", "Port Forwards"),
         ];
 
         if self.experimental {
-            entries.push(("x", "Exec shell ($TERMINAL/$TERM_PROGRAM)", "Main"));
-            entries.push(("X", "Exec custom cmd/terminal", "Main"));
-            entries.push(("x", "Exec shell ($TERMINAL/$TERM_PROGRAM)", "Detail"));
-            entries.push(("X", "Exec custom cmd/terminal", "Detail"));
+            entries.push(("x", "Exec into pod", "Main"));
+            entries.push(("x", "Exec into pod", "Detail"));
         }
 
         entries
@@ -2887,15 +2924,24 @@ impl App {
             | KeyCode::Esc => {
                 self.help_open = false;
             },
-            | KeyCode::Up => {
+            | KeyCode::Up | KeyCode::Char('k') => {
                 if self.help_cursor > 0 {
                     self.help_cursor -= 1;
                 }
             },
-            | KeyCode::Down => {
+            | KeyCode::Down | KeyCode::Char('j') => {
                 let count = self.filtered_help_entries().len();
                 if count > 0 && self.help_cursor < count.saturating_sub(1) {
                     self.help_cursor += 1;
+                }
+            },
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.help_cursor = self.help_cursor.saturating_sub(10);
+            },
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let count = self.filtered_help_entries().len();
+                if count > 0 {
+                    self.help_cursor = (self.help_cursor + 10).min(count.saturating_sub(1));
                 }
             },
             | KeyCode::Backspace => {
@@ -2967,7 +3013,7 @@ impl App {
                 self.popup = None;
                 match self.rt.block_on(self.kube.delete_resource(rt, &namespace, &name)) {
                     | Ok(()) => {
-                        self.status = format!("Deleted {}/{}", rt.display_name(), name);
+                        self.push_status(format!("Deleted {}/{}", rt.display_name(), name));
                         self.error = None;
                         if self.view == View::Detail {
                             self.view = View::Main;
@@ -3075,7 +3121,12 @@ impl App {
                     .block_on(self.kube.scale_resource(rt, &namespace, &name, replicas))
                 {
                     | Ok(()) => {
-                        self.status = format!("Scaled {}/{} to {} replicas", rt.display_name(), name, replicas);
+                        self.push_status(format!(
+                            "Scaled {}/{} to {} replicas",
+                            rt.display_name(),
+                            name,
+                            replicas
+                        ));
                         self.error = None;
                         self.pending_load = Some(PendingLoad::Resources);
                     },
@@ -3137,7 +3188,7 @@ impl App {
                         self.cluster_stats_scroll = 0;
                         self.pending_load = Some(PendingLoad::ClusterStats);
                         self.error = None;
-                        self.status = "Kubeconfig loaded".into();
+                        self.push_status("Kubeconfig loaded");
                         // Re-select overview
                         let first = self
                             .nav_items
@@ -3172,7 +3223,7 @@ impl App {
     // Exec
     // -----------------------------------------------------------------------
 
-    fn open_exec_shell(&mut self, custom_command: bool) {
+    fn open_exec_shell(&mut self) {
         let rt = match self.selected_resource_type {
             | Some(rt) if rt.supports_exec() => rt,
             | _ => return,
@@ -3197,27 +3248,15 @@ impl App {
                 let pod = &pods[0];
                 let pod_name = pod.name.clone();
                 let containers = pod.containers.clone();
-                if custom_command {
-                    // Show popup to choose container and enter command
-                    self.popup = Some(Popup::ExecShell {
-                        pod_name,
-                        namespace,
-                        containers,
-                        container_cursor: 0,
-                        command_buf: "/bin/sh".to_string(),
-                        terminal_buf: resolve_terminal_app().unwrap_or_default(),
-                        editing_terminal: false,
-                    });
-                } else {
-                    // Direct exec with /bin/sh into first container
-                    let container = containers.first().cloned().unwrap_or_default();
-                    self.pending_exec = Some(PendingExec {
-                        pod_name,
-                        namespace,
-                        container,
-                        command: vec!["/bin/sh".to_string()],
-                    });
-                }
+                self.popup = Some(Popup::ExecShell {
+                    pod_name,
+                    namespace,
+                    containers,
+                    container_cursor: 0,
+                    command_buf: "/bin/sh".to_string(),
+                    terminal_buf: resolve_terminal_app().unwrap_or_default(),
+                    editing_terminal: false,
+                });
             },
             | Ok(_) => {
                 self.error = Some("No pods found for this resource".into());
@@ -3393,7 +3432,7 @@ impl App {
     /// Called by the event loop after the editor exits. Computes the diff.
     pub fn handle_edit_result(&mut self, edit: PendingEdit, edited_yaml: String) {
         if edited_yaml.trim() == edit.yaml.trim() {
-            self.status = "No changes".into();
+            self.push_status("No changes");
             return;
         }
 
@@ -3458,12 +3497,12 @@ impl App {
                     ctx.scroll = ctx.scroll.saturating_add(1);
                 }
             },
-            | KeyCode::PageUp => {
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(ctx) = &mut self.edit_ctx {
                     ctx.scroll = ctx.scroll.saturating_sub(20);
                 }
             },
-            | KeyCode::PageDown => {
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(ctx) = &mut self.edit_ctx {
                     ctx.scroll = ctx.scroll.saturating_add(20);
                 }
@@ -3484,7 +3523,7 @@ impl App {
 
         match self.rt.block_on(self.kube.replace_resource_yaml(rt, &ns, &name, &yaml)) {
             | Ok(value) => {
-                self.status = format!("Applied changes to {}/{}", rt.display_name(), name);
+                self.push_status(format!("Applied changes to {}/{}", rt.display_name(), name));
                 self.error = None;
                 // Refresh the detail view with updated data
                 self.detail_yaml = serde_yaml::to_string(&value).unwrap_or_default();
@@ -3499,6 +3538,306 @@ impl App {
                 if let Some(ctx) = &mut self.edit_ctx {
                     ctx.error = Some(format!("{}", e));
                 }
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Time filter popup
+    // -----------------------------------------------------------------------
+
+    fn handle_time_filter_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Enter => {
+                let buf = match &self.popup {
+                    | Some(Popup::TimeFilter { buf }) => buf.clone(),
+                    | _ => return,
+                };
+                self.popup = None;
+                let seconds = parse_duration_to_seconds(&buf);
+                if seconds == 0 {
+                    self.error = Some("Invalid duration. Use e.g. 30m, 2h, 1h30m".into());
+                    return;
+                }
+                if let Some(state) = &mut self.log_state {
+                    state.since_seconds = Some(seconds);
+                }
+                self.pending_load = Some(PendingLoad::ReloadLogs);
+                self.push_status(format!("Log time filter: last {}", buf));
+            },
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Backspace => {
+                if let Some(Popup::TimeFilter { buf, .. }) = &mut self.popup {
+                    buf.pop();
+                }
+            },
+            | KeyCode::Char(c) => {
+                if let Some(Popup::TimeFilter { buf, .. }) = &mut self.popup {
+                    buf.push(c);
+                }
+            },
+            | _ => {},
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata edit popup (annotations / labels)
+    // -----------------------------------------------------------------------
+
+    fn open_metadata_edit(&mut self, kind: MetadataEditKind) {
+        let rt = match self.selected_resource_type {
+            | Some(rt) => rt,
+            | None => return,
+        };
+        let field = match kind {
+            | MetadataEditKind::Labels => "labels",
+            | MetadataEditKind::Annotations => "annotations",
+        };
+        let entries: Vec<(String, String)> = self
+            .detail_value
+            .get("metadata")
+            .and_then(|m| m.get(field))
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                let mut pairs: Vec<(String, String)> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .collect();
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                pairs
+            })
+            .unwrap_or_default();
+        self.popup = Some(Popup::MetadataEdit {
+            kind,
+            resource_type: rt,
+            name: self.detail_name.clone(),
+            namespace: self.detail_namespace.clone(),
+            entries,
+            cursor: 0,
+            mode: MetadataEditMode::Browse,
+            key_buf: String::new(),
+            value_buf: String::new(),
+        });
+    }
+
+    fn handle_metadata_edit_key(&mut self, key: KeyEvent) {
+        let mode = match &self.popup {
+            | Some(Popup::MetadataEdit { mode, .. }) => *mode,
+            | _ => return,
+        };
+        match mode {
+            | MetadataEditMode::Browse => {
+                match key.code {
+                    | KeyCode::Esc => {
+                        self.popup = None;
+                    },
+                    | KeyCode::Up | KeyCode::Char('k') => {
+                        if let Some(Popup::MetadataEdit { cursor, .. }) = &mut self.popup {
+                            *cursor = cursor.saturating_sub(1);
+                        }
+                    },
+                    | KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some(Popup::MetadataEdit { entries, cursor, .. }) = &mut self.popup {
+                            if *cursor + 1 < entries.len() {
+                                *cursor += 1;
+                            }
+                        }
+                    },
+                    | KeyCode::Char('a') => {
+                        if let Some(Popup::MetadataEdit {
+                            mode,
+                            key_buf,
+                            value_buf,
+                            ..
+                        }) = &mut self.popup
+                        {
+                            *mode = MetadataEditMode::AddKey;
+                            key_buf.clear();
+                            value_buf.clear();
+                        }
+                    },
+                    | KeyCode::Char('d') => {
+                        self.delete_metadata_entry();
+                    },
+                    | KeyCode::Enter => {
+                        if let Some(Popup::MetadataEdit {
+                            entries,
+                            cursor,
+                            mode,
+                            value_buf,
+                            ..
+                        }) = &mut self.popup
+                        {
+                            if let Some((_, val)) = entries.get(*cursor) {
+                                *value_buf = val.clone();
+                                *mode = MetadataEditMode::EditValue;
+                            }
+                        }
+                    },
+                    | _ => {},
+                }
+            },
+            | MetadataEditMode::AddKey => {
+                match key.code {
+                    | KeyCode::Esc => {
+                        if let Some(Popup::MetadataEdit { mode, .. }) = &mut self.popup {
+                            *mode = MetadataEditMode::Browse;
+                        }
+                    },
+                    | KeyCode::Enter => {
+                        if let Some(Popup::MetadataEdit { mode, key_buf, .. }) = &mut self.popup {
+                            if !key_buf.is_empty() {
+                                *mode = MetadataEditMode::AddValue;
+                            }
+                        }
+                    },
+                    | KeyCode::Backspace => {
+                        if let Some(Popup::MetadataEdit { key_buf, .. }) = &mut self.popup {
+                            key_buf.pop();
+                        }
+                    },
+                    | KeyCode::Char(c) => {
+                        if let Some(Popup::MetadataEdit { key_buf, .. }) = &mut self.popup {
+                            key_buf.push(c);
+                        }
+                    },
+                    | _ => {},
+                }
+            },
+            | MetadataEditMode::AddValue | MetadataEditMode::EditValue => {
+                match key.code {
+                    | KeyCode::Esc => {
+                        if let Some(Popup::MetadataEdit { mode, .. }) = &mut self.popup {
+                            *mode = MetadataEditMode::Browse;
+                        }
+                    },
+                    | KeyCode::Enter => {
+                        self.apply_metadata_edit();
+                    },
+                    | KeyCode::Backspace => {
+                        if let Some(Popup::MetadataEdit { value_buf, .. }) = &mut self.popup {
+                            value_buf.pop();
+                        }
+                    },
+                    | KeyCode::Char(c) => {
+                        if let Some(Popup::MetadataEdit { value_buf, .. }) = &mut self.popup {
+                            value_buf.push(c);
+                        }
+                    },
+                    | _ => {},
+                }
+            },
+        }
+    }
+
+    fn apply_metadata_edit(&mut self) {
+        let (kind, rt, name, namespace, key, value) = match &self.popup {
+            | Some(Popup::MetadataEdit {
+                kind,
+                resource_type,
+                name,
+                namespace,
+                mode,
+                key_buf,
+                value_buf,
+                entries,
+                cursor,
+            }) => {
+                let key = match mode {
+                    | MetadataEditMode::AddValue => key_buf.clone(),
+                    | MetadataEditMode::EditValue => entries.get(*cursor).map(|(k, _)| k.clone()).unwrap_or_default(),
+                    | _ => return,
+                };
+                (
+                    *kind,
+                    *resource_type,
+                    name.clone(),
+                    namespace.clone(),
+                    key,
+                    value_buf.clone(),
+                )
+            },
+            | _ => return,
+        };
+        let mut map = serde_json::Map::new();
+        map.insert(key.clone(), Value::String(value));
+        let result = match kind {
+            | MetadataEditKind::Labels => {
+                self.rt
+                    .block_on(self.kube.patch_metadata(rt, &namespace, &name, Some(&map), None))
+            },
+            | MetadataEditKind::Annotations => {
+                self.rt
+                    .block_on(self.kube.patch_metadata(rt, &namespace, &name, None, Some(&map)))
+            },
+        };
+        match result {
+            | Ok(_) => {
+                let kind_label = if kind == MetadataEditKind::Labels {
+                    "label"
+                } else {
+                    "annotation"
+                };
+                self.push_status(format!("Updated {} '{}' on {}", kind_label, key, name));
+                self.error = None;
+                self.pending_load = Some(PendingLoad::ResourceDetail {
+                    name: name.clone(),
+                    namespace: namespace.clone(),
+                });
+                self.popup = None;
+            },
+            | Err(e) => {
+                self.error = Some(format!("Patch failed: {}", e));
+            },
+        }
+    }
+
+    fn delete_metadata_entry(&mut self) {
+        let (kind, rt, name, namespace, key) = match &self.popup {
+            | Some(Popup::MetadataEdit {
+                kind,
+                resource_type,
+                name,
+                namespace,
+                entries,
+                cursor,
+                ..
+            }) => {
+                let key = entries.get(*cursor).map(|(k, _)| k.clone()).unwrap_or_default();
+                (*kind, *resource_type, name.clone(), namespace.clone(), key)
+            },
+            | _ => return,
+        };
+        if key.is_empty() {
+            return;
+        }
+        let mut map = serde_json::Map::new();
+        map.insert(key.clone(), Value::Null); // null = remove in merge patch
+        let result = match kind {
+            | MetadataEditKind::Labels => {
+                self.rt
+                    .block_on(self.kube.patch_metadata(rt, &namespace, &name, Some(&map), None))
+            },
+            | MetadataEditKind::Annotations => {
+                self.rt
+                    .block_on(self.kube.patch_metadata(rt, &namespace, &name, None, Some(&map)))
+            },
+        };
+        match result {
+            | Ok(_) => {
+                let kind_label = if kind == MetadataEditKind::Labels {
+                    "label"
+                } else {
+                    "annotation"
+                };
+                self.push_status(format!("Removed {} '{}' from {}", kind_label, key, name));
+                self.popup = None;
+                self.pending_load = Some(PendingLoad::ResourceDetail { name, namespace });
+            },
+            | Err(e) => {
+                self.error = Some(format!("Patch failed: {}", e));
             },
         }
     }
@@ -3529,4 +3868,38 @@ fn compute_diff(original: &str, edited: &str) -> Vec<(DiffKind, String)> {
         lines.push((kind, format!("{} {}", prefix, change.value().trim_end())));
     }
     lines
+}
+
+// ---------------------------------------------------------------------------
+// Duration parsing (e.g. "30m", "2h", "1h30m", "1d")
+// ---------------------------------------------------------------------------
+
+fn parse_duration_to_seconds(s: &str) -> i64 {
+    let mut total: i64 = 0;
+    let mut num_buf = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num_buf.push(c);
+        } else {
+            let n: i64 = num_buf.parse().unwrap_or(0);
+            num_buf.clear();
+            match c {
+                | 'h' | 'H' => total += n * 3600,
+                | 'm' | 'M' => total += n * 60,
+                | 's' | 'S' => total += n,
+                | 'd' | 'D' => total += n * 86400,
+                | _ => {},
+            }
+        }
+    }
+    // If only digits remain, treat as minutes when no unit was parsed yet
+    if !num_buf.is_empty() {
+        let n: i64 = num_buf.parse().unwrap_or(0);
+        if total == 0 {
+            total = n * 60;
+        } else {
+            total += n;
+        }
+    }
+    total
 }

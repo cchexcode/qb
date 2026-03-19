@@ -7,11 +7,7 @@ use {
     crate::k8s::KubeClient,
     anyhow::Result,
     crossterm::{
-        event::{
-            self,
-            DisableMouseCapture,
-            EnableMouseCapture,
-        },
+        event,
         execute,
         terminal::{
             disable_raw_mode,
@@ -41,14 +37,14 @@ pub async fn run(
 fn run_tui(kube_client: KubeClient, rt: tokio::runtime::Handle, experimental: bool) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_event_loop(&mut terminal, kube_client, rt, experimental);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -83,9 +79,6 @@ fn run_event_loop(
                     if key.kind == event::KeyEventKind::Press {
                         app.handle_key(key);
                     }
-                },
-                | event::Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse);
                 },
                 | _ => {},
             }
@@ -123,7 +116,7 @@ fn run_external_editor(
 
     // Suspend TUI
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     // Resolve editor: $EDITOR → vim → vi
@@ -143,7 +136,7 @@ fn run_external_editor(
 
     // Restore TUI
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     // Force full redraw
     terminal.clear()?;
 
@@ -172,7 +165,7 @@ fn run_create_editor(
 
     // Suspend TUI
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
@@ -188,7 +181,7 @@ fn run_create_editor(
 
     // Restore TUI
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.clear()?;
 
     match status {

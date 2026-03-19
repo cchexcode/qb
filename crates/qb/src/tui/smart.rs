@@ -21,9 +21,6 @@ pub struct SecretDetailState {
     pub values: HashMap<String, String>,
     pub selected: usize,
     pub decoded: HashSet<String>,
-    /// Line index (within the rendered output) where each key row starts.
-    /// Populated by `render_secret` each frame.
-    pub key_line_offsets: Vec<usize>,
 }
 
 impl SecretDetailState {
@@ -42,7 +39,26 @@ impl SecretDetailState {
             values,
             selected: 0,
             decoded: HashSet::new(),
-            key_line_offsets: Vec::new(),
+        }
+    }
+
+    pub fn update_values(&mut self, v: &Value) {
+        if let Some(data) = v.get("data").and_then(|d| d.as_object()) {
+            let mut new_keys = Vec::new();
+            let mut new_values = HashMap::new();
+            for (k, v) in data {
+                new_keys.push(k.clone());
+                new_values.insert(k.clone(), v.as_str().unwrap_or("").to_string());
+            }
+            new_keys.sort();
+            self.keys = new_keys;
+            self.values = new_values;
+            // Clamp selection
+            if !self.keys.is_empty() {
+                self.selected = self.selected.min(self.keys.len() - 1);
+            }
+            // Remove decoded entries for keys that no longer exist
+            self.decoded.retain(|k| self.keys.contains(k));
         }
     }
 
@@ -270,14 +286,64 @@ fn render_pod(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
             let name = cs.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let image = cs.get("image").and_then(|v| v.as_str()).unwrap_or("");
             let ready = cs.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
-            let restarts = cs.get("restartCount").and_then(|v| v.as_i64()).unwrap_or(0);
             let state = container_state_str(cs.get("state"));
 
             subheading(&mut l, &format!("▸ {}", name));
             field(&mut l, "    Image", image);
             field(&mut l, "    State", &state);
+            if let Some(last) = cs.get("lastState") {
+                let last_str = container_state_str(Some(last));
+                if last_str != "Unknown" && last_str != "Waiting" {
+                    l.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:<w$}", "    Last State", w = 18),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(last_str, Style::default().fg(Color::Yellow)),
+                    ]));
+                    if let Some(terminated) = last.get("terminated") {
+                        if let Some(reason) = terminated.get("reason").and_then(|v| v.as_str()) {
+                            let exit_code = terminated.get("exitCode").and_then(|v| v.as_i64()).unwrap_or(-1);
+                            let finished = terminated.get("finishedAt").and_then(|v| v.as_str()).unwrap_or("");
+                            l.push(Line::from(vec![
+                                Span::styled(
+                                    format!("{:<w$}", "    Reason", w = 18),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::styled(
+                                    format!("{} (exit code: {})", reason, exit_code),
+                                    Style::default().fg(Color::Red),
+                                ),
+                            ]));
+                            if !finished.is_empty() {
+                                l.push(Line::from(vec![
+                                    Span::styled(
+                                        format!("{:<w$}", "    Finished", w = 18),
+                                        Style::default().fg(Color::DarkGray),
+                                    ),
+                                    Span::styled(finished.to_string(), Style::default().fg(Color::White)),
+                                ]));
+                            }
+                        }
+                    }
+                }
+            }
             field(&mut l, "    Ready", if ready { "true" } else { "false" });
-            field(&mut l, "    Restarts", &restarts.to_string());
+            let restarts = cs.get("restartCount").and_then(|v| v.as_i64()).unwrap_or(0);
+            if restarts > 0 {
+                let restart_style = if restarts > 5 {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                l.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<w$}", "    Restarts", w = 18),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(format!("{}", restarts), restart_style),
+                ]));
+            }
         }
     } else {
         // Fall back to spec containers if no status yet
@@ -418,12 +484,7 @@ fn render_secret(v: &Value, state: Option<&mut SecretDetailState>, ds: &mut Dict
     section(&mut l, &format!("Data ({} keys)", state.keys.len()));
 
     // Record the line offset where each key starts
-    state.key_line_offsets.clear();
-
     for (i, key) in state.keys.iter().enumerate() {
-        // Record this key's line offset for click mapping
-        state.key_line_offsets.push(l.len());
-
         let is_selected = i == state.selected;
         let is_decoded = state.decoded.contains(key);
         let b64 = state.values.get(key).map(|s| s.as_str()).unwrap_or("");
@@ -1018,6 +1079,23 @@ fn render_node(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
         field(&mut l, "Status", if ready == "True" { "Ready" } else { "NotReady" });
     }
 
+    // Resource pressure warnings
+    if let Some(conds) = jget(v, "status.conditions").and_then(|v| v.as_array()) {
+        for ptype in &["DiskPressure", "MemoryPressure", "PIDPressure"] {
+            if let Some(cond) = conds
+                .iter()
+                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some(ptype))
+            {
+                if cond.get("status").and_then(|s| s.as_str()) == Some("True") {
+                    l.push(Line::from(Span::styled(
+                        format!("  ⚠ {} ACTIVE", ptype),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )));
+                }
+            }
+        }
+    }
+
     // Roles
     if let Some(labels) = jget(v, "metadata.labels").and_then(|v| v.as_object()) {
         let roles: Vec<&str> = labels
@@ -1116,11 +1194,11 @@ fn render_event(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
         field(&mut l, "Reason", &reason);
     }
 
-    let message = js(v, "message");
-    if !message.is_empty() {
+    let note = js(v, "note");
+    if !note.is_empty() {
         blank(&mut l);
         section(&mut l, "Message");
-        for line in message.lines() {
+        for line in note.lines() {
             l.push(Line::from(Span::styled(
                 format!("  {}", line),
                 Style::default().fg(Color::White),
@@ -1128,12 +1206,12 @@ fn render_event(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
         }
     }
 
-    let obj_kind = js(v, "involvedObject.kind");
-    let obj_name = js(v, "involvedObject.name");
-    let obj_ns = js(v, "involvedObject.namespace");
+    let obj_kind = js(v, "regarding.kind");
+    let obj_name = js(v, "regarding.name");
+    let obj_ns = js(v, "regarding.namespace");
     if !obj_name.is_empty() {
         blank(&mut l);
-        section(&mut l, "Involved Object");
+        section(&mut l, "Regarding");
         field(&mut l, "Kind", &obj_kind);
         field(&mut l, "Name", &obj_name);
         if !obj_ns.is_empty() {
@@ -1141,30 +1219,21 @@ fn render_event(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
         }
     }
 
-    let count = ji(v, "count");
+    // Series count (modern) or deprecated count
+    let series_count = ji(v, "series.count");
+    let count = series_count.or_else(|| ji(v, "deprecatedCount"));
     if let Some(c) = count {
         field(&mut l, "Count", &c.to_string());
     }
 
-    let first = js(v, "firstTimestamp");
-    if !first.is_empty() {
-        field(&mut l, "First Seen", &first);
+    let event_time = js(v, "eventTime");
+    if !event_time.is_empty() {
+        field(&mut l, "Event Time", &event_time);
     }
 
-    let last = js(v, "lastTimestamp");
-    if !last.is_empty() {
-        field(&mut l, "Last Seen", &last);
-    }
-
-    let source_component = js(v, "source.component");
-    let source_host = js(v, "source.host");
-    if !source_component.is_empty() {
-        let source = if source_host.is_empty() {
-            source_component
-        } else {
-            format!("{}, {}", source_component, source_host)
-        };
-        field(&mut l, "Source", &source);
+    let reporting = js(v, "reportingController");
+    if !reporting.is_empty() {
+        field(&mut l, "Reporting", &reporting);
     }
 
     l
@@ -1307,34 +1376,75 @@ fn conditions_section(l: &mut Vec<Line<'static>>, v: &Value) {
         | _ => return,
     };
 
+    const POSITIVE_CONDITIONS: &[&str] = &[
+        "Ready",
+        "Available",
+        "Progressing",
+        "Initialized",
+        "ContainersReady",
+        "PodScheduled",
+    ];
+    const NEGATIVE_CONDITIONS: &[&str] = &["DiskPressure", "MemoryPressure", "PIDPressure", "NetworkUnavailable"];
+
     blank(l);
     section(l, "Conditions");
 
     // Compute column widths from data
     let mut type_w = 4usize; // "TYPE"
     let mut status_w = 6usize; // "STATUS"
+    let mut reason_w = 6usize; // "REASON"
+    let mut transition_w = 15usize; // "LAST TRANSITION"
     for c in conditions {
         let ctype = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let status = c.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let reason = c.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        let transition = c
+            .get("lastTransitionTime")
+            .and_then(|v| v.as_str())
+            .map(format_age_from_str)
+            .unwrap_or_default();
         type_w = type_w.max(ctype.len());
         status_w = status_w.max(status.len());
+        reason_w = reason_w.max(reason.len());
+        transition_w = transition_w.max(transition.len());
     }
     type_w += 2; // padding
     status_w += 2;
+    reason_w += 2;
+    transition_w += 2;
 
     // Header
     l.push(Line::from(vec![
         Span::styled(format!("  {:<type_w$}", "TYPE"), Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{:<status_w$}", "STATUS"), Style::default().fg(Color::DarkGray)),
-        Span::styled("REASON", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:<reason_w$}", "REASON"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<transition_w$}", "LAST TRANSITION"),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]));
 
     for c in conditions {
         let ctype = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let status = c.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let reason = c.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        let message = c.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let transition = c
+            .get("lastTransitionTime")
+            .and_then(|v| v.as_str())
+            .map(format_age_from_str)
+            .unwrap_or_default();
 
-        let status_style = if status == "True" {
+        let is_positive = POSITIVE_CONDITIONS.contains(&ctype);
+        let is_negative = NEGATIVE_CONDITIONS.contains(&ctype);
+
+        let status_style = if status == "True" && is_positive {
+            Style::default().fg(Color::Green)
+        } else if status == "True" && is_negative {
+            Style::default().fg(Color::Red)
+        } else if status == "False" && is_positive {
+            Style::default().fg(Color::Red)
+        } else if status == "True" {
             Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::Red)
@@ -1343,8 +1453,16 @@ fn conditions_section(l: &mut Vec<Line<'static>>, v: &Value) {
         l.push(Line::from(vec![
             Span::styled(format!("  {:<type_w$}", ctype), Style::default().fg(Color::White)),
             Span::styled(format!("{:<status_w$}", status), status_style),
-            Span::styled(reason.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:<reason_w$}", reason), Style::default().fg(Color::DarkGray)),
+            Span::styled(transition, Style::default().fg(Color::DarkGray)),
         ]));
+
+        if !message.is_empty() {
+            l.push(Line::from(Span::styled(
+                format!("    {}", message),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 }
 
@@ -1501,6 +1619,28 @@ fn wrap_str(s: &str, width: usize) -> Vec<&str> {
 
 fn blank(l: &mut Vec<Line<'static>>) {
     l.push(Line::from(""));
+}
+
+fn format_age_from_str(ts: &str) -> String {
+    match jiff::Timestamp::strptime("%Y-%m-%dT%H:%M:%SZ", ts).or_else(|_| ts.parse::<jiff::Timestamp>()) {
+        | Ok(t) => {
+            let dur = jiff::Timestamp::now().duration_since(t);
+            let secs = dur.as_secs().max(0);
+            let days = secs / 86400;
+            let hours = (secs % 86400) / 3600;
+            let mins = (secs % 3600) / 60;
+            if days > 0 {
+                format!("{}d ago", days)
+            } else if hours > 0 {
+                format!("{}h ago", hours)
+            } else if mins > 0 {
+                format!("{}m ago", mins)
+            } else {
+                format!("{}s ago", secs)
+            }
+        },
+        | Err(_) => ts.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------

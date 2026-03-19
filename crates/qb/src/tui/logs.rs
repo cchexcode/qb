@@ -41,6 +41,9 @@ pub struct LogViewState {
     pub selected_pod: Option<usize>,       // None = all pods
     pub selected_container: Option<usize>, // None = all containers (scoped to selected_pod if set)
     pub namespace: String,
+
+    // Time-based filter (only fetch logs from last N seconds)
+    pub since_seconds: Option<i64>,
 }
 
 impl LogViewState {
@@ -62,6 +65,7 @@ impl LogViewState {
             selected_pod: None,
             selected_container: None,
             namespace,
+            since_seconds: None,
         }
     }
 

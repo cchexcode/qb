@@ -6,9 +6,9 @@
 
 ## Project
 
-qb is a ratatui-based terminal UI for browsing and editing Kubernetes clusters. It talks
-directly to the K8s API server via the `kube` crate using kubeconfig — no kubectl dependency.
-Single binary, no external frontend, no remote services.
+qb is EMACS for Kubernetes — a powerful, extensible ratatui-based terminal UI for managing
+Kubernetes clusters. It talks directly to the K8s API server via the `kube` crate using
+kubeconfig — no kubectl dependency. Single binary, no external frontend, no remote services.
 
 **Workspace layout**: `crates/qb/` is the sole crate. Workspace root at `Cargo.toml`.
 
@@ -22,7 +22,7 @@ crates/qb/src/
                    port extraction helpers, pause/resume/cancel lifecycle
   tui/mod.rs       Terminal setup, event loop (render → load → poll logs → poll pf → poll input),
                    external editor invocation (suspend/resume terminal)
-  tui/app.rs       App struct (all state), key/mouse handlers, deferred loading, filter state,
+  tui/app.rs       App struct (all state), key handlers, deferred loading, filter state,
                    dict entry selection/expansion, edit flow (diff, apply, re-edit),
                    port forward dialog + creation flow
   tui/ui.rs        Rendering: main view, detail view, log view, events log, cluster stats,
@@ -47,8 +47,8 @@ crates/qb/src/
    Breadcrumb shows refresh timestamp right-aligned. `p` pauses/resumes globally.
 6. **Smart then YAML** — Detail views open in Smart mode (typed, structured rendering per resource
    type). `v` cycles between Smart and YAML views.
-7. **Keyboard-first, mouse-supported** — Gitui-inspired hotkey bar at the bottom. All actions are
-   keyboard-accessible. Mouse clicks and scroll wheel work as a convenience layer.
+7. **Keyboard-only** — Gitui-inspired hotkey bar at the bottom. All navigation uses vim-style
+   bindings (j/k, Ctrl+d/u, g/G). No mouse support.
 8. **Breadcrumb always visible** — Top bar shows `cluster > namespace > type > resource > logs` in
    every view, plus a right-aligned refresh indicator (`⟳ just now` / `⟳ Ns ago` / `⏸ paused`).
 9. **Cluster stats as default view** — App starts on the Overview panel showing cluster-wide
@@ -62,81 +62,113 @@ crates/qb/src/
 
 ## Key Bindings Summary
 
+Keyboard-only. All navigation uses vim-style bindings.
+
 ### Global
 
 | Key | Action |
 |-----|--------|
 | `Ctrl+C` | Force quit |
 | `q` | Quit / back |
-| `Esc` | Back / dismiss |
+| `Esc` | Back / dismiss popup or selection |
+| `?` | Help |
+| `Ctrl+P` | Command palette |
 | `p` | Pause/resume auto-refresh (except log view, port forwards view) |
 
 ### Main View
 
 | Key | Action |
 |-----|--------|
-| `j`/`k` | Navigate sidebar (loads immediately) or resource table |
+| `j` / `Down` | Move down in sidebar or resource table |
+| `k` / `Up` | Move up in sidebar or resource table |
+| `Ctrl+d` / `PgDn` | Page down in table |
+| `Ctrl+u` / `PgUp` | Page up in table |
+| `g` / `Home` | Jump to top of list |
+| `G` / `End` | Jump to bottom of list |
 | `Enter` | Open detail / move focus to right panel |
 | `Tab` | Toggle focus between sidebar and table |
 | `r` | Focus resource table |
 | `c` | Switch cluster context (popup) |
 | `n` | Switch namespace (popup) |
+| `O` | Open kubeconfig |
 | `/` | Filter resources by regex |
 | `x` | Clear filter |
 | `e` | Edit selected resource ($EDITOR) |
 | `l` | Open logs (workload resources) |
 | `F` | Create port forward (popup, for workload/service resources) |
 | `D` | Delete selected resource (confirmation popup) |
+| `R` | Restart workload |
 | `S` | Scale workload (Deployment/StatefulSet/ReplicaSet) |
-| `x` | Exec into pod (when no filter active) — opens /bin/sh |
-| `X` | Exec with custom command/container (popup) |
+| `y` | Copy resource name |
+| `d` | Mark / diff resources |
+| `C` | Create new resource |
+| `x` | Exec into pod (experimental, when no filter active) |
 
 ### Detail View
 
 | Key | Action |
 |-----|--------|
+| `j` / `Down` | Scroll down or navigate entries |
+| `k` / `Up` | Scroll up or navigate entries |
+| `Ctrl+d` / `PgDn` | Page down |
+| `Ctrl+u` / `PgUp` | Page up |
+| `Home` | Jump to top |
 | `v` | Cycle view: Smart → YAML → Smart |
-| `j`/`k` | Scroll (or navigate selected entries) |
 | `s` | Enter/leave label/annotation selection |
+| `Enter` | Edit selected label/annotation |
 | `Space` | Expand/collapse selected entry or decode secret |
 | `y` | Copy: selected entry value, full YAML, or secret |
 | `e` | Edit resource ($EDITOR) |
 | `l` | Open logs (workload resources) |
 | `F` | Create port forward (popup) |
 | `D` | Delete resource (confirmation popup) |
+| `R` | Restart workload |
 | `S` | Scale workload |
-| `x` | Exec into pod (/bin/sh) |
-| `X` | Exec with custom command/container (popup) |
-
-### Port Forwards View
-
-| Key | Action |
-|-----|--------|
-| `j`/`k` | Navigate port forward list |
-| `p` | Pause/resume selected forward |
-| `d` | Cancel (delete) selected forward |
-
-### Edit Diff View
-
-| Key | Action |
-|-----|--------|
-| `v` | Cycle: inline diff ↔ side-by-side diff |
-| `Enter` | Apply changes to cluster |
-| `e` | Re-edit (reopen $EDITOR with current edits) |
-| `j`/`k` | Scroll diff |
-| `Esc` | Cancel edit |
+| `w` | Toggle watch mode (auto-refresh detail) |
+| `Tab` | Toggle related resources selection |
+| `x` | Exec into pod (experimental) |
 
 ### Log View
 
 | Key | Action |
 |-----|--------|
+| `j` / `Down` | Move cursor down |
+| `k` / `Up` | Move cursor up |
+| `Ctrl+d` / `PgDn` | Page down |
+| `Ctrl+u` / `PgUp` | Page up |
+| `g` / `Home` | Jump to top |
+| `G` / `End` | Jump to bottom |
 | `f` | Toggle follow (live streaming) |
 | `/` | Filter by regex |
 | `x` | Clear filter |
 | `p` | Select pod (popup) |
 | `c` | Select container (popup) |
-| `j`/`k` | Scroll |
-| `G`/`g` | Jump to bottom/top |
+| `w` | Toggle line wrapping |
+| `t` | Set time filter |
+| `Y` | Copy all logs to clipboard |
+| `Enter` | Open selected line detail |
+
+### Edit Diff View
+
+| Key | Action |
+|-----|--------|
+| `j` / `Down` | Scroll down |
+| `k` / `Up` | Scroll up |
+| `Ctrl+d` / `PgDn` | Page down |
+| `Ctrl+u` / `PgUp` | Page up |
+| `v` | Cycle: inline diff ↔ side-by-side diff |
+| `Enter` | Apply changes to cluster |
+| `e` | Re-edit (reopen $EDITOR with current edits) |
+| `Esc` | Cancel edit |
+
+### Port Forwards View
+
+| Key | Action |
+|-----|--------|
+| `j` / `Down` | Navigate list |
+| `k` / `Up` | Navigate list |
+| `p` | Pause/resume selected forward |
+| `d` | Cancel (delete) selected forward |
 
 ## Sidebar Structure
 
@@ -233,9 +265,8 @@ an editable field for the new count. Uses `Api::patch` with `Patch::Merge` to up
 
 **Experimental** — requires `qb -e` to enable.
 
-Press `x` for quick exec (`/bin/sh` into first container of first pod). Press `X` for the
-full dialog: choose container (Tab to switch fields, Up/Down for containers), edit command
-(split on whitespace for argv), and override the terminal application.
+Press `x` to open the exec dialog: choose container (Tab to switch fields, Up/Down for
+containers), edit command (split on whitespace for argv), and override the terminal application.
 
 Exec opens a **new terminal window** running `kubectl exec -it`. The terminal is resolved as:
 1. `$TERMINAL` env var (explicit override, freedesktop convention)
@@ -244,7 +275,7 @@ Exec opens a **new terminal window** running `kubectl exec -it`. The terminal is
 3. Error if neither is set — user must set one of the above
 
 On macOS, Apple Terminal.app uses osascript `do script`. All other terminals are invoked
-directly as `<terminal> -e <script>`, which spawns a new window. The `X` dialog allows
+directly as `<terminal> -e <script>`, which spawns a new window. The exec dialog allows
 overriding the terminal per-session.
 
 The kubectl command includes `--context` and `--kubeconfig` (if a custom kubeconfig was loaded
@@ -306,8 +337,8 @@ single clear responsibility:
 - `tui/mod.rs` — terminal setup, event loop, and external editor invocation (suspend/resume).
 - `tui/app.rs` — state + event handling. No rendering code. Includes edit flow state
   (`PendingEdit`, `EditContext`, `DiffMode`).
-- `tui/ui.rs` — rendering only. Reads from App, writes to Frame. No mutations except storing
-  click-area rects, clamping scroll/cursor positions, and syncing `DictState`.
+- `tui/ui.rs` — rendering only. Reads from App, writes to Frame. No mutations except
+  clamping scroll/cursor positions and syncing `DictState`.
 - `tui/smart.rs` — per-resource-type renderers. Returns `Vec<Line<'static>>`. Accepts
   `ds: &mut DictState` for label/annotation selection/expansion. May mutate `SecretDetailState`.
 - `tui/logs.rs` — log view state encapsulated in `LogViewState`. Owns its own streaming handles,
@@ -341,8 +372,6 @@ for exhaustive matching. No `unreachable!()` in dispatch.
   navigation (switching resource type, opening a new detail) should reset scroll.
 - **Popup = `Option<Popup>`**: One popup at a time. `None` means no popup. Popup keys are handled
   before view-specific keys. Pod/container selectors are popups, not cycling.
-- **Click areas**: `ui.rs` stores rendered `Rect`s into `app.area_*` fields. `handle_mouse_click`
-  uses these to map coordinates to items. Offset by +1 for borders.
 - **Log prefixes**: Every log line from multi-pod/container sources is prefixed with
   `[pod/container]` so the user can identify the source and filter with regex.
 - **Filtered views**: Resource filter computes `visible_resource_indices()` — a mapping from

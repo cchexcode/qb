@@ -20,7 +20,6 @@ use {
             core::v1::{
                 ConfigMap,
                 Endpoints,
-                Event,
                 Namespace,
                 Node,
                 PersistentVolume,
@@ -30,6 +29,7 @@ use {
                 Service,
                 ServiceAccount,
             },
+            events::v1::Event,
             networking::v1::{
                 Ingress,
                 NetworkPolicy,
@@ -342,6 +342,15 @@ pub struct PodInfo {
     pub containers: Vec<String>,
 }
 
+pub struct RelatedResource {
+    pub resource_type: ResourceType,
+    pub name: String,
+    pub namespace: String,
+    pub info: String,
+    pub category: &'static str,
+    pub sort_key: String,
+}
+
 pub struct RelatedEvent {
     pub type_: String,
     pub reason: String,
@@ -381,6 +390,10 @@ pub struct ClusterStatsData {
     pub pods_failed: usize,
     pub deployment_count: usize,
     pub service_count: usize,
+    pub pods_crash_loop: usize,
+    pub pods_error: usize,
+    pub recent_warnings: usize,
+    pub nodes_with_pressure: usize,
     pub nodes: Vec<NodeStats>,
 }
 
@@ -569,12 +582,28 @@ impl KubeClient {
         let mut pods_running = 0usize;
         let mut pods_pending = 0usize;
         let mut pods_failed = 0usize;
+        let mut pods_crash_loop = 0usize;
+        let mut pods_error = 0usize;
         for p in &pod_list.items {
             match p.status.as_ref().and_then(|s| s.phase.as_deref()) {
                 | Some("Running") => pods_running += 1,
                 | Some("Pending") => pods_pending += 1,
                 | Some("Failed") => pods_failed += 1,
                 | _ => {},
+            }
+            let container_statuses = p.status.as_ref().and_then(|s| s.container_statuses.as_ref());
+            if let Some(statuses) = container_statuses {
+                for cs in statuses {
+                    if let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) {
+                        match waiting.reason.as_deref() {
+                            | Some("CrashLoopBackOff") => pods_crash_loop += 1,
+                            | Some("ImagePullBackOff") | Some("ErrImagePull") | Some("CreateContainerConfigError") => {
+                                pods_error += 1
+                            },
+                            | _ => {},
+                        }
+                    }
+                }
             }
         }
 
@@ -583,6 +612,42 @@ impl KubeClient {
         let deployment_count = dep_api.list(&ListParams::default()).await?.items.len();
         let svc_api: Api<Service> = Api::all(self.client.clone());
         let service_count = svc_api.list(&ListParams::default()).await?.items.len();
+
+        // Nodes with resource pressure
+        let mut nodes_with_pressure = 0usize;
+        for n in &node_list.items {
+            if let Some(conditions) = n.status.as_ref().and_then(|s| s.conditions.as_ref()) {
+                for c in conditions {
+                    if matches!(c.type_.as_str(), "DiskPressure" | "MemoryPressure" | "PIDPressure")
+                        && c.status == "True"
+                    {
+                        nodes_with_pressure += 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Recent warning events (last 1 hour)
+        let event_api: Api<Event> = Api::all(self.client.clone());
+        let recent_warnings = if let Ok(events) = event_api.list(&ListParams::default()).await {
+            let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(1);
+            events
+                .items
+                .iter()
+                .filter(|e| {
+                    e.type_.as_deref() == Some("Warning")
+                        && e.event_time
+                            .as_ref()
+                            .map(|t| t.0)
+                            .or(e.deprecated_last_timestamp.as_ref().map(|t| t.0))
+                            .map(|t| t >= cutoff)
+                            .unwrap_or(false)
+                })
+                .count()
+        } else {
+            0
+        };
 
         Ok(ClusterStatsData {
             server_version,
@@ -596,6 +661,10 @@ impl KubeClient {
             pods_failed,
             deployment_count,
             service_count,
+            pods_crash_loop,
+            pods_error,
+            recent_warnings,
+            nodes_with_pressure,
             nodes: node_stats,
         })
     }
@@ -679,6 +748,37 @@ impl KubeClient {
         };
         let pp = kube::api::PostParams::default();
         let result = api.replace(name, &pp, &obj).await.context("Failed to apply resource")?;
+        let val = serde_json::to_value(&result)?;
+        Ok(val)
+    }
+
+    pub async fn patch_metadata(
+        &self,
+        rt: ResourceType,
+        ns: &str,
+        name: &str,
+        labels: Option<&serde_json::Map<String, Value>>,
+        annotations: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<Value> {
+        let ar = rt.api_resource();
+        let api: Api<kube::api::DynamicObject> = if rt.is_cluster_scoped() {
+            Api::all_with(self.client.clone(), &ar)
+        } else {
+            Api::namespaced_with(self.client.clone(), ns, &ar)
+        };
+        let mut metadata = serde_json::Map::new();
+        if let Some(l) = labels {
+            metadata.insert("labels".into(), Value::Object(l.clone()));
+        }
+        if let Some(a) = annotations {
+            metadata.insert("annotations".into(), Value::Object(a.clone()));
+        }
+        let patch = serde_json::json!({ "metadata": metadata });
+        let pp = kube::api::PatchParams::default();
+        let result = api
+            .patch(name, &pp, &kube::api::Patch::Merge(&patch))
+            .await
+            .context("Failed to patch metadata")?;
         let val = serde_json::to_value(&result)?;
         Ok(val)
     }
@@ -786,28 +886,27 @@ impl KubeClient {
         } else {
             Api::namespaced(self.client.clone(), ns)
         };
-        let lp = ListParams::default().fields(&format!("involvedObject.name={}", resource_name));
+        let lp = ListParams::default().fields(&format!("regarding.name={}", resource_name));
         let list = api.list(&lp).await.context("Failed to fetch events")?;
         let mut events: Vec<RelatedEvent> = list
             .items
             .iter()
             .map(|e| {
                 let last_seen = e
-                    .last_timestamp
+                    .event_time
                     .as_ref()
-                    .map(|t| format_age(Some(t)))
-                    .or_else(|| {
-                        e.event_time.as_ref().map(|t| {
-                            let dur = jiff::Timestamp::now().duration_since(t.0);
-                            format_duration(dur)
-                        })
+                    .map(|t| {
+                        let dur = jiff::Timestamp::now().duration_since(t.0);
+                        format_duration(dur)
                     })
+                    .or_else(|| e.deprecated_last_timestamp.as_ref().map(|t| format_age(Some(t))))
                     .unwrap_or_else(|| "-".into());
+                let count = e.series.as_ref().map(|s| s.count).or(e.deprecated_count).unwrap_or(1);
                 RelatedEvent {
                     type_: e.type_.clone().unwrap_or_default(),
                     reason: e.reason.clone().unwrap_or_default(),
-                    message: e.message.clone().unwrap_or_default(),
-                    count: e.count.unwrap_or(1),
+                    message: e.note.clone().unwrap_or_default(),
+                    count,
                     last_seen,
                 }
             })
@@ -816,7 +915,1022 @@ impl KubeClient {
         Ok(events)
     }
 
-    // -- Generic list helper -------------------------------------------------
+    pub async fn fetch_related_resources(
+        &self,
+        rt: ResourceType,
+        ns: &str,
+        name: &str,
+        value: &Value,
+    ) -> Vec<RelatedResource> {
+        let mut related = Vec::new();
+
+        // Owner references (universal — all resource types)
+        Self::add_owner_refs(&mut related, value, ns);
+
+        match rt {
+            | ResourceType::Deployment => {
+                self.add_replicasets_for_deployment(&mut related, ns, value).await;
+                self.add_pods_by_selector(&mut related, ns, value).await;
+                self.add_hpa_for_workload(&mut related, ns, name).await;
+                Self::add_service_account(&mut related, value, ns, true);
+            },
+            | ResourceType::StatefulSet => {
+                self.add_pods_by_selector(&mut related, ns, value).await;
+                self.add_hpa_for_workload(&mut related, ns, name).await;
+                Self::add_service_account(&mut related, value, ns, true);
+                if let Some(templates) = value
+                    .get("spec")
+                    .and_then(|s| s.get("volumeClaimTemplates"))
+                    .and_then(|v| v.as_array())
+                {
+                    for tpl in templates {
+                        if let Some(pvc_name) = tpl.get("metadata").and_then(|m| m.get("name")).and_then(|n| n.as_str())
+                        {
+                            Self::push_unique(
+                                &mut related,
+                                ResourceType::PersistentVolumeClaim,
+                                pvc_name,
+                                ns,
+                                "template",
+                                "Storage",
+                            );
+                        }
+                    }
+                }
+            },
+            | ResourceType::DaemonSet => {
+                self.add_pods_by_selector(&mut related, ns, value).await;
+                Self::add_service_account(&mut related, value, ns, true);
+            },
+            | ResourceType::ReplicaSet => {
+                self.add_pods_by_selector(&mut related, ns, value).await;
+                Self::add_service_account(&mut related, value, ns, true);
+            },
+            | ResourceType::Pod => {
+                Self::add_service_account(&mut related, value, ns, false);
+                if let Some(node) = value
+                    .get("spec")
+                    .and_then(|s| s.get("nodeName"))
+                    .and_then(|n| n.as_str())
+                {
+                    Self::push_unique(&mut related, ResourceType::Node, node, "", "scheduled", "Cluster");
+                }
+            },
+            | ResourceType::Service => {
+                Self::push_unique(&mut related, ResourceType::Endpoints, name, ns, "endpoints", "Network");
+                self.add_pods_by_service_selector(&mut related, ns, value).await;
+            },
+            | ResourceType::Ingress => {
+                if let Some(rules) = value
+                    .get("spec")
+                    .and_then(|s| s.get("rules"))
+                    .and_then(|r| r.as_array())
+                {
+                    for rule in rules {
+                        if let Some(paths) = rule.get("http").and_then(|h| h.get("paths")).and_then(|p| p.as_array()) {
+                            for path in paths {
+                                if let Some(svc) = path
+                                    .get("backend")
+                                    .and_then(|b| b.get("service"))
+                                    .and_then(|s| s.get("name"))
+                                    .and_then(|n| n.as_str())
+                                {
+                                    Self::push_unique(
+                                        &mut related,
+                                        ResourceType::Service,
+                                        svc,
+                                        ns,
+                                        "backend",
+                                        "Network",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(tls) = value.get("spec").and_then(|s| s.get("tls")).and_then(|t| t.as_array()) {
+                    for entry in tls {
+                        if let Some(secret) = entry.get("secretName").and_then(|s| s.as_str()) {
+                            Self::push_unique(&mut related, ResourceType::Secret, secret, ns, "tls", "Config");
+                        }
+                    }
+                }
+            },
+            | ResourceType::Job => {
+                self.add_pods_by_label(&mut related, ns, &format!("job-name={}", name))
+                    .await;
+                Self::add_service_account(&mut related, value, ns, true);
+            },
+            | ResourceType::CronJob => {
+                let job_api: Api<Job> = Api::namespaced(self.client.clone(), ns);
+                if let Ok(jobs) = job_api.list(&ListParams::default()).await {
+                    for job in &jobs.items {
+                        let is_owned = job
+                            .metadata
+                            .owner_references
+                            .as_ref()
+                            .map(|refs| refs.iter().any(|r| r.kind == "CronJob" && r.name == name))
+                            .unwrap_or(false);
+                        if is_owned {
+                            let ts = job
+                                .metadata
+                                .creation_timestamp
+                                .as_ref()
+                                .map(|t| t.0.to_string())
+                                .unwrap_or_default();
+                            let status = if job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0) > 0 {
+                                "Succeeded"
+                            } else if job.status.as_ref().and_then(|s| s.active).unwrap_or(0) > 0 {
+                                "Active"
+                            } else {
+                                "Unknown"
+                            };
+                            related.push(RelatedResource {
+                                resource_type: ResourceType::Job,
+                                name: meta_name(&job.metadata),
+                                namespace: ns.to_string(),
+                                info: status.to_string(),
+                                category: ResourceType::Job.display_name(),
+                                sort_key: ts,
+                            });
+                        }
+                    }
+                }
+                // SA from jobTemplate
+                if let Some(sa) = value
+                    .get("spec")
+                    .and_then(|s| s.get("jobTemplate"))
+                    .and_then(|j| j.get("spec"))
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+                    .and_then(|s| s.get("serviceAccountName"))
+                    .and_then(|n| n.as_str())
+                {
+                    Self::push_unique(
+                        &mut related,
+                        ResourceType::ServiceAccount,
+                        sa,
+                        ns,
+                        "serviceAccount",
+                        "RBAC",
+                    );
+                }
+            },
+            | ResourceType::HorizontalPodAutoscaler => {
+                if let Some(target_ref) = value.get("spec").and_then(|s| s.get("scaleTargetRef")) {
+                    let kind = target_ref.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    let tname = target_ref.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let trt = match kind {
+                        | "Deployment" => Some(ResourceType::Deployment),
+                        | "StatefulSet" => Some(ResourceType::StatefulSet),
+                        | "ReplicaSet" => Some(ResourceType::ReplicaSet),
+                        | _ => None,
+                    };
+                    if let Some(trt) = trt {
+                        Self::push_unique(&mut related, trt, tname, ns, "scale target", "Workloads");
+                    }
+                }
+            },
+            | ResourceType::PersistentVolumeClaim => {
+                if let Some(vol) = value
+                    .get("spec")
+                    .and_then(|s| s.get("volumeName"))
+                    .and_then(|v| v.as_str())
+                {
+                    Self::push_unique(
+                        &mut related,
+                        ResourceType::PersistentVolume,
+                        vol,
+                        "",
+                        "bound",
+                        "Storage",
+                    );
+                }
+                if let Some(sc) = value
+                    .get("spec")
+                    .and_then(|s| s.get("storageClassName"))
+                    .and_then(|v| v.as_str())
+                {
+                    Self::push_unique(
+                        &mut related,
+                        ResourceType::StorageClass,
+                        sc,
+                        "",
+                        "storageClass",
+                        "Storage",
+                    );
+                }
+            },
+            | ResourceType::PersistentVolume => {
+                if let Some(claim) = value.get("spec").and_then(|s| s.get("claimRef")) {
+                    let cn = claim.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let cns = claim.get("namespace").and_then(|n| n.as_str()).unwrap_or("");
+                    if !cn.is_empty() {
+                        Self::push_unique(
+                            &mut related,
+                            ResourceType::PersistentVolumeClaim,
+                            cn,
+                            cns,
+                            "claim",
+                            "Storage",
+                        );
+                    }
+                }
+                if let Some(sc) = value
+                    .get("spec")
+                    .and_then(|s| s.get("storageClassName"))
+                    .and_then(|v| v.as_str())
+                {
+                    Self::push_unique(
+                        &mut related,
+                        ResourceType::StorageClass,
+                        sc,
+                        "",
+                        "storageClass",
+                        "Storage",
+                    );
+                }
+            },
+            | ResourceType::ServiceAccount => {
+                // Token secrets
+                if let Some(secrets) = value.get("secrets").and_then(|s| s.as_array()) {
+                    for secret in secrets {
+                        if let Some(sname) = secret.get("name").and_then(|n| n.as_str()) {
+                            Self::push_unique(&mut related, ResourceType::Secret, sname, ns, "token", "x");
+                        }
+                    }
+                }
+                // RoleBindings referencing this SA
+                let rb_api: Api<RoleBinding> = Api::namespaced(self.client.clone(), ns);
+                if let Ok(list) = rb_api.list(&ListParams::default()).await {
+                    for rb in &list.items {
+                        let refs_sa = rb
+                            .subjects
+                            .as_ref()
+                            .map(|subjects| subjects.iter().any(|s| s.kind == "ServiceAccount" && s.name == name))
+                            .unwrap_or(false);
+                        if refs_sa {
+                            Self::push_unique(
+                                &mut related,
+                                ResourceType::RoleBinding,
+                                &meta_name(&rb.metadata),
+                                ns,
+                                "binds SA",
+                                "x",
+                            );
+                        }
+                    }
+                }
+                // ClusterRoleBindings referencing this SA
+                let crb_api: Api<ClusterRoleBinding> = Api::all(self.client.clone());
+                if let Ok(list) = crb_api.list(&ListParams::default()).await {
+                    for crb in &list.items {
+                        let refs_sa = crb
+                            .subjects
+                            .as_ref()
+                            .map(|subjects| {
+                                subjects.iter().any(|s| {
+                                    s.kind == "ServiceAccount" && s.name == name && s.namespace.as_deref() == Some(ns)
+                                })
+                            })
+                            .unwrap_or(false);
+                        if refs_sa {
+                            Self::push_unique(
+                                &mut related,
+                                ResourceType::ClusterRoleBinding,
+                                &meta_name(&crb.metadata),
+                                "",
+                                "binds SA",
+                                "x",
+                            );
+                        }
+                    }
+                }
+                // Workloads using this SA
+                self.add_workloads_using_sa(&mut related, ns, name).await;
+            },
+            | ResourceType::RoleBinding | ResourceType::ClusterRoleBinding => {
+                if let Some(role_ref) = value.get("roleRef") {
+                    let kind = role_ref.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    let rname = role_ref.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let rrt = match kind {
+                        | "Role" => Some(ResourceType::Role),
+                        | "ClusterRole" => Some(ResourceType::ClusterRole),
+                        | _ => None,
+                    };
+                    if let Some(rrt) = rrt {
+                        Self::push_unique(&mut related, rrt, rname, ns, "bound role", "RBAC");
+                    }
+                }
+                if let Some(subjects) = value.get("subjects").and_then(|s| s.as_array()) {
+                    for subj in subjects {
+                        if subj.get("kind").and_then(|k| k.as_str()) == Some("ServiceAccount") {
+                            let sa_name = subj.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            let sa_ns = subj.get("namespace").and_then(|n| n.as_str()).unwrap_or(ns);
+                            Self::push_unique(
+                                &mut related,
+                                ResourceType::ServiceAccount,
+                                sa_name,
+                                sa_ns,
+                                "subject",
+                                "RBAC",
+                            );
+                        }
+                    }
+                }
+            },
+            | ResourceType::NetworkPolicy => {
+                self.add_pods_by_network_policy_selector(&mut related, ns, value).await;
+            },
+            | ResourceType::Secret | ResourceType::ConfigMap => {
+                self.add_workloads_referencing(&mut related, rt, ns, name).await;
+            },
+            | _ => {},
+        }
+
+        // Extract mounted volumes + env refs from pod templates
+        let template_spec = match rt {
+            | ResourceType::CronJob => {
+                value
+                    .get("spec")
+                    .and_then(|s| s.get("jobTemplate"))
+                    .and_then(|j| j.get("spec"))
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+            },
+            | ResourceType::Deployment
+            | ResourceType::StatefulSet
+            | ResourceType::DaemonSet
+            | ResourceType::Job
+            | ResourceType::ReplicaSet => {
+                value
+                    .get("spec")
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+            },
+            | ResourceType::Pod => value.get("spec"),
+            | _ => None,
+        };
+        if let Some(spec) = template_spec {
+            if let Some(volumes) = spec.get("volumes").and_then(|v| v.as_array()) {
+                Self::extract_volume_refs(&mut related, volumes, ns);
+            }
+            if let Some(containers) = spec.get("containers").and_then(|c| c.as_array()) {
+                Self::extract_env_refs(&mut related, containers, ns);
+            }
+            if let Some(init_containers) = spec.get("initContainers").and_then(|c| c.as_array()) {
+                Self::extract_env_refs(&mut related, init_containers, ns);
+            }
+        }
+
+        // Sort: by resource type category order, then by sort_key (timestamp)
+        let type_order = |c: &str| -> u8 {
+            match c {
+                // Workloads
+                | "Deployments" => 0,
+                | "ReplicaSets" => 1,
+                | "StatefulSets" => 2,
+                | "DaemonSets" => 3,
+                | "Pods" => 4,
+                | "Jobs" => 5,
+                | "CronJobs" => 6,
+                | "HPAs" => 7,
+                // Network
+                | "Services" => 10,
+                | "Ingresses" => 11,
+                | "Endpoints" => 12,
+                | "NetworkPolicies" => 13,
+                // Config
+                | "ConfigMaps" => 20,
+                | "Secrets" => 21,
+                // Storage
+                | "PVCs" => 30,
+                | "PVs" => 31,
+                | "StorageClasses" => 32,
+                // RBAC
+                | "ServiceAccounts" => 40,
+                | "Roles" => 41,
+                | "RoleBindings" => 42,
+                | "ClusterRoles" => 43,
+                | "ClusterRoleBindings" => 44,
+                // Cluster
+                | "Nodes" => 50,
+                | "Namespaces" => 51,
+                | _ => 99,
+            }
+        };
+        related.sort_by(|a, b| {
+            type_order(a.category).cmp(&type_order(b.category)).then_with(|| {
+                if a.sort_key.is_empty() && b.sort_key.is_empty() {
+                    a.name.cmp(&b.name)
+                } else {
+                    b.sort_key.cmp(&a.sort_key)
+                }
+            })
+        });
+
+        related
+    }
+
+    fn add_owner_refs(related: &mut Vec<RelatedResource>, value: &Value, ns: &str) {
+        if let Some(owners) = value
+            .get("metadata")
+            .and_then(|m| m.get("ownerReferences"))
+            .and_then(|o| o.as_array())
+        {
+            for owner in owners {
+                let kind = owner.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                let oname = owner.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let owner_rt = match kind {
+                    | "Deployment" => Some(ResourceType::Deployment),
+                    | "ReplicaSet" => Some(ResourceType::ReplicaSet),
+                    | "StatefulSet" => Some(ResourceType::StatefulSet),
+                    | "DaemonSet" => Some(ResourceType::DaemonSet),
+                    | "Job" => Some(ResourceType::Job),
+                    | "CronJob" => Some(ResourceType::CronJob),
+                    | "Node" => Some(ResourceType::Node),
+                    | _ => None,
+                };
+                if let Some(ort) = owner_rt {
+                    related.push(RelatedResource {
+                        resource_type: ort,
+                        name: oname.to_string(),
+                        namespace: ns.to_string(),
+                        info: "owner".to_string(),
+                        category: ort.display_name(),
+                        sort_key: String::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn add_replicasets_for_deployment(&self, related: &mut Vec<RelatedResource>, ns: &str, value: &Value) {
+        let selector = value
+            .get("spec")
+            .and_then(|s| s.get("selector"))
+            .and_then(|s| s.get("matchLabels"))
+            .and_then(|m| m.as_object());
+        if let Some(labels) = selector {
+            let sel = labels
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(",");
+            let api: Api<ReplicaSet> = Api::namespaced(self.client.clone(), ns);
+            if let Ok(list) = api.list(&ListParams::default().labels(&sel)).await {
+                for rs in &list.items {
+                    let rs_name = meta_name(&rs.metadata);
+                    let replicas = rs.status.as_ref().map(|s| s.replicas).unwrap_or(0);
+                    let ready = rs.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0);
+                    let revision = rs
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|a| a.get("deployment.kubernetes.io/revision"))
+                        .map(|s| s.as_str())
+                        .unwrap_or("0");
+                    let ts = rs
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|t| t.0.to_string())
+                        .unwrap_or_default();
+                    related.push(RelatedResource {
+                        resource_type: ResourceType::ReplicaSet,
+                        name: rs_name,
+                        namespace: ns.to_string(),
+                        info: format!("rev:{} ready:{}/{}", revision, ready, replicas),
+                        category: ResourceType::ReplicaSet.display_name(),
+                        sort_key: ts,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn add_pods_by_selector(&self, related: &mut Vec<RelatedResource>, ns: &str, value: &Value) {
+        let selector = value
+            .get("spec")
+            .and_then(|s| s.get("selector"))
+            .and_then(|s| s.get("matchLabels"))
+            .and_then(|m| m.as_object());
+        if let Some(labels) = selector {
+            let sel = labels
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.add_pods_by_label(related, ns, &sel).await;
+        }
+    }
+
+    async fn add_pods_by_service_selector(&self, related: &mut Vec<RelatedResource>, ns: &str, value: &Value) {
+        if let Some(selector) = value
+            .get("spec")
+            .and_then(|s| s.get("selector"))
+            .and_then(|s| s.as_object())
+        {
+            let sel = selector
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.add_pods_by_label(related, ns, &sel).await;
+        }
+    }
+
+    async fn add_pods_by_network_policy_selector(&self, related: &mut Vec<RelatedResource>, ns: &str, value: &Value) {
+        if let Some(selector) = value
+            .get("spec")
+            .and_then(|s| s.get("podSelector"))
+            .and_then(|s| s.get("matchLabels"))
+            .and_then(|m| m.as_object())
+        {
+            let sel = selector
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.add_pods_by_label(related, ns, &sel).await;
+        }
+    }
+
+    async fn add_pods_by_label(&self, related: &mut Vec<RelatedResource>, ns: &str, label_sel: &str) {
+        let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = api.list(&ListParams::default().labels(label_sel)).await {
+            for pod in &list.items {
+                let phase = pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.phase.as_deref())
+                    .unwrap_or("Unknown");
+                let ts = pod
+                    .metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .map(|t| t.0.to_string())
+                    .unwrap_or_default();
+                related.push(RelatedResource {
+                    resource_type: ResourceType::Pod,
+                    name: meta_name(&pod.metadata),
+                    namespace: ns.to_string(),
+                    info: phase.to_string(),
+                    category: ResourceType::Pod.display_name(),
+                    sort_key: ts,
+                });
+            }
+        }
+    }
+
+    async fn add_hpa_for_workload(&self, related: &mut Vec<RelatedResource>, ns: &str, name: &str) {
+        let api: Api<HorizontalPodAutoscaler> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = api.list(&ListParams::default()).await {
+            for hpa in &list.items {
+                let target = hpa
+                    .spec
+                    .as_ref()
+                    .map(|s| s.scale_target_ref.name.as_str())
+                    .unwrap_or("");
+                if target == name {
+                    let min = hpa.spec.as_ref().and_then(|s| s.min_replicas).unwrap_or(0);
+                    let max = hpa.spec.as_ref().map(|s| s.max_replicas).unwrap_or(0);
+                    related.push(RelatedResource {
+                        resource_type: ResourceType::HorizontalPodAutoscaler,
+                        name: meta_name(&hpa.metadata),
+                        namespace: ns.to_string(),
+                        info: format!("min:{} max:{}", min, max),
+                        category: ResourceType::HorizontalPodAutoscaler.display_name(),
+                        sort_key: String::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn add_service_account(related: &mut Vec<RelatedResource>, value: &Value, ns: &str, from_template: bool) {
+        let spec = if from_template {
+            value
+                .get("spec")
+                .and_then(|s| s.get("template"))
+                .and_then(|t| t.get("spec"))
+        } else {
+            value.get("spec")
+        };
+        if let Some(sa) = spec.and_then(|s| s.get("serviceAccountName")).and_then(|n| n.as_str()) {
+            Self::push_unique(related, ResourceType::ServiceAccount, sa, ns, "serviceAccount", "RBAC");
+        }
+        // Also check serviceAccount field (deprecated but still used)
+        if let Some(sa) = spec.and_then(|s| s.get("serviceAccount")).and_then(|n| n.as_str()) {
+            Self::push_unique(related, ResourceType::ServiceAccount, sa, ns, "serviceAccount", "RBAC");
+        }
+    }
+
+    fn push_unique(
+        related: &mut Vec<RelatedResource>,
+        rt: ResourceType,
+        name: &str,
+        ns: &str,
+        info: &str,
+        _category: &'static str,
+    ) {
+        if !related.iter().any(|r| r.resource_type == rt && r.name == name) {
+            related.push(RelatedResource {
+                resource_type: rt,
+                name: name.to_string(),
+                namespace: ns.to_string(),
+                info: info.to_string(),
+                category: rt.display_name(),
+                sort_key: String::new(),
+            });
+        }
+    }
+
+    /// Find workloads (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs)
+    /// that reference a given Secret or ConfigMap by name.
+    async fn add_workloads_referencing(
+        &self,
+        related: &mut Vec<RelatedResource>,
+        ref_type: ResourceType,
+        ns: &str,
+        ref_name: &str,
+    ) {
+        let is_secret = ref_type == ResourceType::Secret;
+
+        // Helper: check if a pod spec references the target name
+        let spec_references = |spec: &Value| -> bool {
+            // Check volumes
+            if let Some(volumes) = spec.get("volumes").and_then(|v| v.as_array()) {
+                for vol in volumes {
+                    if is_secret {
+                        if vol
+                            .get("secret")
+                            .and_then(|s| s.get("secretName"))
+                            .and_then(|n| n.as_str())
+                            == Some(ref_name)
+                        {
+                            return true;
+                        }
+                        if let Some(sources) = vol
+                            .get("projected")
+                            .and_then(|p| p.get("sources"))
+                            .and_then(|s| s.as_array())
+                        {
+                            for src in sources {
+                                if src.get("secret").and_then(|s| s.get("name")).and_then(|n| n.as_str())
+                                    == Some(ref_name)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    } else {
+                        if vol
+                            .get("configMap")
+                            .and_then(|c| c.get("name"))
+                            .and_then(|n| n.as_str())
+                            == Some(ref_name)
+                        {
+                            return true;
+                        }
+                        if let Some(sources) = vol
+                            .get("projected")
+                            .and_then(|p| p.get("sources"))
+                            .and_then(|s| s.as_array())
+                        {
+                            for src in sources {
+                                if src
+                                    .get("configMap")
+                                    .and_then(|c| c.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    == Some(ref_name)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Check containers env refs
+            for container_key in &["containers", "initContainers"] {
+                if let Some(containers) = spec.get(container_key).and_then(|c| c.as_array()) {
+                    for container in containers {
+                        if let Some(env_from) = container.get("envFrom").and_then(|e| e.as_array()) {
+                            for src in env_from {
+                                let ref_field = if is_secret { "secretRef" } else { "configMapRef" };
+                                if src.get(ref_field).and_then(|r| r.get("name")).and_then(|n| n.as_str())
+                                    == Some(ref_name)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        if let Some(env) = container.get("env").and_then(|e| e.as_array()) {
+                            for var in env {
+                                if let Some(vf) = var.get("valueFrom") {
+                                    let ref_field = if is_secret { "secretKeyRef" } else { "configMapKeyRef" };
+                                    if vf.get(ref_field).and_then(|r| r.get("name")).and_then(|n| n.as_str())
+                                        == Some(ref_name)
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        };
+
+        // Search Deployments
+        let dep_api: Api<Deployment> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = dep_api.list(&ListParams::default()).await {
+            for dep in &list.items {
+                let val = serde_json::to_value(dep).unwrap_or_default();
+                if let Some(spec) = val
+                    .get("spec")
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+                {
+                    if spec_references(spec) {
+                        Self::push_unique(
+                            related,
+                            ResourceType::Deployment,
+                            &meta_name(&dep.metadata),
+                            ns,
+                            "references",
+                            "Workloads",
+                        );
+                    }
+                }
+            }
+        }
+        // Search StatefulSets
+        let ss_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = ss_api.list(&ListParams::default()).await {
+            for ss in &list.items {
+                let val = serde_json::to_value(ss).unwrap_or_default();
+                if let Some(spec) = val
+                    .get("spec")
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+                {
+                    if spec_references(spec) {
+                        Self::push_unique(
+                            related,
+                            ResourceType::StatefulSet,
+                            &meta_name(&ss.metadata),
+                            ns,
+                            "references",
+                            "Workloads",
+                        );
+                    }
+                }
+            }
+        }
+        // Search DaemonSets
+        let ds_api: Api<DaemonSet> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = ds_api.list(&ListParams::default()).await {
+            for ds in &list.items {
+                let val = serde_json::to_value(ds).unwrap_or_default();
+                if let Some(spec) = val
+                    .get("spec")
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+                {
+                    if spec_references(spec) {
+                        Self::push_unique(
+                            related,
+                            ResourceType::DaemonSet,
+                            &meta_name(&ds.metadata),
+                            ns,
+                            "references",
+                            "Workloads",
+                        );
+                    }
+                }
+            }
+        }
+        // Search Jobs
+        let job_api: Api<Job> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = job_api.list(&ListParams::default()).await {
+            for job in &list.items {
+                let val = serde_json::to_value(job).unwrap_or_default();
+                if let Some(spec) = val
+                    .get("spec")
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+                {
+                    if spec_references(spec) {
+                        Self::push_unique(
+                            related,
+                            ResourceType::Job,
+                            &meta_name(&job.metadata),
+                            ns,
+                            "references",
+                            "Workloads",
+                        );
+                    }
+                }
+            }
+        }
+        // Search CronJobs
+        let cj_api: Api<CronJob> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = cj_api.list(&ListParams::default()).await {
+            for cj in &list.items {
+                let val = serde_json::to_value(cj).unwrap_or_default();
+                if let Some(spec) = val
+                    .get("spec")
+                    .and_then(|s| s.get("jobTemplate"))
+                    .and_then(|j| j.get("spec"))
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+                {
+                    if spec_references(spec) {
+                        Self::push_unique(
+                            related,
+                            ResourceType::CronJob,
+                            &meta_name(&cj.metadata),
+                            ns,
+                            "references",
+                            "Workloads",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    async fn add_workloads_using_sa(&self, related: &mut Vec<RelatedResource>, ns: &str, sa_name: &str) {
+        let check_sa = |val: &Value| -> bool {
+            val.get("spec")
+                .and_then(|s| s.get("template"))
+                .and_then(|t| t.get("spec"))
+                .and_then(|s| s.get("serviceAccountName").or_else(|| s.get("serviceAccount")))
+                .and_then(|n| n.as_str())
+                == Some(sa_name)
+        };
+        let dep_api: Api<Deployment> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = dep_api.list(&ListParams::default()).await {
+            for dep in &list.items {
+                let val = serde_json::to_value(dep).unwrap_or_default();
+                if check_sa(&val) {
+                    Self::push_unique(
+                        related,
+                        ResourceType::Deployment,
+                        &meta_name(&dep.metadata),
+                        ns,
+                        "uses SA",
+                        "x",
+                    );
+                }
+            }
+        }
+        let ss_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = ss_api.list(&ListParams::default()).await {
+            for ss in &list.items {
+                let val = serde_json::to_value(ss).unwrap_or_default();
+                if check_sa(&val) {
+                    Self::push_unique(
+                        related,
+                        ResourceType::StatefulSet,
+                        &meta_name(&ss.metadata),
+                        ns,
+                        "uses SA",
+                        "x",
+                    );
+                }
+            }
+        }
+        let ds_api: Api<DaemonSet> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = ds_api.list(&ListParams::default()).await {
+            for ds in &list.items {
+                let val = serde_json::to_value(ds).unwrap_or_default();
+                if check_sa(&val) {
+                    Self::push_unique(
+                        related,
+                        ResourceType::DaemonSet,
+                        &meta_name(&ds.metadata),
+                        ns,
+                        "uses SA",
+                        "x",
+                    );
+                }
+            }
+        }
+        let job_api: Api<Job> = Api::namespaced(self.client.clone(), ns);
+        if let Ok(list) = job_api.list(&ListParams::default()).await {
+            for job in &list.items {
+                let val = serde_json::to_value(job).unwrap_or_default();
+                if check_sa(&val) {
+                    Self::push_unique(
+                        related,
+                        ResourceType::Job,
+                        &meta_name(&job.metadata),
+                        ns,
+                        "uses SA",
+                        "x",
+                    );
+                }
+            }
+        }
+    }
+
+    fn extract_volume_refs(related: &mut Vec<RelatedResource>, volumes: &[Value], ns: &str) {
+        for vol in volumes {
+            if let Some(name) = vol
+                .get("secret")
+                .and_then(|s| s.get("secretName"))
+                .and_then(|n| n.as_str())
+            {
+                Self::push_unique(related, ResourceType::Secret, name, ns, "mounted", "Config");
+            }
+            if let Some(name) = vol
+                .get("configMap")
+                .and_then(|c| c.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                Self::push_unique(related, ResourceType::ConfigMap, name, ns, "mounted", "Config");
+            }
+            if let Some(name) = vol
+                .get("persistentVolumeClaim")
+                .and_then(|p| p.get("claimName"))
+                .and_then(|n| n.as_str())
+            {
+                Self::push_unique(
+                    related,
+                    ResourceType::PersistentVolumeClaim,
+                    name,
+                    ns,
+                    "mounted",
+                    "Storage",
+                );
+            }
+            if let Some(name) = vol
+                .get("projected")
+                .and_then(|p| p.get("sources"))
+                .and_then(|s| s.as_array())
+            {
+                for src in name {
+                    if let Some(sname) = src.get("secret").and_then(|s| s.get("name")).and_then(|n| n.as_str()) {
+                        Self::push_unique(related, ResourceType::Secret, sname, ns, "projected", "Config");
+                    }
+                    if let Some(cname) = src
+                        .get("configMap")
+                        .and_then(|c| c.get("name"))
+                        .and_then(|n| n.as_str())
+                    {
+                        Self::push_unique(related, ResourceType::ConfigMap, cname, ns, "projected", "Config");
+                    }
+                }
+            }
+        }
+    }
+
+    fn extract_env_refs(related: &mut Vec<RelatedResource>, containers: &[Value], ns: &str) {
+        for container in containers {
+            if let Some(env_from) = container.get("envFrom").and_then(|e| e.as_array()) {
+                for src in env_from {
+                    if let Some(name) = src
+                        .get("secretRef")
+                        .and_then(|s| s.get("name"))
+                        .and_then(|n| n.as_str())
+                    {
+                        Self::push_unique(related, ResourceType::Secret, name, ns, "envFrom", "Config");
+                    }
+                    if let Some(name) = src
+                        .get("configMapRef")
+                        .and_then(|c| c.get("name"))
+                        .and_then(|n| n.as_str())
+                    {
+                        Self::push_unique(related, ResourceType::ConfigMap, name, ns, "envFrom", "Config");
+                    }
+                }
+            }
+            if let Some(env) = container.get("env").and_then(|e| e.as_array()) {
+                for var in env {
+                    if let Some(vf) = var.get("valueFrom") {
+                        if let Some(name) = vf
+                            .get("secretKeyRef")
+                            .and_then(|s| s.get("name"))
+                            .and_then(|n| n.as_str())
+                        {
+                            Self::push_unique(related, ResourceType::Secret, name, ns, "env", "Config");
+                        }
+                        if let Some(name) = vf
+                            .get("configMapKeyRef")
+                            .and_then(|c| c.get("name"))
+                            .and_then(|n| n.as_str())
+                        {
+                            Self::push_unique(related, ResourceType::ConfigMap, name, ns, "env", "Config");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // -- Log support -----------------------------------------------------------
 
@@ -914,12 +2028,20 @@ impl KubeClient {
     }
 
     /// Fetch logs for a single pod/container.
-    pub async fn fetch_logs(&self, ns: &str, pod: &str, container: &str, tail: i64) -> Result<String> {
+    pub async fn fetch_logs(
+        &self,
+        ns: &str,
+        pod: &str,
+        container: &str,
+        tail: i64,
+        since_seconds: Option<i64>,
+    ) -> Result<String> {
         let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
         let lp = kube::api::LogParams {
             container: Some(container.to_string()),
             tail_lines: Some(tail),
             timestamps: true,
+            since_seconds,
             ..Default::default()
         };
         Ok(api.logs(pod, &lp).await?)
@@ -927,11 +2049,17 @@ impl KubeClient {
 
     /// Fetch logs for multiple pod/container pairs and merge them with
     /// prefixes.
-    pub async fn fetch_logs_multi(&self, ns: &str, pairs: &[(String, String)], tail: i64) -> Result<Vec<String>> {
+    pub async fn fetch_logs_multi(
+        &self,
+        ns: &str,
+        pairs: &[(String, String)],
+        tail: i64,
+        since_seconds: Option<i64>,
+    ) -> Result<Vec<String>> {
         let mut all_lines = Vec::new();
         for (pod, container) in pairs {
             let prefix = format!("[{}/{}] ", pod, container);
-            match self.fetch_logs(ns, pod, container, tail).await {
+            match self.fetch_logs(ns, pod, container, tail, since_seconds).await {
                 | Ok(logs) => {
                     for line in logs.lines() {
                         all_lines.push(format!("{}{}", prefix, line));
@@ -1511,26 +2639,30 @@ impl KubeClient {
         let event_type = e.type_.clone().unwrap_or_default();
         let reason = e.reason.clone().unwrap_or_default();
         let object = e
-            .involved_object
-            .name
+            .regarding
             .as_ref()
-            .map(|n| format!("{}/{}", e.involved_object.kind.as_deref().unwrap_or(""), n))
+            .and_then(|r| {
+                r.name
+                    .as_ref()
+                    .map(|n| format!("{}/{}", r.kind.as_deref().unwrap_or(""), n))
+            })
             .unwrap_or_default();
-        let message = e.message.clone().unwrap_or_default();
-        let count = e.count.unwrap_or(1);
-        // Use lastTimestamp (or creationTimestamp) as sort key — ISO 8601 sorts
-        // lexicographically
-        let sort_ts = e
-            .last_timestamp
+        let message = e.note.clone().unwrap_or_default();
+        let count = e.series.as_ref().map(|s| s.count).or(e.deprecated_count).unwrap_or(1);
+        // Prefer eventTime, fall back to deprecated lastTimestamp, then
+        // creationTimestamp
+        let best_time: Option<Timestamp> = e
+            .event_time
             .as_ref()
-            .or(e.metadata.creation_timestamp.as_ref())
-            .map(|t| t.0.to_string())
-            .unwrap_or_default();
-        let age = e
-            .last_timestamp
-            .as_ref()
-            .or(e.metadata.creation_timestamp.as_ref())
-            .map(|t| format_age(Some(t)))
+            .map(|t| t.0)
+            .or(e.deprecated_last_timestamp.as_ref().map(|t| t.0))
+            .or(e.metadata.creation_timestamp.as_ref().map(|t| t.0));
+        let sort_ts = best_time.map(|t| t.to_string()).unwrap_or_default();
+        let age = best_time
+            .map(|t| {
+                let dur = Timestamp::now().duration_since(t);
+                format_duration(dur)
+            })
             .unwrap_or_else(|| "N/A".into());
         ResourceEntry {
             name: meta_name(&e.metadata),
