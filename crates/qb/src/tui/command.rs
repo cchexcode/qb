@@ -154,6 +154,10 @@ fn supports_restart(f: &CmdFlags) -> bool {
         .unwrap_or(false)
 }
 
+fn is_cronjob(f: &CmdFlags) -> bool {
+    f.resource_type == Some(ResourceType::CronJob)
+}
+
 fn has_filter(f: &CmdFlags) -> bool {
     f.has_filter
 }
@@ -518,6 +522,15 @@ static COMMANDS: &[Cmd] = &[
         hotkey: true,
         palette: true,
         available: Some(is_node),
+    },
+    Cmd {
+        key: "T",
+        label: "Trigger",
+        description: "Create a Job from this CronJob",
+        contexts: &[Ctx::Resources, Ctx::Detail],
+        hotkey: true,
+        palette: true,
+        available: Some(is_cronjob),
     },
     // ── Events view ─────────────────────────────────────────────────────
     Cmd {

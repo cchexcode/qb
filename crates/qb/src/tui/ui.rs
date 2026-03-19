@@ -1926,6 +1926,7 @@ fn render_popup(f: &mut Frame, app: &mut App) {
         Popup::PortForwardCreate(_)
             | Popup::ConfirmDelete { .. }
             | Popup::ConfirmDrain { .. }
+            | Popup::TriggerCronJob { .. }
             | Popup::ScaleInput { .. }
             | Popup::TimeFilter { .. }
     ) {
@@ -2117,6 +2118,26 @@ fn render_popup(f: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red))
                 .title(" Confirm Drain ");
+
+            f.render_widget(Paragraph::new(lines).block(block), area);
+        },
+        | Popup::TriggerCronJob { cronjob_name, buf, .. } => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Trigger CronJob/{}", cronjob_name),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(format!("  Job name: {}▎", buf)),
+                Line::from(""),
+                Line::from("  [Enter] create  [Esc] cancel"),
+            ];
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Trigger CronJob ");
 
             f.render_widget(Paragraph::new(lines).block(block), area);
         },

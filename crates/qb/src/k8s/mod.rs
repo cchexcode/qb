@@ -894,6 +894,55 @@ impl KubeClient {
         Ok(())
     }
 
+    /// Generate a default job name for a manually triggered CronJob.
+    pub fn default_trigger_job_name(cronjob_name: &str) -> String {
+        let ts = Timestamp::now().strftime("%Y%m%d%H%M%S").to_string();
+        format!("{}-manual-{}", cronjob_name, ts)
+    }
+
+    /// Create a Job from a CronJob's jobTemplate (manual trigger).
+    pub async fn trigger_cronjob(&self, ns: &str, name: &str, job_name: &str) -> Result<String> {
+        let cj_api: Api<CronJob> = Api::namespaced(self.client.clone(), ns);
+        let cj = cj_api.get(name).await.context("Failed to get CronJob")?;
+
+        let job_template = cj
+            .spec
+            .as_ref()
+            .map(|s| &s.job_template)
+            .ok_or_else(|| anyhow::anyhow!("CronJob has no spec"))?;
+
+        let mut job_meta = job_template.metadata.clone().unwrap_or_default();
+        job_meta.name = Some(job_name.to_string());
+        job_meta.namespace = Some(ns.to_string());
+        // Add owner reference so the job shows up as related
+        job_meta.owner_references = Some(vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "batch/v1".to_string(),
+            kind: "CronJob".to_string(),
+            name: name.to_string(),
+            uid: cj.metadata.uid.clone().unwrap_or_default(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        // Annotate as manually triggered
+        let annotations = job_meta.annotations.get_or_insert_with(Default::default);
+        annotations.insert("cronjob.kubernetes.io/instantiate".to_string(), "manual".to_string());
+
+        let job = Job {
+            metadata: job_meta,
+            spec: job_template.spec.clone(),
+            ..Default::default()
+        };
+
+        let job_api: Api<Job> = Api::namespaced(self.client.clone(), ns);
+        let pp = kube::api::PostParams::default();
+        job_api
+            .create(&pp, &job)
+            .await
+            .context("Failed to create Job from CronJob")?;
+
+        Ok(job_name.to_string())
+    }
+
     /// Cordon a node (mark as unschedulable).
     pub async fn cordon_node(&self, name: &str) -> Result<()> {
         let api: Api<Node> = Api::all(self.client.clone());

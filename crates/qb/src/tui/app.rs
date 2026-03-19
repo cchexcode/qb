@@ -86,6 +86,9 @@ pub struct PendingEdit {
     pub name: String,
     pub namespace: String,
     pub yaml: String,
+    /// Set during re-edit so we can restore the diff view if user makes no
+    /// changes.
+    pub original_yaml: Option<String>,
 }
 
 /// Set by key handler, consumed by the event loop to edit metadata in $EDITOR.
@@ -164,6 +167,11 @@ pub enum Popup {
     },
     ConfirmDrain {
         node_name: String,
+    },
+    TriggerCronJob {
+        cronjob_name: String,
+        namespace: String,
+        buf: String,
     },
     ScaleInput {
         name: String,
@@ -1298,6 +1306,8 @@ impl App {
                     if !name.is_empty() {
                         self.popup = Some(Popup::ConfirmDrain { node_name: name });
                     }
+                } else if self.selected_resource_type == Some(ResourceType::CronJob) {
+                    self.open_trigger_cronjob();
                 }
             },
             | KeyCode::Char('X') if self.experimental => {
@@ -1523,6 +1533,8 @@ impl App {
                     if !name.is_empty() {
                         self.popup = Some(Popup::ConfirmDrain { node_name: name });
                     }
+                } else if self.selected_resource_type == Some(ResourceType::CronJob) {
+                    self.open_trigger_cronjob();
                 }
             },
             // [Tab] Toggle related resource selection
@@ -1913,6 +1925,10 @@ impl App {
             self.handle_confirm_drain_key(key);
             return;
         }
+        if matches!(self.popup, Some(Popup::TriggerCronJob { .. })) {
+            self.handle_trigger_cronjob_key(key);
+            return;
+        }
         if matches!(self.popup, Some(Popup::ScaleInput { .. })) {
             self.handle_scale_input_key(key);
             return;
@@ -1947,6 +1963,7 @@ impl App {
                         | Popup::ScaleInput { .. }
                         | Popup::ExecShell { .. }
                         | Popup::KubeconfigInput { .. }
+                        | Popup::TriggerCronJob { .. }
                         | Popup::TimeFilter { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
@@ -1968,6 +1985,7 @@ impl App {
                         | Popup::ScaleInput { .. }
                         | Popup::ExecShell { .. }
                         | Popup::KubeconfigInput { .. }
+                        | Popup::TriggerCronJob { .. }
                         | Popup::TimeFilter { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
@@ -2049,6 +2067,7 @@ impl App {
                     | Some(Popup::ScaleInput { .. })
                     | Some(Popup::ExecShell { .. })
                     | Some(Popup::KubeconfigInput { .. })
+                    | Some(Popup::TriggerCronJob { .. })
                     | Some(Popup::TimeFilter { .. })
                     | None => None,
                 };
@@ -2461,6 +2480,81 @@ impl App {
             | Err(e) => {
                 self.error = Some(format!("Restart failed: {}", e));
             },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Trigger CronJob (create manual Job)
+    // -----------------------------------------------------------------------
+
+    fn open_trigger_cronjob(&mut self) {
+        if self.selected_resource_type != Some(ResourceType::CronJob) {
+            return;
+        }
+        let (name, namespace) = if self.view == View::Detail {
+            (self.detail_name.clone(), self.detail_namespace.clone())
+        } else {
+            self.selected_resource_name_ns()
+        };
+        if name.is_empty() {
+            return;
+        }
+        let default_name = KubeClient::default_trigger_job_name(&name);
+        self.popup = Some(Popup::TriggerCronJob {
+            cronjob_name: name,
+            namespace,
+            buf: default_name,
+        });
+    }
+
+    fn handle_trigger_cronjob_key(&mut self, key: KeyEvent) {
+        match key.code {
+            | KeyCode::Enter => {
+                let (cronjob_name, namespace, job_name) = match &self.popup {
+                    | Some(Popup::TriggerCronJob {
+                        cronjob_name,
+                        namespace,
+                        buf,
+                    }) => {
+                        let job_name = buf.trim().to_string();
+                        if job_name.is_empty() {
+                            self.error = Some("Job name cannot be empty".into());
+                            self.popup = None;
+                            return;
+                        }
+                        (cronjob_name.clone(), namespace.clone(), job_name)
+                    },
+                    | _ => return,
+                };
+                self.popup = None;
+                match self
+                    .rt
+                    .block_on(self.kube.trigger_cronjob(&namespace, &cronjob_name, &job_name))
+                {
+                    | Ok(created_name) => {
+                        self.push_status(format!("Created job {}", created_name));
+                        self.error = None;
+                        self.navigate_to_related(ResourceType::Job, created_name, namespace);
+                    },
+                    | Err(e) => {
+                        self.error = Some(format!("Trigger failed: {}", e));
+                    },
+                }
+            },
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Backspace => {
+                if let Some(Popup::TriggerCronJob { buf, .. }) = &mut self.popup {
+                    buf.pop();
+                }
+            },
+            | KeyCode::Char(c) => {
+                if let Some(Popup::TriggerCronJob { buf, .. }) = &mut self.popup {
+                    buf.push(c);
+                }
+            },
+            | _ => {},
         }
     }
 
@@ -3480,6 +3574,7 @@ impl App {
                     name,
                     namespace,
                     yaml,
+                    original_yaml: None,
                 });
             },
             | Err(e) => {
@@ -3499,23 +3594,42 @@ impl App {
             name: self.detail_name.clone(),
             namespace: self.detail_namespace.clone(),
             yaml: self.detail_yaml.clone(),
+            original_yaml: None,
         });
     }
 
     /// Called by the event loop after the editor exits. Computes the diff.
     pub fn handle_edit_result(&mut self, edit: PendingEdit, edited_yaml: String) {
         if edited_yaml.trim() == edit.yaml.trim() {
-            self.push_status("No changes");
+            // If this was a re-edit, restore the previous diff view
+            if let Some(original_yaml) = edit.original_yaml {
+                let diff_lines = compute_diff(&original_yaml, &edited_yaml);
+                self.edit_ctx = Some(EditContext {
+                    resource_type: edit.resource_type,
+                    name: edit.name,
+                    namespace: edit.namespace,
+                    original_yaml,
+                    edited_yaml,
+                    diff_lines,
+                    diff_mode: DiffMode::Inline,
+                    scroll: 0,
+                    error: None,
+                });
+                self.push_status("No changes from re-edit");
+            } else {
+                self.push_status("No changes");
+            }
             return;
         }
 
-        let diff_lines = compute_diff(&edit.yaml, &edited_yaml);
+        let original_yaml = edit.original_yaml.unwrap_or(edit.yaml);
+        let diff_lines = compute_diff(&original_yaml, &edited_yaml);
 
         self.edit_ctx = Some(EditContext {
             resource_type: edit.resource_type,
             name: edit.name,
             namespace: edit.namespace,
-            original_yaml: edit.yaml,
+            original_yaml,
             edited_yaml,
             diff_lines,
             diff_mode: DiffMode::Inline,
@@ -3557,6 +3671,7 @@ impl App {
                         name: ctx.name,
                         namespace: ctx.namespace,
                         yaml: ctx.edited_yaml,
+                        original_yaml: Some(ctx.original_yaml),
                     });
                 }
             },
