@@ -1398,7 +1398,7 @@ fn render_logs(f: &mut Frame, app: &mut App) {
         | None => return,
     };
 
-    // Layout: breadcrumb + log content + filter bar + hotkey bar
+    // Layout: breadcrumb + log status + log content + filter bar + hotkey bar
     let has_filter_bar = state.filter_editing || !state.filter_text.is_empty();
     let filter_height = if has_filter_bar { 1 } else { 0 };
 
@@ -1406,7 +1406,8 @@ fn render_logs(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),             // breadcrumb
-            Constraint::Min(3),                // log content
+            Constraint::Length(1),             // log status line
+            Constraint::Min(1),                // log content (no borders)
             Constraint::Length(filter_height), // filter bar
             Constraint::Length(1),             // hotkey bar
         ])
@@ -1414,22 +1415,46 @@ fn render_logs(f: &mut Frame, app: &mut App) {
 
     render_breadcrumb(f, app, outer[0]);
 
-    let mut title_parts = Vec::new();
-    if state.following {
-        title_parts.push("[Following]");
+    // Status line: mode badges + line count
+    {
+        let dim = Style::default().fg(Color::DarkGray);
+        let badge = Style::default().fg(Color::Cyan);
+        let mut spans: Vec<Span> = Vec::new();
+        if state.following {
+            spans.push(Span::styled("[Following] ", badge));
+        }
+        if state.wrap {
+            spans.push(Span::styled("[Wrap] ", badge));
+        }
+        let visible = state.visible_lines();
+        let area_height = outer[2].height as usize;
+        let scroll_offset = if state.auto_scroll && visible.len() > area_height {
+            visible.len().saturating_sub(area_height)
+        } else {
+            state.scroll
+        };
+        let shown = visible.len().min(area_height);
+        let line_info = if let Some((start, end)) = state.selection_range() {
+            format!(
+                "{} selected  {}/{}",
+                end - start + 1,
+                scroll_offset + shown,
+                visible.len()
+            )
+        } else {
+            format!("{}/{}", scroll_offset + shown, visible.len())
+        };
+        let left_len: usize = spans.iter().map(|s| s.width()).sum();
+        let pad = (outer[1].width as usize).saturating_sub(left_len + line_info.len());
+        spans.push(Span::styled(" ".repeat(pad), dim));
+        spans.push(Span::styled(line_info, dim));
+        f.render_widget(Paragraph::new(Line::from(spans)), outer[1]);
     }
-    if state.wrap {
-        title_parts.push("[Wrap]");
-    }
-    let title = if title_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" {} ", title_parts.join(" "))
-    };
 
-    // Log lines (filtered)
+    // Log lines (filtered) — no borders for clean text selection
     let visible = state.visible_lines();
-    let area_height = outer[1].height.saturating_sub(2) as usize;
+    let area_height = outer[2].height as usize;
+    let sel_range = state.selection_range();
 
     // Auto-scroll: if at bottom, keep scroll at end
     let scroll_offset = if state.auto_scroll && visible.len() > area_height {
@@ -1444,14 +1469,19 @@ fn render_logs(f: &mut Frame, app: &mut App) {
         .skip(scroll_offset)
         .take(area_height)
         .map(|(idx, l)| {
-            let is_selected = state.selected_line == Some(idx);
-            let base_style = if is_selected {
+            let is_cursor = state.selected_line == Some(idx);
+            let is_in_selection = sel_range
+                .map(|(start, end)| idx >= start && idx <= end)
+                .unwrap_or(false);
+            let base_style = if is_cursor {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED)
+            } else if is_in_selection {
+                Style::default().fg(Color::White).bg(Color::DarkGray)
             } else {
                 Style::default().fg(Color::White)
             };
             // Highlight filter matches
-            if !is_selected {
+            if !is_cursor && !is_in_selection {
                 if let Some(re) = &state.filter_regex {
                     if let Some(m) = re.find(l) {
                         return Line::from(vec![
@@ -1469,18 +1499,11 @@ fn render_logs(f: &mut Frame, app: &mut App) {
         })
         .collect();
 
-    let line_info = format!(" {}/{} ", scroll_offset + lines.len(), visible.len());
-    let mut paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(title)
-            .title_bottom(line_info),
-    );
+    let mut paragraph = Paragraph::new(lines);
     if state.wrap {
         paragraph = paragraph.wrap(Wrap { trim: false });
     }
-    f.render_widget(paragraph, outer[1]);
+    f.render_widget(paragraph, outer[2]);
 
     // Log detail popup (selected line expanded)
     if let Some(detail) = &app.log_detail_line {
@@ -1508,12 +1531,12 @@ fn render_logs(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::DarkGray)
         };
         let filter_line = Paragraph::new(Line::from(Span::styled(filter_display, filter_style)));
-        f.render_widget(filter_line, outer[2]);
+        f.render_widget(filter_line, outer[3]);
     }
 
     // Hotkey bar
     let bar = build_hotkey_bar(app);
-    f.render_widget(Paragraph::new(bar), outer[3]);
+    f.render_widget(Paragraph::new(bar), outer[4]);
 }
 
 /// Build the hotkey bar for any context from the command registry.

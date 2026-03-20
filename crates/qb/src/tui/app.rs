@@ -498,7 +498,8 @@ impl App {
             following,
             wrapping,
             has_since,
-            has_dict_entries: !self.dict_entries.is_empty(),
+            has_labels: self.dict_entries.iter().any(|(q, ..)| q.starts_with("Labels:")),
+            has_annotations: self.dict_entries.iter().any(|(q, ..)| q.starts_with("Annotations:")),
             dict_cursor_active: self.dict_cursor.is_some(),
             has_related: !self.related_resources.is_empty(),
             paused: self.paused,
@@ -865,6 +866,7 @@ impl App {
                         }
                     } else {
                         self.related_cursor = None;
+                        self.related_tab = 0;
                     }
                     self.related_resources = new_related;
                 },
@@ -1500,23 +1502,55 @@ impl App {
             | KeyCode::Home => {
                 self.detail_scroll = 0;
             },
-            // [s] Enter/leave label/annotation selection mode
-            | KeyCode::Char('s') => {
+            // [l] Enter/leave label selection mode
+            | KeyCode::Char('l') => {
                 if secret_smart {
                     // no-op for secrets
-                } else if self.dict_cursor.is_some() {
+                } else if self.dict_cursor.is_some()
+                    && self
+                        .dict_entries
+                        .get(self.dict_cursor.unwrap_or(0))
+                        .map_or(false, |(q, ..)| q.starts_with("Labels:"))
+                {
                     self.dict_cursor = None;
-                } else if !self.dict_entries.is_empty() {
-                    self.dict_cursor = Some(0);
-                    self.scroll_to_dict_cursor();
+                } else {
+                    let first_label = self.dict_entries.iter().position(|(q, ..)| q.starts_with("Labels:"));
+                    if let Some(idx) = first_label {
+                        self.related_cursor = None;
+                        self.dict_cursor = Some(idx);
+                        self.scroll_to_dict_cursor();
+                    }
+                }
+            },
+            // [a] Enter/leave annotation selection mode
+            | KeyCode::Char('a') => {
+                if secret_smart {
+                    // no-op for secrets
+                } else if self.dict_cursor.is_some()
+                    && self
+                        .dict_entries
+                        .get(self.dict_cursor.unwrap_or(0))
+                        .map_or(false, |(q, ..)| q.starts_with("Annotations:"))
+                {
+                    self.dict_cursor = None;
+                } else {
+                    let first_annot = self
+                        .dict_entries
+                        .iter()
+                        .position(|(q, ..)| q.starts_with("Annotations:"));
+                    if let Some(idx) = first_annot {
+                        self.related_cursor = None;
+                        self.dict_cursor = Some(idx);
+                        self.scroll_to_dict_cursor();
+                    }
                 }
             },
             // [e] Edit resource
             | KeyCode::Char('e') => {
                 self.start_edit_from_detail();
             },
-            // [l] Open logs (for workload resources)
-            | KeyCode::Char('l') => {
+            // [L] Open logs (for workload resources)
+            | KeyCode::Char('L') => {
                 self.open_logs_for_selected();
             },
             // [F] Port forward
@@ -1556,13 +1590,14 @@ impl App {
                     self.open_trigger_cronjob();
                 }
             },
-            // [Tab] Toggle related resource selection
-            | KeyCode::Tab => {
+            // [r] Toggle related resource selection
+            | KeyCode::Char('r') => {
                 if self.related_resources.is_empty() {
                     // no-op
                 } else if self.related_cursor.is_some() {
                     self.related_cursor = None;
                 } else {
+                    self.dict_cursor = None; // exit dict selection
                     let cats = self.related_categories();
                     if !cats.is_empty() {
                         self.related_tab = self.related_tab.min(cats.len().saturating_sub(1));
@@ -1636,6 +1671,7 @@ impl App {
         self.selected_resource_type = Some(rt);
         self.showing_port_forwards = false;
         self.related_cursor = None;
+        self.related_tab = 0;
         self.resource_table_state = TableState::default();
         // Update nav selection
         if let Some(nav_idx) = self
@@ -1754,6 +1790,7 @@ impl App {
                 {
                     if let Some(state) = &mut self.log_state {
                         state.selected_line = None;
+                        state.selection_anchor = None;
                     }
                 } else {
                     if let Some(state) = &mut self.log_state {
@@ -1821,19 +1858,24 @@ impl App {
                 }
             },
             // Navigation — moves selected_line cursor
-            | KeyCode::Up | KeyCode::Char('k') => {
+            // Shift+Up/K extends selection from anchor
+            | KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                let extending = key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('K');
                 if let Some(state) = &mut self.log_state {
                     match state.selected_line {
                         | Some(sel) if sel > 0 => {
+                            if extending && state.selection_anchor.is_none() {
+                                state.selection_anchor = Some(sel);
+                            } else if !extending {
+                                state.selection_anchor = None;
+                            }
                             state.selected_line = Some(sel - 1);
-                            // Scroll to keep selection visible
                             if sel - 1 < state.scroll {
                                 state.scroll = sel - 1;
                             }
                             state.auto_scroll = false;
                         },
                         | None => {
-                            // Start selection at current scroll position
                             let vis_count = state.visible_lines().len();
                             if vis_count > 0 {
                                 let pos = state.scroll.min(vis_count.saturating_sub(1));
@@ -1845,11 +1887,17 @@ impl App {
                     }
                 }
             },
-            | KeyCode::Down | KeyCode::Char('j') => {
+            | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                let extending = key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('J');
                 if let Some(state) = &mut self.log_state {
                     let vis_count = state.visible_lines().len();
                     match state.selected_line {
                         | Some(sel) if sel + 1 < vis_count => {
+                            if extending && state.selection_anchor.is_none() {
+                                state.selection_anchor = Some(sel);
+                            } else if !extending {
+                                state.selection_anchor = None;
+                            }
                             state.selected_line = Some(sel + 1);
                             state.auto_scroll = sel + 1 == vis_count.saturating_sub(1);
                         },
@@ -1873,12 +1921,24 @@ impl App {
             },
             | KeyCode::Home | KeyCode::Char('g') => {
                 if let Some(state) = &mut self.log_state {
-                    state.scroll_to_top();
+                    let vis_count = state.visible_lines().len();
+                    if vis_count > 0 {
+                        state.selected_line = Some(0);
+                        state.selection_anchor = None;
+                        state.scroll = 0;
+                        state.auto_scroll = false;
+                    }
                 }
             },
             | KeyCode::End | KeyCode::Char('G') => {
                 if let Some(state) = &mut self.log_state {
-                    state.scroll_to_bottom(visible_count);
+                    let vis_count = state.visible_lines().len();
+                    if vis_count > 0 {
+                        state.selected_line = Some(vis_count.saturating_sub(1));
+                        state.selection_anchor = None;
+                        state.scroll = vis_count.saturating_sub(1);
+                        state.auto_scroll = true;
+                    }
                 }
             },
             | _ => {},
@@ -2690,8 +2750,19 @@ impl App {
     fn copy_logs_to_clipboard(&mut self) {
         if let Some(state) = &self.log_state {
             let visible = state.visible_lines();
-            let text = visible.join("\n");
-            let count = visible.len();
+            let (text, count) = if let Some((start, end)) = state.selection_range() {
+                let selected: Vec<&str> = visible
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i >= start && *i <= end)
+                    .map(|(_, l)| *l)
+                    .collect();
+                let n = selected.len();
+                (selected.join("\n"), n)
+            } else {
+                let n = visible.len();
+                (visible.join("\n"), n)
+            };
             match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
                 | Ok(()) => {
                     self.push_status(format!("Copied {} log lines to clipboard", count));
@@ -3139,7 +3210,7 @@ impl App {
             .pf_manager
             .entries()
             .iter()
-            .filter(|e| !matches!(e.status, portforward::PortForwardStatus::Cancelled))
+            .filter(|e| e.status.is_running())
             .count();
         self.popup = Some(Popup::ConfirmQuit { pf_count });
     }

@@ -34,6 +34,7 @@ pub struct LogViewState {
     pub scroll: usize,
     pub auto_scroll: bool,
     pub selected_line: Option<usize>,
+    pub selection_anchor: Option<usize>,
     pub wrap: bool,
 
     // Pod / container selection
@@ -60,6 +61,7 @@ impl LogViewState {
             scroll: 0,
             auto_scroll: true,
             selected_line: None,
+            selection_anchor: None,
             wrap: false,
             pods,
             selected_pod: None,
@@ -238,14 +240,11 @@ impl LogViewState {
         self.scroll = (self.scroll + n).min(visible_count.saturating_sub(1));
     }
 
-    pub fn scroll_to_top(&mut self) {
-        self.scroll = 0;
-        self.auto_scroll = false;
-    }
-
-    pub fn scroll_to_bottom(&mut self, visible_count: usize) {
-        self.scroll = visible_count.saturating_sub(1);
-        self.auto_scroll = true;
+    /// Returns (start, end) inclusive range if a multi-line selection exists.
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        let cursor = self.selected_line?;
+        Some((anchor.min(cursor), anchor.max(cursor)))
     }
 }
 

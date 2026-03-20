@@ -282,7 +282,7 @@ async fn port_forward_task(
     local_port: u16,
     remote_port: u16,
     mut cancel_rx: watch::Receiver<bool>,
-    pause_rx: watch::Receiver<bool>,
+    mut pause_rx: watch::Receiver<bool>,
     update_tx: mpsc::UnboundedSender<PfUpdate>,
 ) {
     let listener = match TcpListener::bind(("127.0.0.1", local_port)).await {
@@ -301,7 +301,49 @@ async fn port_forward_task(
         status: PortForwardStatus::Active,
     });
 
+    let mut listener = Some(listener);
+
     loop {
+        // If paused, drop the listener to free the port and wait for
+        // resume or cancel.
+        if *pause_rx.borrow() {
+            drop(listener.take());
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            return;
+                        }
+                    }
+                    _ = pause_rx.changed() => {
+                        if !*pause_rx.borrow() {
+                            // Resumed — re-bind the port
+                            match TcpListener::bind(("127.0.0.1", local_port)).await {
+                                | Ok(l) => {
+                                    listener = Some(l);
+                                    let _ = update_tx.send(PfUpdate::Status {
+                                        id,
+                                        status: PortForwardStatus::Active,
+                                    });
+                                    break;
+                                },
+                                | Err(e) => {
+                                    let _ = update_tx.send(PfUpdate::Status {
+                                        id,
+                                        status: PortForwardStatus::Error(format!("Re-bind :{} {}", local_port, e)),
+                                    });
+                                    return;
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let l = listener.as_ref().unwrap();
+
         tokio::select! {
             biased;
             _ = cancel_rx.changed() => {
@@ -309,15 +351,13 @@ async fn port_forward_task(
                     return;
                 }
             }
-            accept = listener.accept() => {
+            _ = pause_rx.changed() => {
+                // Will drop listener at top of loop
+                continue;
+            }
+            accept = l.accept() => {
                 match accept {
                     | Ok((tcp_stream, _)) => {
-                        // Reject connections while paused
-                        if *pause_rx.borrow() {
-                            drop(tcp_stream);
-                            continue;
-                        }
-
                         // Resolve current pod for this connection
                         let pod_name = match resolve_pod(&client, &namespace, &target).await {
                             | Some(name) => {

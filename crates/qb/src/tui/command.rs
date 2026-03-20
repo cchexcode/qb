@@ -68,7 +68,8 @@ pub struct CmdFlags {
     pub following: bool,
     pub wrapping: bool,
     pub has_since: bool,
-    pub has_dict_entries: bool,
+    pub has_labels: bool,
+    pub has_annotations: bool,
     pub dict_cursor_active: bool,
     pub has_related: bool,
     pub paused: bool,
@@ -175,8 +176,12 @@ fn is_node(f: &CmdFlags) -> bool {
     f.resource_type == Some(ResourceType::Node)
 }
 
-fn has_dict(f: &CmdFlags) -> bool {
-    f.has_dict_entries
+fn has_labels(f: &CmdFlags) -> bool {
+    f.has_labels
+}
+
+fn has_annotations(f: &CmdFlags) -> bool {
+    f.has_annotations
 }
 
 fn has_dict_cursor(f: &CmdFlags) -> bool {
@@ -437,7 +442,16 @@ static COMMANDS: &[Cmd] = &[
         key: "l",
         label: "Logs",
         description: "Open logs for workload pods",
-        contexts: &[Ctx::Resources, Ctx::Detail],
+        contexts: &[Ctx::Resources],
+        hotkey: true,
+        palette: false,
+        available: Some(supports_logs),
+    },
+    Cmd {
+        key: "L",
+        label: "Logs",
+        description: "Open logs for workload pods",
+        contexts: &[Ctx::Detail],
         hotkey: true,
         palette: false,
         available: Some(supports_logs),
@@ -571,13 +585,22 @@ static COMMANDS: &[Cmd] = &[
         available: None,
     },
     Cmd {
-        key: "s",
-        label: "Select",
-        description: "Enter/leave label/annotation selection",
+        key: "l",
+        label: "Labels",
+        description: "Enter/leave label selection",
         contexts: &[Ctx::Detail],
         hotkey: true,
         palette: false,
-        available: Some(has_dict),
+        available: Some(has_labels),
+    },
+    Cmd {
+        key: "a",
+        label: "Annotations",
+        description: "Enter/leave annotation selection",
+        contexts: &[Ctx::Detail],
+        hotkey: true,
+        palette: false,
+        available: Some(has_annotations),
     },
     Cmd {
         key: "Space",
@@ -607,7 +630,7 @@ static COMMANDS: &[Cmd] = &[
         available: Some(has_dict_cursor),
     },
     Cmd {
-        key: "Tab",
+        key: "r",
         label: "Related",
         description: "Toggle related resources selection",
         contexts: &[Ctx::Detail],
@@ -663,10 +686,19 @@ static COMMANDS: &[Cmd] = &[
     },
     Cmd {
         key: "Y",
-        label: "Copy All",
-        description: "Copy all log lines to clipboard",
+        label: "Copy",
+        description: "Copy selected lines (or all) to clipboard",
         contexts: &[Ctx::Logs],
         hotkey: true,
+        palette: false,
+        available: None,
+    },
+    Cmd {
+        key: "J/K",
+        label: "Extend",
+        description: "Extend selection up/down (Shift+j/k)",
+        contexts: &[Ctx::Logs],
+        hotkey: false,
         palette: false,
         available: None,
     },
