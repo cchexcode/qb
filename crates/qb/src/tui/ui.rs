@@ -1462,22 +1462,14 @@ fn render_logs(f: &mut Frame, app: &mut App) {
             spans.push(Span::styled("[Wrap] ", badge));
         }
         let visible = state.visible_lines();
-        let area_height = outer[2].height as usize;
-        let scroll_offset = if state.auto_scroll && visible.len() > area_height {
-            visible.len().saturating_sub(area_height)
-        } else {
-            state.scroll
-        };
-        let shown = visible.len().min(area_height);
+        let vis_count = visible.len();
+        let scroll_pos = state.scroll.min(vis_count.saturating_sub(1));
         let line_info = if let Some((start, end)) = state.selection_range() {
-            format!(
-                "{} selected  {}/{}",
-                end - start + 1,
-                scroll_offset + shown,
-                visible.len()
-            )
+            format!("{} selected  {}/{}", end - start + 1, scroll_pos + 1, vis_count)
+        } else if vis_count == 0 {
+            "0/0".to_string()
         } else {
-            format!("{}/{}", scroll_offset + shown, visible.len())
+            format!("{}/{}", scroll_pos + 1, vis_count)
         };
         let left_len: usize = spans.iter().map(|s| s.width()).sum();
         let pad = (outer[1].width as usize).saturating_sub(left_len + line_info.len());
@@ -1488,21 +1480,60 @@ fn render_logs(f: &mut Frame, app: &mut App) {
 
     // Log lines (filtered) — no borders for clean text selection
     let visible = state.visible_lines();
+    let area_width = outer[2].width as usize;
     let area_height = outer[2].height as usize;
     let sel_range = state.selection_range();
 
-    // Auto-scroll: if at bottom, keep scroll at end
-    let scroll_offset = if state.auto_scroll && visible.len() > area_height {
-        visible.len().saturating_sub(area_height)
+    // When wrapping, compute how many terminal rows each logical line takes
+    let wrapped_heights: Vec<usize> = if state.wrap && area_width > 0 {
+        visible
+            .iter()
+            .map(|l| {
+                let len = l.len();
+                if len == 0 {
+                    1
+                } else {
+                    (len + area_width - 1) / area_width
+                }
+            })
+            .collect()
     } else {
-        state.scroll
+        vec![1; visible.len()]
     };
 
+    let total_rows: usize = wrapped_heights.iter().sum();
+
+    // Auto-scroll: find the scroll offset (in logical lines) that shows the end
+    let scroll_offset = if state.auto_scroll && total_rows > area_height {
+        // Find first logical line such that remaining rows fit in area_height
+        let mut remaining = total_rows;
+        let mut offset = 0;
+        for h in &wrapped_heights {
+            if remaining <= area_height {
+                break;
+            }
+            remaining -= h;
+            offset += 1;
+        }
+        offset
+    } else {
+        state.scroll.min(visible.len().saturating_sub(1))
+    };
+
+    // Collect logical lines that fit in the viewport (accounting for wrap)
+    let mut rows_used = 0;
     let lines: Vec<Line> = visible
         .iter()
         .enumerate()
         .skip(scroll_offset)
-        .take(area_height)
+        .take_while(|(idx, _)| {
+            let h = wrapped_heights.get(*idx).copied().unwrap_or(1);
+            if rows_used >= area_height {
+                return false;
+            }
+            rows_used += h;
+            true
+        })
         .map(|(idx, l)| {
             let is_cursor = state.selected_line == Some(idx);
             let is_in_selection = sel_range
