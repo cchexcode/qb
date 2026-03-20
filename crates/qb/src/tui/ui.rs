@@ -392,6 +392,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
                     | s if s.starts_with("Init:") => Style::default().fg(Color::Yellow),
                     | "CrashLoopBackOff"
                     | "Error"
+                    | "Failed"
                     | "OOMKilled"
                     | "ImagePullBackOff"
                     | "ErrImagePull"
@@ -1815,6 +1816,8 @@ fn render_profiles(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::tui::app::FavDisplayItem;
+
     let favorites = &app.config.active_profile().favorites;
 
     let focused = app.focus == Focus::Resources;
@@ -1839,79 +1842,77 @@ fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    let display = app.favorites_display_items();
+
     // Sync table state with cursor
-    app.favorites_table_state.select(if favorites.is_empty() {
+    app.favorites_table_state.select(if display.is_empty() {
         None
     } else {
         Some(app.favorites_cursor)
     });
 
-    let header = Row::new(vec!["TYPE", "NAME", "NAMESPACE", "CONTEXT"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-        .bottom_margin(0);
-
     let current_context = app.kube.current_context().to_string();
     let available_contexts = app.kube.contexts();
 
-    let rows: Vec<Row> = favorites
+    let rows: Vec<Row> = display
         .iter()
-        .map(|fav| {
-            let missing = !available_contexts.iter().any(|c| c == &fav.context);
-            let is_diff_marked = app
-                .diff_mark
-                .as_ref()
-                .map(|(n, ns, _)| n == &fav.name && ns == &fav.namespace)
-                .unwrap_or(false);
+        .map(|item| {
+            match item {
+                | FavDisplayItem::Header(label) => {
+                    Row::new(vec![Cell::from(Span::styled(
+                        format!("  {}", label),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                    ))])
+                },
+                | FavDisplayItem::Entry(idx) => {
+                    let fav = &favorites[*idx];
+                    let missing = !available_contexts.iter().any(|c| c == &fav.context);
+                    let is_diff_marked = app
+                        .diff_mark
+                        .as_ref()
+                        .map(|(n, ns, _)| n == &fav.name && ns == &fav.namespace)
+                        .unwrap_or(false);
 
-            let type_label = crate::k8s::ResourceType::from_singular_name(&fav.resource_type)
-                .map(|rt| rt.display_name())
-                .unwrap_or(&fav.resource_type);
+                    let name_cell = if is_diff_marked {
+                        Cell::from(Span::styled(
+                            format!("* {}", fav.name),
+                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                        ))
+                    } else {
+                        let name_style = if missing {
+                            Style::default().fg(Color::DarkGray)
+                        } else if fav.context == current_context {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default()
+                        };
+                        let name_prefix = if missing { "⚠ " } else { "★ " };
+                        Cell::from(Span::styled(format!("{}{}", name_prefix, fav.name), name_style))
+                    };
 
-            let name_cell = if is_diff_marked {
-                Cell::from(Span::styled(
-                    format!("* {}", fav.name),
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                let name_style = if missing {
-                    Style::default().fg(Color::DarkGray)
-                } else if fav.context == current_context {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default()
-                };
-                let name_prefix = if missing { "⚠ " } else { "★ " };
-                Cell::from(Span::styled(format!("{}{}", name_prefix, fav.name), name_style))
-            };
-
-            Row::new(vec![
-                Cell::from(type_label),
-                name_cell,
-                Cell::from(fav.namespace.as_str()),
-                Cell::from(if missing {
-                    Span::styled(format!("{} (missing)", fav.context), Style::default().fg(Color::Red))
-                } else {
-                    Span::raw(fav.context.as_str())
-                }),
-            ])
+                    Row::new(vec![
+                        name_cell,
+                        Cell::from(fav.namespace.as_str()),
+                        Cell::from(if missing {
+                            Span::styled(format!("{} (missing)", fav.context), Style::default().fg(Color::Red))
+                        } else {
+                            Span::raw(fav.context.as_str())
+                        }),
+                    ])
+                },
+            }
         })
         .collect();
 
-    let table = Table::new(rows, [
-        Constraint::Length(18),
-        Constraint::Min(20),
-        Constraint::Length(18),
-        Constraint::Min(14),
-    ])
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-            .title(format!(" ★ Favorites ({}) ", favorites.len())),
-    )
-    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Yellow))
-    .highlight_symbol("▶ ");
+    let table = Table::new(rows, [Constraint::Min(20), Constraint::Length(18), Constraint::Min(14)])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(format!(" ★ Favorites ({}) ", favorites.len())),
+        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Yellow))
+        .highlight_symbol("▶ ");
 
     f.render_stateful_widget(table, area, &mut app.favorites_table_state);
 }

@@ -271,6 +271,13 @@ pub enum NavItemKind {
     Profiles,
 }
 
+/// An item in the favorites display list — either a section header or a
+/// reference (by original index) into the profile's favorites Vec.
+pub enum FavDisplayItem {
+    Header(String),
+    Entry(usize),
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -3231,31 +3238,78 @@ impl App {
         }
     }
 
+    /// Build a sorted, grouped display list for the favorites panel.
+    /// Groups favorites by resource type (alphabetically by display name),
+    /// then sorts entries within each group by name.
+    pub fn favorites_display_items(&self) -> Vec<FavDisplayItem> {
+        let favorites = &self.config.active_profile().favorites;
+        if favorites.is_empty() {
+            return Vec::new();
+        }
+        let mut indexed: Vec<(usize, &crate::config::FavoriteEntry)> = favorites.iter().enumerate().collect();
+        indexed.sort_by(|a, b| {
+            let type_a = ResourceType::from_singular_name(&a.1.resource_type)
+                .map(|rt| rt.display_name())
+                .unwrap_or(&a.1.resource_type);
+            let type_b = ResourceType::from_singular_name(&b.1.resource_type)
+                .map(|rt| rt.display_name())
+                .unwrap_or(&b.1.resource_type);
+            type_a.cmp(type_b).then(a.1.name.cmp(&b.1.name))
+        });
+
+        let mut items = Vec::new();
+        let mut current_type = "";
+        for (idx, fav) in &indexed {
+            if fav.resource_type != current_type {
+                current_type = &fav.resource_type;
+                let label = ResourceType::from_singular_name(current_type)
+                    .map(|rt| rt.display_name().to_string())
+                    .unwrap_or_else(|| current_type.to_string());
+                items.push(FavDisplayItem::Header(label));
+            }
+            items.push(FavDisplayItem::Entry(*idx));
+        }
+        items
+    }
+
+    /// Resolve the original favorite index for the current display cursor.
+    fn favorites_entry_at_cursor(&self) -> Option<usize> {
+        let display = self.favorites_display_items();
+        match display.get(self.favorites_cursor) {
+            | Some(FavDisplayItem::Entry(idx)) => Some(*idx),
+            | _ => None,
+        }
+    }
+
     /// Navigate to a favorite from the favorites view.
     fn open_favorite_at_cursor(&mut self) {
-        let favorites = self.config.active_profile().favorites.clone();
-        if let Some(fav) = favorites.get(self.favorites_cursor) {
-            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
-                self.return_panel = Some(self.panel.clone());
-                self.panel = Panel::ResourceList(rt);
-                self.pending_load = Some(PendingLoad::ResourceDetail {
-                    name: fav.name.clone(),
-                    namespace: fav.namespace.clone(),
-                });
+        if let Some(idx) = self.favorites_entry_at_cursor() {
+            let favorites = self.config.active_profile().favorites.clone();
+            if let Some(fav) = favorites.get(idx) {
+                if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                    self.return_panel = Some(self.panel.clone());
+                    self.panel = Panel::ResourceList(rt);
+                    self.pending_load = Some(PendingLoad::ResourceDetail {
+                        name: fav.name.clone(),
+                        namespace: fav.namespace.clone(),
+                    });
+                }
             }
         }
     }
 
     /// Remove a favorite from the favorites view.
     fn remove_favorite_at_cursor(&mut self) {
-        let favorites = self.config.active_profile().favorites.clone();
-        if let Some(fav) = favorites.get(self.favorites_cursor) {
-            let fav = fav.clone();
+        if let Some(idx) = self.favorites_entry_at_cursor() {
+            let fav = self.config.active_profile().favorites[idx].clone();
             self.config.active_profile_mut().favorites.retain(|f| f != &fav);
-            let count = self.config.active_profile().favorites.len();
-            if self.favorites_cursor >= count && count > 0 {
-                self.favorites_cursor = count - 1;
+            // Clamp cursor to valid display range
+            let display_len = self.favorites_display_items().len();
+            if self.favorites_cursor >= display_len {
+                self.favorites_cursor = display_len.saturating_sub(1);
             }
+            // If cursor landed on a header, advance to next entry
+            self.snap_favorites_cursor_to_entry();
             self.push_status(format!("Removed '{}' from favorites", fav.name));
             if let Err(e) = self.config.save() {
                 self.error = Some(format!("Failed to save config: {}", e));
@@ -3266,38 +3320,86 @@ impl App {
     /// Resolve the favorite at the cursor, setting the panel to ResourceList
     /// for downstream commands. Returns (rt, name, namespace) if valid.
     fn resolve_favorite_at_cursor(&self) -> Option<(ResourceType, String, String)> {
-        let fav = self.config.active_profile().favorites.get(self.favorites_cursor)?;
+        let idx = self.favorites_entry_at_cursor()?;
+        let fav = self.config.active_profile().favorites.get(idx)?;
         let rt = ResourceType::from_singular_name(&fav.resource_type)?;
         Some((rt, fav.name.clone(), fav.namespace.clone()))
+    }
+
+    /// If the favorites cursor is on a header, snap it to the nearest entry.
+    fn snap_favorites_cursor_to_entry(&mut self) {
+        let display = self.favorites_display_items();
+        if display.is_empty() {
+            self.favorites_cursor = 0;
+            return;
+        }
+        // Try forward first, then backward
+        let len = display.len();
+        for i in self.favorites_cursor..len {
+            if matches!(display[i], FavDisplayItem::Entry(_)) {
+                self.favorites_cursor = i;
+                return;
+            }
+        }
+        for i in (0..self.favorites_cursor).rev() {
+            if matches!(display[i], FavDisplayItem::Entry(_)) {
+                self.favorites_cursor = i;
+                return;
+            }
+        }
+    }
+
+    /// Move the favorites cursor up, skipping headers.
+    fn favorites_cursor_up(&mut self) {
+        let display = self.favorites_display_items();
+        for i in (0..self.favorites_cursor).rev() {
+            if matches!(display[i], FavDisplayItem::Entry(_)) {
+                self.favorites_cursor = i;
+                return;
+            }
+        }
+    }
+
+    /// Move the favorites cursor down, skipping headers.
+    fn favorites_cursor_down(&mut self) {
+        let display = self.favorites_display_items();
+        for i in (self.favorites_cursor + 1)..display.len() {
+            if matches!(display[i], FavDisplayItem::Entry(_)) {
+                self.favorites_cursor = i;
+                return;
+            }
+        }
     }
 
     /// Handle keys in the favorites view.
     /// Supports all standard resource list commands plus `*` to de-favorite.
     async fn handle_favorites_key(&mut self, key: KeyEvent) {
-        let count = self.config.active_profile().favorites.len();
+        let display = self.favorites_display_items();
+        let display_len = display.len();
+        drop(display);
         match key.code {
             | KeyCode::Up | KeyCode::Char('k') => {
-                if self.favorites_cursor > 0 {
-                    self.favorites_cursor -= 1;
-                }
+                self.favorites_cursor_up();
             },
             | KeyCode::Down | KeyCode::Char('j') => {
-                if count > 0 && self.favorites_cursor + 1 < count {
-                    self.favorites_cursor += 1;
-                }
+                self.favorites_cursor_down();
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.favorites_cursor = self.favorites_cursor.saturating_sub(20);
+                self.snap_favorites_cursor_to_entry();
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.favorites_cursor = (self.favorites_cursor + 20).min(count.saturating_sub(1));
+                self.favorites_cursor = (self.favorites_cursor + 20).min(display_len.saturating_sub(1));
+                self.snap_favorites_cursor_to_entry();
             },
             | KeyCode::Home | KeyCode::Char('g') => {
                 self.favorites_cursor = 0;
+                self.snap_favorites_cursor_to_entry();
             },
             | KeyCode::End | KeyCode::Char('G') => {
-                if count > 0 {
-                    self.favorites_cursor = count - 1;
+                if display_len > 0 {
+                    self.favorites_cursor = display_len - 1;
+                    self.snap_favorites_cursor_to_entry();
                 }
             },
             // [Enter] Open detail view for this favorite
@@ -3318,8 +3420,8 @@ impl App {
             },
             // [y] Copy resource name
             | KeyCode::Char('y') => {
-                if let Some(fav) = self.config.active_profile().favorites.get(self.favorites_cursor) {
-                    let name = fav.name.clone();
+                if let Some(idx) = self.favorites_entry_at_cursor() {
+                    let name = self.config.active_profile().favorites[idx].name.clone();
                     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&name)) {
                         | Ok(()) => {
                             self.push_status(format!("Copied '{}'", name));
@@ -3476,16 +3578,18 @@ impl App {
 
     /// Open logs for the favorite at cursor.
     fn open_favorite_logs(&mut self) {
-        let favorites = self.config.active_profile().favorites.clone();
-        if let Some(fav) = favorites.get(self.favorites_cursor) {
-            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
-                if rt.supports_logs() {
-                    self.return_panel = Some(self.panel.clone());
-                    self.panel = Panel::ResourceList(rt);
-                    self.pending_load = Some(PendingLoad::Logs {
-                        name: fav.name.clone(),
-                        namespace: fav.namespace.clone(),
-                    });
+        if let Some(idx) = self.favorites_entry_at_cursor() {
+            let favorites = self.config.active_profile().favorites.clone();
+            if let Some(fav) = favorites.get(idx) {
+                if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                    if rt.supports_logs() {
+                        self.return_panel = Some(self.panel.clone());
+                        self.panel = Panel::ResourceList(rt);
+                        self.pending_load = Some(PendingLoad::Logs {
+                            name: fav.name.clone(),
+                            namespace: fav.namespace.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -3493,26 +3597,28 @@ impl App {
 
     /// Edit the resource at the favorites cursor.
     async fn edit_favorite_at_cursor(&mut self) {
-        let favorites = self.config.active_profile().favorites.clone();
-        if let Some(fav) = favorites.get(self.favorites_cursor) {
-            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
-                // Fetch the resource YAML
-                match self.kube.get_resource(rt, &fav.namespace, &fav.name).await {
-                    | Ok(value) => {
-                        let yaml = serde_yaml::to_string(&value).unwrap_or_default();
-                        self.return_panel = Some(self.panel.clone());
-                        self.panel = Panel::ResourceList(rt);
-                        self.pending_edit = Some(PendingEdit {
-                            resource_type: rt,
-                            name: fav.name.clone(),
-                            namespace: fav.namespace.clone(),
-                            yaml,
-                            original_yaml: None,
-                        });
-                    },
-                    | Err(e) => {
-                        self.error = Some(format!("Failed to fetch resource: {}", e));
-                    },
+        if let Some(idx) = self.favorites_entry_at_cursor() {
+            let favorites = self.config.active_profile().favorites.clone();
+            if let Some(fav) = favorites.get(idx) {
+                if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                    // Fetch the resource YAML
+                    match self.kube.get_resource(rt, &fav.namespace, &fav.name).await {
+                        | Ok(value) => {
+                            let yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                            self.return_panel = Some(self.panel.clone());
+                            self.panel = Panel::ResourceList(rt);
+                            self.pending_edit = Some(PendingEdit {
+                                resource_type: rt,
+                                name: fav.name.clone(),
+                                namespace: fav.namespace.clone(),
+                                yaml,
+                                original_yaml: None,
+                            });
+                        },
+                        | Err(e) => {
+                            self.error = Some(format!("Failed to fetch resource: {}", e));
+                        },
+                    }
                 }
             }
         }
