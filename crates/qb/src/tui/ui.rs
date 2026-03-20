@@ -5,6 +5,7 @@ use {
             DetailMode,
             Focus,
             NavItemKind,
+            Panel,
             Popup,
             View,
             ALL_NAMESPACES_LABEL,
@@ -62,7 +63,7 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = vec![Span::styled(" ", dim)];
 
     let ctx = app.kube.current_context().to_string();
-    let is_top = app.view == View::Main && app.selected_resource_type.is_none();
+    let is_top = app.view == View::Main && app.selected_resource_type().is_none();
     spans.push(Span::styled(ctx, if is_top { active } else { seg }));
 
     // Namespace
@@ -71,7 +72,7 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
     spans.push(Span::styled(ns, seg));
 
     // Resource type
-    if let Some(rt) = app.selected_resource_type {
+    if let Some(rt) = app.selected_resource_type() {
         spans.push(sep.clone());
         let is_last = app.view == View::Main;
         spans.push(Span::styled(
@@ -89,6 +90,13 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or_else(|| "?".into());
             spans.push(sep.clone());
             let is_detail = app.view == View::Detail;
+            // Star indicator for favorites
+            if app.is_favorite(rt, &app.detail_name, &app.detail_namespace) {
+                spans.push(Span::styled(
+                    "★ ",
+                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+                ));
+            }
             spans.push(Span::styled(name, if is_detail { active } else { seg }));
         }
 
@@ -199,34 +207,31 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
         .nav_items
         .iter()
         .map(|item| {
+            let is_active = match (&item.kind, &app.panel) {
+                | (NavItemKind::ClusterStats, Panel::Overview) => true,
+                | (NavItemKind::Favorites, Panel::Favorites) => true,
+                | (NavItemKind::PortForwards, Panel::PortForwards) => true,
+                | (NavItemKind::Profiles, Panel::Profiles) => true,
+                | (NavItemKind::Resource(rt), Panel::ResourceList(prt)) => rt == prt,
+                | _ => false,
+            };
             let style = match &item.kind {
                 | NavItemKind::Category => Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-                | NavItemKind::Resource(rt) => {
-                    if app.selected_resource_type == Some(*rt) && !app.showing_port_forwards {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::White)
-                    }
-                },
-                | NavItemKind::ClusterStats => {
-                    if app.is_showing_cluster_stats() && !app.showing_port_forwards {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::White)
-                    }
-                },
-                | NavItemKind::PortForwards => {
-                    if app.showing_port_forwards {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::White)
-                    }
-                },
+                | NavItemKind::Favorites if is_active => Style::default().fg(Color::Yellow),
+                | _ if is_active => Style::default().fg(Color::Green),
+                | _ => Style::default().fg(Color::White),
             };
             // Append resource count badge if available
             let label = if let NavItemKind::Resource(rt) = &item.kind {
                 if let Some(&count) = app.resource_counts.get(rt) {
                     format!("{} ({})", item.label, count)
+                } else {
+                    item.label.clone()
+                }
+            } else if matches!(item.kind, NavItemKind::Favorites) {
+                let fav_count = app.config.active_profile().favorites.len();
+                if fav_count > 0 {
+                    format!("{} ({})", item.label, fav_count)
                 } else {
                     item.label.clone()
                 }
@@ -272,19 +277,27 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
-    // Port forwards view
-    if app.is_showing_port_forwards() {
-        render_port_forwards(f, app, area);
-        return;
+    match &app.panel {
+        | Panel::Favorites => {
+            render_favorites(f, app, area);
+            return;
+        },
+        | Panel::Profiles => {
+            render_profiles(f, app, area);
+            return;
+        },
+        | Panel::PortForwards => {
+            render_port_forwards(f, app, area);
+            return;
+        },
+        | Panel::Overview => {
+            render_cluster_stats(f, app, area);
+            return;
+        },
+        | Panel::ResourceList(_) => {},
     }
 
-    // Cluster stats overview
-    if app.is_showing_cluster_stats() {
-        render_cluster_stats(f, app, area);
-        return;
-    }
-
-    let rt = match app.selected_resource_type {
+    let rt = match app.selected_resource_type() {
         | Some(rt) => rt,
         | None => {
             let block = Block::default()
@@ -322,6 +335,21 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
     )
     .height(1);
 
+    // Pre-compute favorite set for this resource type to avoid borrow conflicts
+    let fav_set: std::collections::HashSet<(String, String)> = if let Some(rt) = app.selected_resource_type() {
+        let context = app.kube.current_context();
+        let rt_name = rt.singular_name();
+        app.config
+            .active_profile()
+            .favorites
+            .iter()
+            .filter(|f| f.resource_type == rt_name && f.context == context)
+            .map(|f| (f.name.clone(), f.namespace.clone()))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let rows: Vec<Row> = visible_indices
         .iter()
         .map(|&idx| {
@@ -332,10 +360,17 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
                 .map(|(n, ns, _)| n == &entry.name && ns == &entry.namespace)
                 .unwrap_or(false);
 
+            let is_favorited = fav_set.contains(&(entry.name.clone(), entry.namespace.clone()));
+
             let name_cell = if is_diff_marked {
                 Cell::from(Span::styled(
                     format!("* {}", entry.name),
                     Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ))
+            } else if is_favorited {
+                Cell::from(Span::styled(
+                    format!("★ {}", entry.name),
+                    Style::default().fg(Color::Yellow),
                 ))
             } else {
                 Cell::from(entry.name.as_str())
@@ -1236,7 +1271,7 @@ fn render_edit_diff(f: &mut Frame, app: &mut App) {
 }
 
 fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
-    let rt = match app.selected_resource_type {
+    let rt = match app.selected_resource_type() {
         | Some(rt) => rt,
         | None => return vec![],
     };
@@ -1667,6 +1702,189 @@ fn build_hotkey_bar(app: &App) -> Line<'static> {
 // Port forwards view
 // ---------------------------------------------------------------------------
 
+fn render_profiles(f: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == Focus::Resources;
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+
+    let mut names: Vec<String> = app.config.profiles.keys().cloned().collect();
+    names.sort();
+
+    if names.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(" Profiles ");
+        let text = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled("  No profiles", Style::default().fg(Color::DarkGray))),
+        ])
+        .block(block);
+        f.render_widget(text, area);
+        return;
+    }
+
+    app.profiles_table_state.select(if names.is_empty() {
+        None
+    } else {
+        Some(app.profiles_cursor)
+    });
+
+    let header = Row::new(vec!["NAME", "CONTEXT", "FAVORITES", "PORT FORWARDS"])
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .bottom_margin(0);
+
+    let rows: Vec<Row> = names
+        .iter()
+        .map(|name| {
+            let profile = app.config.profiles.get(name);
+            let is_active = name == &app.config.active_profile;
+
+            let fav_count = profile.map(|p| p.favorites.len()).unwrap_or(0);
+            let pf_count = profile.map(|p| p.port_forwards.len()).unwrap_or(0);
+            let context = profile.and_then(|p| p.context.as_deref()).unwrap_or("(default)");
+
+            let name_style = if is_active {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            let name_display = if is_active {
+                format!("● {}", name)
+            } else {
+                format!("  {}", name)
+            };
+
+            Row::new(vec![
+                Cell::from(Span::styled(name_display, name_style)),
+                Cell::from(context),
+                Cell::from(fav_count.to_string()),
+                Cell::from(pf_count.to_string()),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(rows, [
+        Constraint::Min(20),
+        Constraint::Length(20),
+        Constraint::Length(12),
+        Constraint::Length(14),
+    ])
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(format!(" Profiles ({}) ", names.len())),
+    )
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
+    .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(table, area, &mut app.profiles_table_state);
+}
+
+fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
+    let favorites = &app.config.active_profile().favorites;
+
+    let focused = app.focus == Focus::Resources;
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+
+    if favorites.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(" ★ Favorites ");
+        let text = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled("  No favorites yet", Style::default().fg(Color::DarkGray))),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Press [*] on any resource to add it",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(block);
+        f.render_widget(text, area);
+        return;
+    }
+
+    // Sync table state with cursor
+    app.favorites_table_state.select(if favorites.is_empty() {
+        None
+    } else {
+        Some(app.favorites_cursor)
+    });
+
+    let header = Row::new(vec!["TYPE", "NAME", "NAMESPACE", "CONTEXT"])
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .bottom_margin(0);
+
+    let current_context = app.kube.current_context().to_string();
+    let available_contexts = app.kube.contexts();
+
+    let rows: Vec<Row> = favorites
+        .iter()
+        .map(|fav| {
+            let missing = !available_contexts.iter().any(|c| c == &fav.context);
+            let is_diff_marked = app
+                .diff_mark
+                .as_ref()
+                .map(|(n, ns, _)| n == &fav.name && ns == &fav.namespace)
+                .unwrap_or(false);
+
+            let type_label = crate::k8s::ResourceType::from_singular_name(&fav.resource_type)
+                .map(|rt| rt.display_name())
+                .unwrap_or(&fav.resource_type);
+
+            let name_cell = if is_diff_marked {
+                Cell::from(Span::styled(
+                    format!("* {}", fav.name),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                let name_style = if missing {
+                    Style::default().fg(Color::DarkGray)
+                } else if fav.context == current_context {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                let name_prefix = if missing { "⚠ " } else { "★ " };
+                Cell::from(Span::styled(format!("{}{}", name_prefix, fav.name), name_style))
+            };
+
+            Row::new(vec![
+                Cell::from(type_label),
+                name_cell,
+                Cell::from(fav.namespace.as_str()),
+                Cell::from(if missing {
+                    Span::styled(format!("{} (missing)", fav.context), Style::default().fg(Color::Red))
+                } else {
+                    Span::raw(fav.context.as_str())
+                }),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(rows, [
+        Constraint::Length(18),
+        Constraint::Min(20),
+        Constraint::Length(18),
+        Constraint::Min(14),
+    ])
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(format!(" ★ Favorites ({}) ", favorites.len())),
+    )
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Yellow))
+    .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(table, area, &mut app.favorites_table_state);
+}
+
 fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
     let entries = app.pf_manager.entries();
 
@@ -1718,13 +1936,7 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
 
             let status_text = match &entry.status {
                 | PortForwardStatus::Reconnecting { attempt } => format!("Retry({})", attempt),
-                | PortForwardStatus::Error(msg) => {
-                    if msg.len() > 20 {
-                        format!("Err:{:.20}", msg)
-                    } else {
-                        format!("Err:{}", msg)
-                    }
-                },
+                | PortForwardStatus::Error(msg) => msg.clone(),
                 | other => other.display().to_string(),
             };
 
@@ -1741,7 +1953,7 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let table = Table::new(rows, [
-        Constraint::Length(12),
+        Constraint::Length(20),
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Min(14),
@@ -1967,6 +2179,10 @@ fn render_popup(f: &mut Frame, app: &mut App) {
             | Popup::TriggerCronJob { .. }
             | Popup::ScaleInput { .. }
             | Popup::TimeFilter { .. }
+            | Popup::ProfileSave { .. }
+            | Popup::PortForwardEditPort { .. }
+            | Popup::ProfileClone { .. }
+            | Popup::ConfirmDeleteProfile { .. }
     ) {
         let a = centered_rect(45, 50, f.area());
         f.render_widget(Clear, a);
@@ -2349,6 +2565,145 @@ fn render_popup(f: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(" Time Filter ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::ProfileSave { buf } => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled("  Save profile as:", Style::default().fg(Color::Cyan))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Name: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{}▎", buf),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [Enter] save  [Esc] cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Save Profile ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::ProfileLoad { items, state } => {
+            let list_items: Vec<ListItem> = items
+                .iter()
+                .map(|name| {
+                    let style = if name == &app.config.active_profile {
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(format!("  {}", name)).style(style)
+                })
+                .collect();
+
+            let list = List::new(list_items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .title(" Load Profile "),
+                )
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
+                .highlight_symbol("▶ ");
+
+            f.render_stateful_widget(list, area, state);
+        },
+        | Popup::PortForwardEditPort { old_port, buf, .. } => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Change local port (current: :{}):", old_port),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Port: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{}▎", buf),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [Enter] apply  [Esc] cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Edit Local Port ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::ProfileClone { source_name, buf } => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Clone profile '{}':", source_name),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  New name: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{}▎", buf),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [Enter] clone  [Esc] cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Clone Profile ");
+
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        },
+        | Popup::ConfirmDeleteProfile { profile_name } => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Delete profile '{}'?", profile_name),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  This cannot be undone.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [Enter/y] confirm  [Esc/n] cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" Delete Profile ");
 
             let paragraph = Paragraph::new(lines).block(block);
             f.render_widget(paragraph, area);

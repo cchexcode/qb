@@ -15,6 +15,7 @@ pub enum Ctx {
     Logs,
     EditDiff,
     PortForwards,
+    Profiles,
 }
 
 impl Ctx {
@@ -29,6 +30,7 @@ impl Ctx {
             | Self::Logs => "Logs",
             | Self::EditDiff => "Edit Diff",
             | Self::PortForwards => "Port Forwards",
+            | Self::Profiles => "Profiles",
         }
     }
 }
@@ -757,5 +759,80 @@ static COMMANDS: &[Cmd] = &[
         hotkey: true,
         palette: false,
         available: Some(has_pf_entries),
+    },
+    Cmd {
+        key: "e",
+        label: "Edit Port",
+        description: "Change the local port number",
+        contexts: &[Ctx::PortForwards],
+        hotkey: true,
+        palette: false,
+        available: Some(has_pf_entries),
+    },
+    // ── Favorites ─────────────────────────────────────────────────────
+    Cmd {
+        key: "*",
+        label: "Star",
+        description: "Toggle favorite for selected resource",
+        contexts: &[Ctx::Resources, Ctx::Detail],
+        hotkey: true,
+        palette: true,
+        available: None,
+    },
+    // ── Profiles ──────────────────────────────────────────────────────
+    Cmd {
+        key: "Ctrl+S",
+        label: "Save Profile",
+        description: "Save current profile",
+        contexts: &[Ctx::Global],
+        hotkey: false,
+        palette: true,
+        available: None,
+    },
+    Cmd {
+        key: "P",
+        label: "Load Profile",
+        description: "Switch to a different profile",
+        contexts: &[Ctx::Global],
+        hotkey: false,
+        palette: true,
+        available: None,
+    },
+    // ── Profiles view ────────────────────────────────────────────────
+    Cmd {
+        key: "Enter",
+        label: "Switch",
+        description: "Switch to the selected profile",
+        contexts: &[Ctx::Profiles],
+        hotkey: true,
+        palette: false,
+        available: None,
+    },
+    Cmd {
+        key: "c",
+        label: "Clone",
+        description: "Clone the selected profile",
+        contexts: &[Ctx::Profiles],
+        hotkey: true,
+        palette: false,
+        available: None,
+    },
+    Cmd {
+        key: "D",
+        label: "Delete",
+        description: "Delete the selected profile",
+        contexts: &[Ctx::Profiles],
+        hotkey: true,
+        palette: false,
+        available: None,
+    },
+    Cmd {
+        key: "C",
+        label: "Create",
+        description: "Create a new empty profile",
+        contexts: &[Ctx::Profiles],
+        hotkey: true,
+        palette: false,
+        available: None,
     },
 ];

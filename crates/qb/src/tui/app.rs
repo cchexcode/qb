@@ -4,6 +4,10 @@ use {
         smart::SecretDetailState,
     },
     crate::{
+        config::{
+            QbConfig,
+            SavedPortForward,
+        },
         k8s::{
             ClusterStatsData,
             KubeClient,
@@ -47,6 +51,16 @@ pub enum View {
     Detail,
     Logs,
     EditDiff,
+}
+
+/// What the right panel displays in the Main view.
+#[derive(Clone, PartialEq)]
+pub enum Panel {
+    Overview,
+    Favorites,
+    PortForwards,
+    Profiles,
+    ResourceList(ResourceType),
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +212,25 @@ pub enum Popup {
     TimeFilter {
         buf: String,
     },
+    ProfileSave {
+        buf: String,
+    },
+    ProfileLoad {
+        items: Vec<String>,
+        state: ListState,
+    },
+    PortForwardEditPort {
+        pf_id: usize,
+        old_port: u16,
+        buf: String,
+    },
+    ProfileClone {
+        source_name: String,
+        buf: String,
+    },
+    ConfirmDeleteProfile {
+        profile_name: String,
+    },
 }
 
 pub struct PfCreateDialog {
@@ -234,6 +267,8 @@ pub enum NavItemKind {
     Resource(ResourceType),
     ClusterStats,
     PortForwards,
+    Favorites,
+    Profiles,
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +284,6 @@ pub const ALL_NAMESPACES_LABEL: &str = "All Namespaces";
 
 pub struct App {
     pub kube: KubeClient,
-    pub rt: tokio::runtime::Handle,
 
     // Navigation sidebar
     pub nav_items: Vec<NavItem>,
@@ -259,7 +293,8 @@ pub struct App {
     pub resources: Vec<ResourceEntry>,
     pub resource_state: TableState,
     pub resource_table_state: TableState,
-    pub selected_resource_type: Option<ResourceType>,
+    pub panel: Panel,
+    pub return_panel: Option<Panel>,
     pub resource_counts: std::collections::HashMap<ResourceType, usize>,
 
     // Cluster stats (shown when "Overview" is selected)
@@ -356,13 +391,19 @@ pub struct App {
 
     // Port forwards
     pub pf_manager: PortForwardManager,
-    pub showing_port_forwards: bool,
     pub pf_cursor: usize,
     pub pf_table_state: TableState,
+
+    // Config & profiles
+    pub config: QbConfig,
+    pub favorites_cursor: usize,
+    pub favorites_table_state: TableState,
+    pub profiles_cursor: usize,
+    pub profiles_table_state: TableState,
 }
 
 impl App {
-    pub fn new(kube: KubeClient, rt: tokio::runtime::Handle, experimental: bool) -> Self {
+    pub fn new(kube: KubeClient, experimental: bool, config: QbConfig) -> Self {
         let nav_items = Self::build_nav_items();
         let mut nav_state = ListState::default();
         // Select first selectable item (skip Category headers)
@@ -374,13 +415,13 @@ impl App {
 
         let mut app = Self {
             kube,
-            rt,
             nav_items,
             nav_state,
             resources: Vec::new(),
             resource_state: TableState::default(),
             resource_table_state: TableState::default(),
-            selected_resource_type: None,
+            panel: Panel::Overview,
+            return_panel: None,
             resource_counts: std::collections::HashMap::new(),
             cluster_stats: None,
             cluster_stats_scroll: 0,
@@ -441,12 +482,72 @@ impl App {
             help_scroll: 0,
             help_context_only: true,
             pf_manager: PortForwardManager::new(),
-            showing_port_forwards: false,
             pf_cursor: 0,
             pf_table_state: TableState::default(),
+            config,
+            favorites_cursor: 0,
+            favorites_table_state: TableState::default(),
+            profiles_cursor: 0,
+            profiles_table_state: TableState::default(),
         };
+        app.restore_saved_port_forwards();
         app.update_status();
         app
+    }
+
+    /// Restore all saved port forwards from the active profile on startup.
+    fn restore_saved_port_forwards(&mut self) {
+        let saved: Vec<_> = self.config.active_profile().port_forwards.clone();
+        for spf in &saved {
+            let target = match spf.target_type.as_str() {
+                | "direct_pod" => {
+                    PfTarget::DirectPod {
+                        pod_name: spf.selector.clone(),
+                    }
+                },
+                | _ => {
+                    PfTarget::LabelSelector {
+                        selector: spf.selector.clone(),
+                    }
+                },
+            };
+            let pod_name = match &target {
+                | PfTarget::DirectPod { pod_name } => pod_name.clone(),
+                | PfTarget::LabelSelector { .. } => "(resolving)".to_string(),
+            };
+            let rt = crate::k8s::ResourceType::from_singular_name(&spf.resource_type);
+            let resource_label = format!(
+                "{}/{}",
+                rt.map(|r| r.display_name()).unwrap_or(&spf.resource_type),
+                spf.resource_name
+            );
+
+            if spf.paused {
+                // Create entry in Paused state without spawning a task
+                self.pf_manager.create_paused(
+                    spf.namespace.clone(),
+                    pod_name,
+                    spf.context.clone(),
+                    resource_label,
+                    spf.local_port,
+                    spf.remote_port,
+                    target,
+                );
+            } else {
+                // Create and start immediately
+                let client = self.kube.client().clone();
+                self.pf_manager.create(
+                    client,
+                    spf.namespace.clone(),
+                    pod_name,
+                    spf.context.clone(),
+                    resource_label,
+                    spf.local_port,
+                    spf.remote_port,
+                    target,
+                );
+            }
+        }
     }
 
     /// Which command context the app is currently in.
@@ -456,21 +557,15 @@ impl App {
             | View::Detail => Ctx::Detail,
             | View::Logs => Ctx::Logs,
             | View::EditDiff => Ctx::EditDiff,
+            | View::Main if self.focus == Focus::Nav => Ctx::Nav,
             | View::Main => {
-                if self.showing_port_forwards {
-                    return Ctx::PortForwards;
-                }
-                match self.focus {
-                    | Focus::Nav => Ctx::Nav,
-                    | Focus::Resources => {
-                        if self.is_showing_cluster_stats() {
-                            Ctx::ClusterStats
-                        } else if self.selected_resource_type == Some(ResourceType::Event) {
-                            Ctx::Events
-                        } else {
-                            Ctx::Resources
-                        }
-                    },
+                match &self.panel {
+                    | Panel::Overview => Ctx::ClusterStats,
+                    | Panel::Favorites => Ctx::Resources,
+                    | Panel::PortForwards => Ctx::PortForwards,
+                    | Panel::Profiles => Ctx::Profiles,
+                    | Panel::ResourceList(rt) if *rt == ResourceType::Event => Ctx::Events,
+                    | Panel::ResourceList(_) => Ctx::Resources,
                 }
             },
         }
@@ -489,8 +584,10 @@ impl App {
         } else {
             (false, false, false, false, false)
         };
+        let effective_resource_type = self.effective_resource_type();
+
         super::command::CmdFlags {
-            resource_type: self.selected_resource_type,
+            resource_type: effective_resource_type,
             experimental: self.experimental,
             has_filter: !self.resource_filter_text.is_empty(),
             has_pods_gt1,
@@ -506,7 +603,7 @@ impl App {
             detail_auto_refresh: self.detail_auto_refresh,
             pf_count: self.pf_manager.entries().len(),
             diff_mark_set: self.diff_mark.is_some(),
-            node_cordoned: if self.selected_resource_type == Some(ResourceType::Node) {
+            node_cordoned: if effective_resource_type == Some(ResourceType::Node) {
                 if self.view == View::Detail {
                     self.detail_value
                         .get("spec")
@@ -536,8 +633,16 @@ impl App {
             kind: NavItemKind::ClusterStats,
         });
         items.push(NavItem {
+            label: " Favorites".to_string(),
+            kind: NavItemKind::Favorites,
+        });
+        items.push(NavItem {
             label: " Port Forwards".to_string(),
             kind: NavItemKind::PortForwards,
+        });
+        items.push(NavItem {
+            label: " Profiles".to_string(),
+            kind: NavItemKind::Profiles,
         });
 
         // Resource categories
@@ -560,7 +665,10 @@ impl App {
     fn update_status(&mut self) {
         let ctx = self.kube.current_context();
         let ns = self.kube.namespace_display();
-        let rt_name = self.selected_resource_type.map(|r| r.display_name()).unwrap_or("None");
+        let rt_name = self
+            .selected_resource_type()
+            .map(|r| r.display_name())
+            .unwrap_or("None");
         let count = self.resources.len();
         self.status = format!("ctx: {} | ns: {} | {}: {}", ctx, ns, rt_name, count);
     }
@@ -575,29 +683,38 @@ impl App {
         }
     }
 
-    pub fn selected_nav_resource_type(&self) -> Option<ResourceType> {
-        let idx = self.nav_state.selected()?;
-        match &self.nav_items.get(idx)?.kind {
-            | NavItemKind::Resource(rt) => Some(*rt),
+    pub fn selected_resource_type(&self) -> Option<ResourceType> {
+        match &self.panel {
+            | Panel::ResourceList(rt) => Some(*rt),
             | _ => None,
         }
     }
 
-    fn is_nav_cluster_stats(&self) -> bool {
-        self.nav_state
-            .selected()
-            .and_then(|idx| self.nav_items.get(idx))
-            .map(|item| matches!(item.kind, NavItemKind::ClusterStats))
-            .unwrap_or(false)
+    pub fn effective_resource_type(&self) -> Option<ResourceType> {
+        match &self.panel {
+            | Panel::ResourceList(rt) => Some(*rt),
+            | Panel::Favorites => {
+                self.config
+                    .active_profile()
+                    .favorites
+                    .get(self.favorites_cursor)
+                    .and_then(|fav| ResourceType::from_singular_name(&fav.resource_type))
+            },
+            | _ => None,
+        }
     }
 
-    pub fn is_showing_cluster_stats(&self) -> bool {
-        self.selected_resource_type.is_none() && self.cluster_stats.is_some()
+    fn return_to_main(&mut self) {
+        self.view = View::Main;
+        self.focus = Focus::Resources;
+        if let Some(panel) = self.return_panel.take() {
+            self.panel = panel;
+        }
     }
 
     fn is_secret_smart_view(&self) -> bool {
         self.detail_mode == DetailMode::Smart
-            && self.selected_resource_type == Some(ResourceType::Secret)
+            && self.selected_resource_type() == Some(ResourceType::Secret)
             && self.secret_state.is_some()
     }
 
@@ -666,16 +783,16 @@ impl App {
     // Deferred loading
     // -----------------------------------------------------------------------
 
-    pub fn process_pending_load(&mut self) {
+    pub async fn process_pending_load(&mut self) {
         if let Some(load) = self.pending_load.take() {
             match load {
-                | PendingLoad::Resources => self.load_resources(),
-                | PendingLoad::Namespaces => self.load_namespaces(),
-                | PendingLoad::SwitchContext(ctx) => self.do_switch_context(&ctx),
-                | PendingLoad::ResourceDetail { name, namespace } => self.load_resource_detail(&namespace, &name),
-                | PendingLoad::Logs { name, namespace } => self.load_logs(&namespace, &name),
-                | PendingLoad::ReloadLogs => self.reload_logs(),
-                | PendingLoad::ClusterStats => self.load_cluster_stats(),
+                | PendingLoad::Resources => self.load_resources().await,
+                | PendingLoad::Namespaces => self.load_namespaces().await,
+                | PendingLoad::SwitchContext(ctx) => self.do_switch_context(&ctx).await,
+                | PendingLoad::ResourceDetail { name, namespace } => self.load_resource_detail(&namespace, &name).await,
+                | PendingLoad::Logs { name, namespace } => self.load_logs(&namespace, &name).await,
+                | PendingLoad::ReloadLogs => self.reload_logs().await,
+                | PendingLoad::ClusterStats => self.load_cluster_stats().await,
             }
         }
     }
@@ -691,15 +808,15 @@ impl App {
         }
     }
 
-    fn load_resources(&mut self) {
-        if let Some(rt) = self.selected_resource_type {
+    async fn load_resources(&mut self) {
+        if let Some(rt) = self.selected_resource_type() {
             let prev_selected = self
                 .resource_state
                 .selected()
                 .and_then(|idx| self.resources.get(idx))
                 .map(|e| (e.name.clone(), e.namespace.clone()));
 
-            match self.rt.block_on(self.kube.list_resources(rt)) {
+            match self.kube.list_resources(rt).await {
                 | Ok(mut entries) => {
                     // Sort events chronologically (oldest first, newest at bottom)
                     if rt == ResourceType::Event {
@@ -748,13 +865,16 @@ impl App {
         if self.view == View::Main
             && self.popup.is_none()
             && self.pending_load.is_none()
-            && !self.showing_port_forwards
             && self.last_refresh.elapsed() >= std::time::Duration::from_secs(2)
         {
-            if self.is_showing_cluster_stats() {
-                self.pending_load = Some(PendingLoad::ClusterStats);
-            } else {
-                self.pending_load = Some(PendingLoad::Resources);
+            match &self.panel {
+                | Panel::Overview => {
+                    self.pending_load = Some(PendingLoad::ClusterStats);
+                },
+                | Panel::ResourceList(_) => {
+                    self.pending_load = Some(PendingLoad::Resources);
+                },
+                | _ => {},
             }
         }
         // Detail view watch mode
@@ -774,8 +894,8 @@ impl App {
         }
     }
 
-    fn load_namespaces(&mut self) {
-        match self.rt.block_on(self.kube.list_namespaces()) {
+    async fn load_namespaces(&mut self) {
+        match self.kube.list_namespaces().await {
             | Ok(namespaces) => {
                 let mut items = vec![ALL_NAMESPACES_LABEL.to_string()];
                 items.extend(namespaces);
@@ -799,12 +919,16 @@ impl App {
         }
     }
 
-    fn do_switch_context(&mut self, ctx: &str) {
-        match self.rt.block_on(self.kube.switch_context(ctx)) {
+    async fn do_switch_context(&mut self, ctx: &str) {
+        match self.kube.switch_context(ctx).await {
             | Ok(()) => {
-                self.showing_port_forwards = false;
                 self.pending_load = Some(PendingLoad::Resources);
                 self.error = None;
+                // Persist selected context
+                self.config.active_profile_mut().context = Some(ctx.to_string());
+                if let Err(e) = self.config.save() {
+                    self.error = Some(format!("Failed to save config: {}", e));
+                }
             },
             | Err(e) => {
                 self.error = Some(format!("Failed to switch context: {}", e));
@@ -812,9 +936,9 @@ impl App {
         }
     }
 
-    fn load_resource_detail(&mut self, ns: &str, name: &str) {
-        if let Some(rt) = self.selected_resource_type {
-            match self.rt.block_on(self.kube.get_resource(rt, ns, name)) {
+    async fn load_resource_detail(&mut self, ns: &str, name: &str) {
+        if let Some(rt) = self.selected_resource_type() {
+            match self.kube.get_resource(rt, ns, name).await {
                 | Ok(value) => {
                     self.detail_yaml = serde_yaml::to_string(&value).unwrap_or_default();
                     let is_same_resource = self.detail_name == name && self.detail_namespace == ns;
@@ -843,14 +967,12 @@ impl App {
                     }
                     self.view = View::Detail;
                     self.error = None;
-                    self.related_events = self
-                        .rt
-                        .block_on(self.kube.fetch_related_events(ns, name))
-                        .unwrap_or_default();
+                    self.related_events = self.kube.fetch_related_events(ns, name).await.unwrap_or_default();
                     // Always re-fetch related resources (they change as pods scale, etc.)
-                    let new_related =
-                        self.rt
-                            .block_on(self.kube.fetch_related_resources(rt, ns, name, &self.detail_value));
+                    let new_related = self
+                        .kube
+                        .fetch_related_resources(rt, ns, name, &self.detail_value)
+                        .await;
                     if is_same_resource && self.detail_auto_refresh {
                         // Preserve cursor position by matching the selected resource
                         if let Some(cursor) = self.related_cursor {
@@ -877,13 +999,13 @@ impl App {
         }
     }
 
-    fn load_logs(&mut self, ns: &str, name: &str) {
-        let rt = match self.selected_resource_type {
+    async fn load_logs(&mut self, ns: &str, name: &str) {
+        let rt = match self.selected_resource_type() {
             | Some(rt) if rt.supports_logs() => rt,
             | _ => return,
         };
 
-        match self.rt.block_on(self.kube.find_pods(rt, ns, name)) {
+        match self.kube.find_pods(rt, ns, name).await {
             | Ok(pods) => {
                 if pods.is_empty() {
                     self.error = Some("No pods found for this resource".into());
@@ -895,10 +1017,7 @@ impl App {
                     .flat_map(|p| p.containers.iter().map(move |c| (p.name.clone(), c.clone())))
                     .collect();
                 let default_since = Some(3600); // 1h default
-                match self
-                    .rt
-                    .block_on(self.kube.fetch_logs_multi(ns, &pairs, 500, default_since))
-                {
+                match self.kube.fetch_logs_multi(ns, &pairs, 500, default_since).await {
                     | Ok(lines) => {
                         let mut state = LogViewState::new(pods, ns.to_string(), lines);
                         state.since_seconds = default_since;
@@ -917,7 +1036,7 @@ impl App {
         }
     }
 
-    fn reload_logs(&mut self) {
+    async fn reload_logs(&mut self) {
         let log_state = match &mut self.log_state {
             | Some(s) => s,
             | None => return,
@@ -929,7 +1048,7 @@ impl App {
         let ns = log_state.namespace.clone();
         let since = log_state.since_seconds;
 
-        match self.rt.block_on(self.kube.fetch_logs_multi(&ns, &pairs, 500, since)) {
+        match self.kube.fetch_logs_multi(&ns, &pairs, 500, since).await {
             | Ok(lines) => {
                 log_state.lines = lines;
                 log_state.scroll = 0;
@@ -942,8 +1061,8 @@ impl App {
         }
     }
 
-    fn load_cluster_stats(&mut self) {
-        match self.rt.block_on(self.kube.fetch_cluster_stats()) {
+    async fn load_cluster_stats(&mut self) {
+        match self.kube.fetch_cluster_stats().await {
             | Ok(stats) => {
                 self.cluster_stats = Some(stats);
                 // Preserve scroll position on auto-refresh
@@ -960,14 +1079,19 @@ impl App {
     // Event handling
     // -----------------------------------------------------------------------
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub async fn handle_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.open_confirm_quit();
             return;
         }
 
         if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.toggle_palette(false);
+            self.toggle_palette(false).await;
+            return;
+        }
+
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_profile_save();
             return;
         }
 
@@ -977,7 +1101,7 @@ impl App {
         }
 
         if self.palette_open {
-            self.handle_palette_key(key);
+            self.handle_palette_key(key).await;
             return;
         }
 
@@ -986,7 +1110,7 @@ impl App {
         if key.code == KeyCode::Char('p') && self.popup.is_none() && !self.resource_filter_editing {
             // Don't consume 'p' in: log view (pod selector), edit diff, port forwards view
             // (pause/resume)
-            if self.view != View::Logs && self.view != View::EditDiff && !self.showing_port_forwards {
+            if self.view != View::Logs && self.view != View::EditDiff && !matches!(self.panel, Panel::PortForwards) {
                 self.paused = !self.paused;
                 self.push_status(if self.paused {
                     "Paused — auto-refresh disabled"
@@ -1006,12 +1130,12 @@ impl App {
         }
 
         if self.popup.is_some() {
-            self.handle_popup_key(key);
+            self.handle_popup_key(key).await;
             return;
         }
 
         if self.view == View::Detail {
-            self.handle_detail_key(key);
+            self.handle_detail_key(key).await;
             return;
         }
 
@@ -1021,7 +1145,7 @@ impl App {
         }
 
         if self.view == View::EditDiff {
-            self.handle_edit_diff_key(key);
+            self.handle_edit_diff_key(key).await;
             return;
         }
 
@@ -1038,7 +1162,7 @@ impl App {
             | KeyCode::Char('r') => {
                 self.focus = Focus::Resources;
             },
-            | KeyCode::Char('c') => {
+            | KeyCode::Char('c') if !matches!(self.panel, Panel::Profiles) => {
                 self.open_context_selector();
             },
             | KeyCode::Char('n') => {
@@ -1058,6 +1182,9 @@ impl App {
                 };
                 self.popup = Some(Popup::KubeconfigInput { buf: default });
             },
+            | KeyCode::Char('P') => {
+                self.open_profile_load();
+            },
             | KeyCode::Char('/') => {
                 self.begin_resource_filter();
             },
@@ -1073,7 +1200,7 @@ impl App {
             | _ => {
                 match self.focus {
                     | Focus::Nav => self.handle_nav_key(key),
-                    | Focus::Resources => self.handle_resource_key(key),
+                    | Focus::Resources => self.handle_resource_key(key).await,
                 }
             },
         }
@@ -1126,49 +1253,60 @@ impl App {
     /// Load whichever resource type or cluster stats is currently highlighted
     /// in the nav.
     fn load_nav_selection(&mut self) {
-        if self.is_nav_port_forwards() {
-            self.selected_resource_type = None;
-            self.showing_port_forwards = true;
-            self.clear_resource_filter();
-            self.view = View::Main;
-        } else if self.is_nav_cluster_stats() {
-            self.showing_port_forwards = false;
-            if !self.is_showing_cluster_stats() {
-                self.selected_resource_type = None;
+        self.return_panel = None;
+        let idx = match self.nav_state.selected() {
+            | Some(i) => i,
+            | None => return,
+        };
+        let kind = &self.nav_items[idx].kind;
+        match kind {
+            | NavItemKind::Favorites => {
+                self.panel = Panel::Favorites;
                 self.clear_resource_filter();
-                self.cluster_stats_scroll = 0;
-                self.pending_load = Some(PendingLoad::ClusterStats);
-            }
-        } else if let Some(rt) = self.selected_nav_resource_type() {
-            self.showing_port_forwards = false;
-            if self.selected_resource_type != Some(rt) {
-                self.selected_resource_type = Some(rt);
-                self.resource_table_state = TableState::default();
-                self.events_scroll = 0;
-                self.events_cursor = 0;
-                self.events_auto_scroll = true;
+                self.view = View::Main;
+            },
+            | NavItemKind::PortForwards => {
+                self.panel = Panel::PortForwards;
                 self.clear_resource_filter();
-                self.pending_load = Some(PendingLoad::Resources);
-            }
+                self.view = View::Main;
+            },
+            | NavItemKind::Profiles => {
+                self.panel = Panel::Profiles;
+                self.clear_resource_filter();
+                self.view = View::Main;
+            },
+            | NavItemKind::ClusterStats => {
+                if !matches!(self.panel, Panel::Overview) {
+                    self.panel = Panel::Overview;
+                    self.clear_resource_filter();
+                    self.cluster_stats_scroll = 0;
+                    self.pending_load = Some(PendingLoad::ClusterStats);
+                }
+            },
+            | NavItemKind::Resource(rt) => {
+                let rt = *rt;
+                if self.selected_resource_type() != Some(rt) {
+                    self.panel = Panel::ResourceList(rt);
+                    self.resource_table_state = TableState::default();
+                    self.events_scroll = 0;
+                    self.events_cursor = 0;
+                    self.events_auto_scroll = true;
+                    self.clear_resource_filter();
+                    self.pending_load = Some(PendingLoad::Resources);
+                }
+            },
+            | NavItemKind::Category => {},
         }
-    }
-
-    fn is_nav_port_forwards(&self) -> bool {
-        self.nav_state
-            .selected()
-            .and_then(|idx| self.nav_items.get(idx))
-            .map(|item| matches!(item.kind, NavItemKind::PortForwards))
-            .unwrap_or(false)
-    }
-
-    pub fn is_showing_port_forwards(&self) -> bool {
-        self.showing_port_forwards
     }
 
     fn is_selectable_nav(kind: &NavItemKind) -> bool {
         matches!(
             kind,
-            NavItemKind::Resource(_) | NavItemKind::ClusterStats | NavItemKind::PortForwards
+            NavItemKind::Resource(_)
+                | NavItemKind::ClusterStats
+                | NavItemKind::PortForwards
+                | NavItemKind::Favorites
+                | NavItemKind::Profiles
         )
     }
 
@@ -1207,36 +1345,49 @@ impl App {
         }
     }
 
-    fn handle_resource_key(&mut self, key: KeyEvent) {
-        if self.showing_port_forwards {
-            self.handle_port_forwards_key(key);
-            return;
-        }
-        if self.is_showing_cluster_stats() {
-            // Cluster stats: scroll only
-            match key.code {
-                | KeyCode::Up | KeyCode::Char('k') => {
-                    self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_sub(1);
-                },
-                | KeyCode::Down | KeyCode::Char('j') => {
-                    self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(1);
-                },
-                | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_sub(20);
-                },
-                | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(20);
-                },
-                | KeyCode::Home => {
-                    self.cluster_stats_scroll = 0;
-                },
-                | _ => {},
-            }
-            return;
-        }
-        if self.selected_resource_type == Some(ResourceType::Event) {
-            self.handle_events_key(key);
-            return;
+    async fn handle_resource_key(&mut self, key: KeyEvent) {
+        match self.panel.clone() {
+            | Panel::Favorites => {
+                self.handle_favorites_key(key).await;
+                return;
+            },
+            | Panel::Profiles => {
+                self.handle_profiles_key(key).await;
+                return;
+            },
+            | Panel::PortForwards => {
+                self.handle_port_forwards_key(key);
+                return;
+            },
+            | Panel::Overview => {
+                // Cluster stats: scroll only
+                match key.code {
+                    | KeyCode::Up | KeyCode::Char('k') => {
+                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_sub(1);
+                    },
+                    | KeyCode::Down | KeyCode::Char('j') => {
+                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(1);
+                    },
+                    | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_sub(20);
+                    },
+                    | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(20);
+                    },
+                    | KeyCode::Home => {
+                        self.cluster_stats_scroll = 0;
+                    },
+                    | _ => {},
+                }
+                return;
+            },
+            | Panel::ResourceList(rt) if rt == ResourceType::Event => {
+                self.handle_events_key(key);
+                return;
+            },
+            | Panel::ResourceList(_) => {
+                // fall through to normal resource handling below
+            },
         }
         let visible = self.visible_resource_indices();
         let vis_len = visible.len();
@@ -1295,44 +1446,47 @@ impl App {
                 self.open_logs_for_selected();
             },
             | KeyCode::Char('e') => {
-                self.start_edit_from_list();
+                self.start_edit_from_list().await;
             },
             | KeyCode::Char('y') => {
                 self.copy_resource_name();
             },
             | KeyCode::Char('F') => {
-                self.open_port_forward_dialog();
+                self.open_port_forward_dialog().await;
             },
             | KeyCode::Char('D') => {
                 self.open_delete_confirm();
             },
             | KeyCode::Char('R') => {
-                self.restart_selected_workload();
+                self.restart_selected_workload().await;
             },
             | KeyCode::Char('d') => {
-                self.handle_diff_mark();
+                self.handle_diff_mark().await;
             },
             | KeyCode::Char('C') => {
                 self.start_create_resource();
             },
             | KeyCode::Char('S') => {
-                self.open_scale_input();
+                self.open_scale_input().await;
             },
             | KeyCode::Char('K') => {
-                self.toggle_cordon_node();
+                self.toggle_cordon_node().await;
             },
             | KeyCode::Char('T') => {
-                if self.selected_resource_type == Some(ResourceType::Node) {
+                if self.selected_resource_type() == Some(ResourceType::Node) {
                     let (name, _) = self.selected_resource_name_ns();
                     if !name.is_empty() {
                         self.popup = Some(Popup::ConfirmDrain { node_name: name });
                     }
-                } else if self.selected_resource_type == Some(ResourceType::CronJob) {
+                } else if self.selected_resource_type() == Some(ResourceType::CronJob) {
                     self.open_trigger_cronjob();
                 }
             },
             | KeyCode::Char('X') if self.experimental => {
-                self.open_exec_shell();
+                self.open_exec_shell().await;
+            },
+            | KeyCode::Char('*') => {
+                self.toggle_favorite_selected();
             },
             | _ => {},
         }
@@ -1384,7 +1538,7 @@ impl App {
         }
     }
 
-    fn handle_detail_key(&mut self, key: KeyEvent) {
+    async fn handle_detail_key(&mut self, key: KeyEvent) {
         let secret_smart = self.is_secret_smart_view();
 
         match key.code {
@@ -1395,8 +1549,7 @@ impl App {
                 } else if self.related_cursor.is_some() {
                     self.related_cursor = None;
                 } else {
-                    self.view = View::Main;
-                    self.focus = Focus::Resources;
+                    self.return_to_main();
                 }
             },
             // [v] Cycle view: Smart → YAML → Smart
@@ -1555,13 +1708,13 @@ impl App {
             },
             // [F] Port forward
             | KeyCode::Char('F') => {
-                self.open_port_forward_dialog();
+                self.open_port_forward_dialog().await;
             },
             | KeyCode::Char('D') => {
                 self.open_delete_confirm_detail();
             },
             | KeyCode::Char('R') => {
-                self.restart_selected_workload();
+                self.restart_selected_workload().await;
             },
             | KeyCode::Char('w') => {
                 self.detail_auto_refresh = !self.detail_auto_refresh;
@@ -1575,18 +1728,18 @@ impl App {
                 self.open_scale_input_detail();
             },
             | KeyCode::Char('X') if self.experimental => {
-                self.open_exec_shell();
+                self.open_exec_shell().await;
             },
             | KeyCode::Char('K') => {
-                self.toggle_cordon_node();
+                self.toggle_cordon_node().await;
             },
             | KeyCode::Char('T') => {
-                if self.selected_resource_type == Some(ResourceType::Node) {
+                if self.selected_resource_type() == Some(ResourceType::Node) {
                     let name = self.detail_name.clone();
                     if !name.is_empty() {
                         self.popup = Some(Popup::ConfirmDrain { node_name: name });
                     }
-                } else if self.selected_resource_type == Some(ResourceType::CronJob) {
+                } else if self.selected_resource_type() == Some(ResourceType::CronJob) {
                     self.open_trigger_cronjob();
                 }
             },
@@ -1620,9 +1773,13 @@ impl App {
                     }
                 } else if let Some(cursor) = self.related_cursor {
                     if let Some(rel) = self.related_resources.get(cursor) {
-                        self.navigate_to_related(rel.resource_type, rel.name.clone(), rel.namespace.clone());
+                        self.navigate_to_related(rel.resource_type, rel.name.clone(), rel.namespace.clone())
+                            .await;
                     }
                 }
+            },
+            | KeyCode::Char('*') => {
+                self.toggle_favorite_detail();
             },
             | _ => {},
         }
@@ -1666,10 +1823,9 @@ impl App {
         }
     }
 
-    fn navigate_to_related(&mut self, rt: ResourceType, name: String, namespace: String) {
+    async fn navigate_to_related(&mut self, rt: ResourceType, name: String, namespace: String) {
         // Switch to the related resource's type and load its detail
-        self.selected_resource_type = Some(rt);
-        self.showing_port_forwards = false;
+        self.panel = Panel::ResourceList(rt);
         self.related_cursor = None;
         self.related_tab = 0;
         self.resource_table_state = TableState::default();
@@ -1682,7 +1838,7 @@ impl App {
             self.nav_state.select(Some(nav_idx));
         }
         // Load the resource list for this type
-        if let Ok(entries) = self.rt.block_on(self.kube.list_resources(rt)) {
+        if let Ok(entries) = self.kube.list_resources(rt).await {
             if let Some(idx) = entries.iter().position(|e| e.name == name && e.namespace == namespace) {
                 self.resource_state.select(Some(idx));
             }
@@ -1798,8 +1954,7 @@ impl App {
                     }
                     self.log_state = None;
                     self.log_detail_line = None;
-                    self.view = View::Main;
-                    self.focus = Focus::Resources;
+                    self.return_to_main();
                 }
             },
             // [/] Start filter edit
@@ -1814,7 +1969,7 @@ impl App {
                     if state.following {
                         state.stop_following();
                     } else {
-                        state.start_following(self.kube.client().clone(), &self.rt);
+                        state.start_following(self.kube.client().clone());
                     }
                 }
             },
@@ -1990,18 +2145,18 @@ impl App {
         }
     }
 
-    fn handle_popup_key(&mut self, key: KeyEvent) {
+    async fn handle_popup_key(&mut self, key: KeyEvent) {
         // Port forward create popup has its own handler
         if matches!(self.popup, Some(Popup::PortForwardCreate(_))) {
             self.handle_pf_create_popup_key(key);
             return;
         }
         if matches!(self.popup, Some(Popup::ConfirmDelete { .. })) {
-            self.handle_confirm_delete_key(key);
+            self.handle_confirm_delete_key(key).await;
             return;
         }
         if matches!(self.popup, Some(Popup::ConfirmDrain { .. })) {
-            self.handle_confirm_drain_key(key);
+            self.handle_confirm_drain_key(key).await;
             return;
         }
         if matches!(self.popup, Some(Popup::ConfirmQuit { .. })) {
@@ -2009,11 +2164,11 @@ impl App {
             return;
         }
         if matches!(self.popup, Some(Popup::TriggerCronJob { .. })) {
-            self.handle_trigger_cronjob_key(key);
+            self.handle_trigger_cronjob_key(key).await;
             return;
         }
         if matches!(self.popup, Some(Popup::ScaleInput { .. })) {
-            self.handle_scale_input_key(key);
+            self.handle_scale_input_key(key).await;
             return;
         }
         if matches!(self.popup, Some(Popup::ExecShell { .. })) {
@@ -2021,11 +2176,31 @@ impl App {
             return;
         }
         if matches!(self.popup, Some(Popup::KubeconfigInput { .. })) {
-            self.handle_kubeconfig_input_key(key);
+            self.handle_kubeconfig_input_key(key).await;
             return;
         }
         if matches!(self.popup, Some(Popup::TimeFilter { .. })) {
             self.handle_time_filter_key(key);
+            return;
+        }
+        if matches!(self.popup, Some(Popup::ProfileSave { .. })) {
+            self.handle_profile_save_key(key);
+            return;
+        }
+        if matches!(self.popup, Some(Popup::ProfileLoad { .. })) {
+            self.handle_profile_load_key(key).await;
+            return;
+        }
+        if matches!(self.popup, Some(Popup::PortForwardEditPort { .. })) {
+            self.handle_pf_edit_port_key(key);
+            return;
+        }
+        if matches!(self.popup, Some(Popup::ProfileClone { .. })) {
+            self.handle_profile_clone_key(key);
+            return;
+        }
+        if matches!(self.popup, Some(Popup::ConfirmDeleteProfile { .. })) {
+            self.handle_confirm_delete_profile_key(key);
             return;
         }
 
@@ -2048,7 +2223,12 @@ impl App {
                         | Popup::KubeconfigInput { .. }
                         | Popup::TriggerCronJob { .. }
                         | Popup::ConfirmQuit { .. }
-                        | Popup::TimeFilter { .. } => unreachable!(),
+                        | Popup::TimeFilter { .. }
+                        | Popup::ProfileSave { .. }
+                        | Popup::ProfileLoad { .. }
+                        | Popup::PortForwardEditPort { .. }
+                        | Popup::ProfileClone { .. }
+                        | Popup::ConfirmDeleteProfile { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
                     if current > 0 {
@@ -2071,7 +2251,12 @@ impl App {
                         | Popup::KubeconfigInput { .. }
                         | Popup::TriggerCronJob { .. }
                         | Popup::ConfirmQuit { .. }
-                        | Popup::TimeFilter { .. } => unreachable!(),
+                        | Popup::TimeFilter { .. }
+                        | Popup::ProfileSave { .. }
+                        | Popup::ProfileLoad { .. }
+                        | Popup::PortForwardEditPort { .. }
+                        | Popup::ProfileClone { .. }
+                        | Popup::ConfirmDeleteProfile { .. } => unreachable!(),
                     };
                     let current = state.selected().unwrap_or(0);
                     if current + 1 < items_len {
@@ -2155,6 +2340,11 @@ impl App {
                     | Some(Popup::TriggerCronJob { .. })
                     | Some(Popup::ConfirmQuit { .. })
                     | Some(Popup::TimeFilter { .. })
+                    | Some(Popup::ProfileSave { .. })
+                    | Some(Popup::ProfileLoad { .. })
+                    | Some(Popup::PortForwardEditPort { .. })
+                    | Some(Popup::ProfileClone { .. })
+                    | Some(Popup::ConfirmDeleteProfile { .. })
                     | None => None,
                 };
                 self.popup = None;
@@ -2167,7 +2357,7 @@ impl App {
     }
 
     fn open_logs_for_selected(&mut self) {
-        if let Some(rt) = self.selected_resource_type {
+        if let Some(rt) = self.selected_resource_type() {
             if rt.supports_logs() {
                 if let Some(idx) = self.resource_state.selected() {
                     if let Some(entry) = self.resources.get(idx) {
@@ -2256,14 +2446,29 @@ impl App {
                     self.pf_table_state.select(Some(self.pf_cursor));
                 }
             },
-            // [p] Pause/resume selected forward
+            // [p] Toggle: running→pause, paused→activate, error→pause
             | KeyCode::Char('p') => {
                 if let Some(entry) = self.pf_manager.entries().get(self.pf_cursor) {
                     let id = entry.id;
+                    let local_port = entry.local_port;
+                    let resource_name = entry.resource_label.split('/').nth(1).unwrap_or("").to_string();
+                    let namespace = entry.namespace.clone();
+                    let context = entry.context.clone();
                     if matches!(entry.status, portforward::PortForwardStatus::Paused) {
-                        self.pf_manager.resume(id);
-                    } else if entry.status.is_running() {
+                        // Paused → activate: spawn a new task
+                        let client = self.kube.client().clone();
+                        if !self.pf_manager.resume_spawn(id, client) {
+                            self.pf_manager.resume(id);
+                        }
+                        self.update_saved_pf_paused(&resource_name, &namespace, &context, local_port, false);
+                    } else if matches!(entry.status, portforward::PortForwardStatus::Error(_)) {
+                        // Error → pause (stop retrying, user can activate later)
                         self.pf_manager.pause(id);
+                        self.update_saved_pf_paused(&resource_name, &namespace, &context, local_port, true);
+                    } else if entry.status.is_running() {
+                        // Running → pause
+                        self.pf_manager.pause(id);
+                        self.update_saved_pf_paused(&resource_name, &namespace, &context, local_port, true);
                     }
                 }
             },
@@ -2271,8 +2476,21 @@ impl App {
             | KeyCode::Char('d') => {
                 if let Some(entry) = self.pf_manager.entries().get(self.pf_cursor) {
                     let id = entry.id;
+                    let resource_name = entry.resource_label.split('/').nth(1).unwrap_or("").to_string();
+                    let namespace = entry.namespace.clone();
+                    let context = entry.context.clone();
+                    let local_port = entry.local_port;
                     self.pf_manager.cancel(id);
                     self.pf_manager.remove_cancelled();
+                    self.config.active_profile_mut().remove_port_forward(
+                        &resource_name,
+                        &namespace,
+                        &context,
+                        local_port,
+                    );
+                    if let Err(e) = self.config.save() {
+                        self.error = Some(format!("Failed to save config: {}", e));
+                    }
                     let new_count = self.pf_manager.entries().len();
                     if new_count == 0 {
                         self.pf_cursor = 0;
@@ -2281,12 +2499,169 @@ impl App {
                     }
                 }
             },
+            // [e] Edit local port
+            | KeyCode::Char('e') => {
+                if let Some(entry) = self.pf_manager.entries().get(self.pf_cursor) {
+                    let id = entry.id;
+                    let old_port = entry.local_port;
+                    self.popup = Some(Popup::PortForwardEditPort {
+                        pf_id: id,
+                        old_port,
+                        buf: old_port.to_string(),
+                    });
+                }
+            },
             | _ => {},
         }
     }
 
-    fn open_port_forward_dialog(&mut self) {
-        let rt = match self.selected_resource_type {
+    fn handle_pf_edit_port_key(&mut self, key: KeyEvent) {
+        let (pf_id, old_port, buf) = match &mut self.popup {
+            | Some(Popup::PortForwardEditPort { pf_id, old_port, buf }) => (*pf_id, *old_port, buf),
+            | _ => return,
+        };
+        match key.code {
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Backspace => {
+                buf.pop();
+            },
+            | KeyCode::Char(c) if c.is_ascii_digit() => {
+                buf.push(c);
+            },
+            | KeyCode::Enter => {
+                let new_port: u16 = match buf.parse() {
+                    | Ok(p) if p > 0 => p,
+                    | _ => {
+                        self.error = Some("Invalid port number".into());
+                        return;
+                    },
+                };
+                let pf_id = pf_id;
+                let old_port = old_port;
+                if new_port == old_port {
+                    self.popup = None;
+                    return;
+                }
+                self.apply_pf_port_change(pf_id, old_port, new_port);
+                self.popup = None;
+            },
+            | _ => {},
+        }
+    }
+
+    /// Change the local port of a port forward: cancel old, create new with
+    /// updated port, update config.
+    fn apply_pf_port_change(&mut self, pf_id: usize, old_port: u16, new_port: u16) {
+        let entry = match self.pf_manager.entries().iter().find(|e| e.id == pf_id) {
+            | Some(e) => e,
+            | None => return,
+        };
+
+        let remote_port = entry.remote_port;
+        let namespace = entry.namespace.clone();
+        let context = entry.context.clone();
+        let resource_label = entry.resource_label.clone();
+        let pod_name = entry.pod_name.clone();
+        let target = entry.target.clone();
+        let was_paused = matches!(entry.status, portforward::PortForwardStatus::Paused);
+        let resource_name = entry.resource_label.split('/').nth(1).unwrap_or("").to_string();
+
+        // Cancel old
+        self.pf_manager.cancel(pf_id);
+        self.pf_manager.remove_cancelled();
+
+        // Update config: remove old, add new
+        self.config
+            .active_profile_mut()
+            .remove_port_forward(&resource_name, &namespace, &context, old_port);
+
+        let target_for_save = target.clone().unwrap_or_else(|| {
+            PfTarget::DirectPod {
+                pod_name: pod_name.clone(),
+            }
+        });
+        let (target_type, selector) = match &target_for_save {
+            | PfTarget::DirectPod { pod_name } => ("direct_pod".to_string(), pod_name.clone()),
+            | PfTarget::LabelSelector { selector } => ("label_selector".to_string(), selector.clone()),
+        };
+
+        let rt_name = resource_label
+            .split('/')
+            .next()
+            .and_then(|display| {
+                crate::k8s::ResourceType::all_by_category()
+                    .into_iter()
+                    .flat_map(|(_, types)| types)
+                    .find(|rt| rt.display_name() == display)
+                    .map(|rt| rt.singular_name().to_string())
+            })
+            .unwrap_or_default();
+
+        let saved = crate::config::SavedPortForward {
+            resource_type: rt_name,
+            resource_name: resource_name.clone(),
+            namespace: namespace.clone(),
+            context: context.clone(),
+            local_port: new_port,
+            remote_port,
+            target_type,
+            selector,
+            paused: was_paused,
+        };
+        self.config.active_profile_mut().add_port_forward(saved);
+        if let Err(e) = self.config.save() {
+            self.error = Some(format!("Failed to save config: {}", e));
+        }
+
+        // Create new forward
+        if was_paused {
+            if let Some(t) = target {
+                self.pf_manager
+                    .create_paused(namespace, pod_name, context, resource_label, new_port, remote_port, t);
+            }
+        } else if let Some(t) = target {
+            let client = self.kube.client().clone();
+            self.pf_manager.create(
+                client,
+                namespace,
+                pod_name,
+                context,
+                resource_label,
+                new_port,
+                remote_port,
+                t,
+            );
+        }
+
+        self.push_status(format!("Port changed :{} → :{}", old_port, new_port));
+    }
+
+    /// Update the `paused` field of a saved port forward in config.
+    fn update_saved_pf_paused(
+        &mut self,
+        resource_name: &str,
+        namespace: &str,
+        context: &str,
+        local_port: u16,
+        paused: bool,
+    ) {
+        if let Some(spf) = self.config.active_profile_mut().port_forwards.iter_mut().find(|pf| {
+            pf.resource_name == resource_name
+                && pf.namespace == namespace
+                && pf.context == context
+                && pf.local_port == local_port
+        }) {
+            spf.paused = paused;
+        }
+        if let Err(e) = self.config.save() {
+            self.error = Some(format!("Failed to save config: {}", e));
+        }
+    }
+
+    async fn open_port_forward_dialog(&mut self) {
+        let rt = match self.selected_resource_type() {
             | Some(rt) => rt,
             | None => return,
         };
@@ -2306,7 +2681,7 @@ impl App {
         let namespace = entry.namespace.clone();
 
         // Fetch the resource value to extract ports and selector
-        let value = match self.rt.block_on(self.kube.get_resource(rt, &namespace, &name)) {
+        let value = match self.kube.get_resource(rt, &namespace, &name).await {
             | Ok(v) => v,
             | Err(e) => {
                 self.error = Some(format!("Failed to fetch resource: {}", e));
@@ -2411,7 +2786,6 @@ impl App {
 
         self.pf_manager.create(
             client,
-            &self.rt,
             namespace,
             pod_name,
             context,
@@ -2420,6 +2794,27 @@ impl App {
             remote_port,
             target,
         );
+
+        // Persist to config
+        let (target_type, selector) = match &dialog.target {
+            | PfTarget::DirectPod { pod_name } => ("direct_pod".to_string(), pod_name.clone()),
+            | PfTarget::LabelSelector { selector } => ("label_selector".to_string(), selector.clone()),
+        };
+        let saved = SavedPortForward {
+            resource_type: dialog.resource_type.singular_name().to_string(),
+            resource_name: dialog.resource_name.clone(),
+            namespace: dialog.namespace.clone(),
+            context: self.kube.current_context().to_string(),
+            local_port,
+            remote_port,
+            target_type,
+            selector,
+            paused: false,
+        };
+        self.config.active_profile_mut().add_port_forward(saved);
+        if let Err(e) = self.config.save() {
+            self.error = Some(format!("Failed to save config: {}", e));
+        }
 
         self.popup = None;
         self.push_status(format!("Port forward created: :{} -> :{}", local_port, remote_port));
@@ -2539,8 +2934,8 @@ impl App {
     // Restart workload
     // -----------------------------------------------------------------------
 
-    fn restart_selected_workload(&mut self) {
-        let rt = match self.selected_resource_type {
+    async fn restart_selected_workload(&mut self) {
+        let rt = match self.selected_resource_type() {
             | Some(rt) if rt.supports_scale() || matches!(rt, ResourceType::DaemonSet) => rt,
             | _ => return,
         };
@@ -2558,7 +2953,7 @@ impl App {
                 | None => return,
             }
         };
-        match self.rt.block_on(self.kube.restart_workload(rt, &namespace, &name)) {
+        match self.kube.restart_workload(rt, &namespace, &name).await {
             | Ok(()) => {
                 self.push_status(format!("Restarted {}/{}", rt.display_name(), name));
                 self.error = None;
@@ -2574,7 +2969,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn open_trigger_cronjob(&mut self) {
-        if self.selected_resource_type != Some(ResourceType::CronJob) {
+        if self.selected_resource_type() != Some(ResourceType::CronJob) {
             return;
         }
         let (name, namespace) = if self.view == View::Detail {
@@ -2593,7 +2988,7 @@ impl App {
         });
     }
 
-    fn handle_trigger_cronjob_key(&mut self, key: KeyEvent) {
+    async fn handle_trigger_cronjob_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Enter => {
                 let (cronjob_name, namespace, job_name) = match &self.popup {
@@ -2613,14 +3008,12 @@ impl App {
                     | _ => return,
                 };
                 self.popup = None;
-                match self
-                    .rt
-                    .block_on(self.kube.trigger_cronjob(&namespace, &cronjob_name, &job_name))
-                {
+                match self.kube.trigger_cronjob(&namespace, &cronjob_name, &job_name).await {
                     | Ok(created_name) => {
                         self.push_status(format!("Created job {}", created_name));
                         self.error = None;
-                        self.navigate_to_related(ResourceType::Job, created_name, namespace);
+                        self.navigate_to_related(ResourceType::Job, created_name, namespace)
+                            .await;
                     },
                     | Err(e) => {
                         self.error = Some(format!("Trigger failed: {}", e));
@@ -2648,8 +3041,8 @@ impl App {
     // Node cordon / drain
     // -----------------------------------------------------------------------
 
-    fn toggle_cordon_node(&mut self) {
-        if self.selected_resource_type != Some(ResourceType::Node) {
+    async fn toggle_cordon_node(&mut self) {
+        if self.selected_resource_type() != Some(ResourceType::Node) {
             return;
         }
         let (name, _) = self.selected_resource_name_ns();
@@ -2677,9 +3070,9 @@ impl App {
         };
 
         let result = if is_schedulable {
-            self.rt.block_on(self.kube.cordon_node(&name))
+            self.kube.cordon_node(&name).await
         } else {
-            self.rt.block_on(self.kube.uncordon_node(&name))
+            self.kube.uncordon_node(&name).await
         };
 
         match result {
@@ -2747,6 +3140,618 @@ impl App {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Favorites
+    // -----------------------------------------------------------------------
+
+    /// Check if a resource is favorited in the active profile.
+    pub fn is_favorite(&self, resource_type: ResourceType, name: &str, namespace: &str) -> bool {
+        let context = self.kube.current_context();
+        self.config
+            .active_profile()
+            .is_favorite(resource_type.singular_name(), name, namespace, context)
+    }
+
+    /// Toggle favorite for the currently selected resource.
+    fn toggle_favorite_selected(&mut self) {
+        let rt = match self.selected_resource_type() {
+            | Some(rt) => rt,
+            | None => return,
+        };
+        let (name, namespace) = self.selected_resource_name_ns();
+        if name.is_empty() {
+            return;
+        }
+        let context = self.kube.current_context().to_string();
+        let added = self.config.active_profile_mut().toggle_favorite(
+            rt.singular_name().to_string(),
+            name.clone(),
+            namespace,
+            context,
+        );
+
+        if added {
+            self.push_status(format!("★ Favorited '{}'", name));
+        } else {
+            self.push_status(format!("☆ Unfavorited '{}'", name));
+        }
+        // Auto-save
+        if let Err(e) = self.config.save() {
+            self.error = Some(format!("Failed to save config: {}", e));
+        }
+    }
+
+    /// Toggle favorite for the resource in detail view.
+    fn toggle_favorite_detail(&mut self) {
+        let rt = match self.selected_resource_type() {
+            | Some(rt) => rt,
+            | None => return,
+        };
+        let name = self.detail_name.clone();
+        let namespace = self.detail_namespace.clone();
+        if name.is_empty() {
+            return;
+        }
+        let context = self.kube.current_context().to_string();
+        let added = self.config.active_profile_mut().toggle_favorite(
+            rt.singular_name().to_string(),
+            name.clone(),
+            namespace,
+            context,
+        );
+
+        if added {
+            self.push_status(format!("★ Favorited '{}'", name));
+        } else {
+            self.push_status(format!("☆ Unfavorited '{}'", name));
+        }
+        // Auto-save
+        if let Err(e) = self.config.save() {
+            self.error = Some(format!("Failed to save config: {}", e));
+        }
+    }
+
+    /// Navigate to a favorite from the favorites view.
+    fn open_favorite_at_cursor(&mut self) {
+        let favorites = self.config.active_profile().favorites.clone();
+        if let Some(fav) = favorites.get(self.favorites_cursor) {
+            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                self.return_panel = Some(self.panel.clone());
+                self.panel = Panel::ResourceList(rt);
+                self.pending_load = Some(PendingLoad::ResourceDetail {
+                    name: fav.name.clone(),
+                    namespace: fav.namespace.clone(),
+                });
+            }
+        }
+    }
+
+    /// Remove a favorite from the favorites view.
+    fn remove_favorite_at_cursor(&mut self) {
+        let favorites = self.config.active_profile().favorites.clone();
+        if let Some(fav) = favorites.get(self.favorites_cursor) {
+            let fav = fav.clone();
+            self.config.active_profile_mut().favorites.retain(|f| f != &fav);
+            let count = self.config.active_profile().favorites.len();
+            if self.favorites_cursor >= count && count > 0 {
+                self.favorites_cursor = count - 1;
+            }
+            self.push_status(format!("Removed '{}' from favorites", fav.name));
+            if let Err(e) = self.config.save() {
+                self.error = Some(format!("Failed to save config: {}", e));
+            }
+        }
+    }
+
+    /// Resolve the favorite at the cursor, setting the panel to ResourceList
+    /// for downstream commands. Returns (rt, name, namespace) if valid.
+    fn resolve_favorite_at_cursor(&self) -> Option<(ResourceType, String, String)> {
+        let fav = self.config.active_profile().favorites.get(self.favorites_cursor)?;
+        let rt = ResourceType::from_singular_name(&fav.resource_type)?;
+        Some((rt, fav.name.clone(), fav.namespace.clone()))
+    }
+
+    /// Handle keys in the favorites view.
+    /// Supports all standard resource list commands plus `*` to de-favorite.
+    async fn handle_favorites_key(&mut self, key: KeyEvent) {
+        let count = self.config.active_profile().favorites.len();
+        match key.code {
+            | KeyCode::Up | KeyCode::Char('k') => {
+                if self.favorites_cursor > 0 {
+                    self.favorites_cursor -= 1;
+                }
+            },
+            | KeyCode::Down | KeyCode::Char('j') => {
+                if count > 0 && self.favorites_cursor + 1 < count {
+                    self.favorites_cursor += 1;
+                }
+            },
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.favorites_cursor = self.favorites_cursor.saturating_sub(20);
+            },
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.favorites_cursor = (self.favorites_cursor + 20).min(count.saturating_sub(1));
+            },
+            | KeyCode::Home | KeyCode::Char('g') => {
+                self.favorites_cursor = 0;
+            },
+            | KeyCode::End | KeyCode::Char('G') => {
+                if count > 0 {
+                    self.favorites_cursor = count - 1;
+                }
+            },
+            // [Enter] Open detail view for this favorite
+            | KeyCode::Enter => {
+                self.open_favorite_at_cursor();
+            },
+            // [*] De-favorite (remove from favorites)
+            | KeyCode::Char('*') => {
+                self.remove_favorite_at_cursor();
+            },
+            // [l] Open logs (workload resources)
+            | KeyCode::Char('l') => {
+                self.open_favorite_logs();
+            },
+            // [e] Edit resource ($EDITOR)
+            | KeyCode::Char('e') => {
+                self.edit_favorite_at_cursor().await;
+            },
+            // [y] Copy resource name
+            | KeyCode::Char('y') => {
+                if let Some(fav) = self.config.active_profile().favorites.get(self.favorites_cursor) {
+                    let name = fav.name.clone();
+                    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&name)) {
+                        | Ok(()) => {
+                            self.push_status(format!("Copied '{}'", name));
+                            self.error = None;
+                        },
+                        | Err(e) => {
+                            self.error = Some(format!("Clipboard error: {}", e));
+                        },
+                    }
+                }
+            },
+            // [F] Port forward — open dialog directly with favorite data
+            | KeyCode::Char('F') => {
+                if let Some((rt, name, namespace)) = self.resolve_favorite_at_cursor() {
+                    match self.kube.get_resource(rt, &namespace, &name).await {
+                        | Ok(value) => {
+                            let ports = portforward::extract_ports(rt, &value);
+                            if ports.is_empty() {
+                                self.error = Some("No ports found on this resource".into());
+                            } else {
+                                let target = if rt == ResourceType::Pod {
+                                    PfTarget::DirectPod { pod_name: name.clone() }
+                                } else {
+                                    match portforward::extract_selector(rt, &value) {
+                                        | Some(selector) => PfTarget::LabelSelector { selector },
+                                        | None => {
+                                            self.error = Some("Cannot resolve pod selector for this resource".into());
+                                            return;
+                                        },
+                                    }
+                                };
+                                let default_port = ports[0].container_port.to_string();
+                                self.popup = Some(Popup::PortForwardCreate(PfCreateDialog {
+                                    resource_type: rt,
+                                    resource_name: name,
+                                    namespace,
+                                    target,
+                                    ports,
+                                    port_cursor: 0,
+                                    local_port_buf: default_port,
+                                }));
+                            }
+                        },
+                        | Err(e) => {
+                            self.error = Some(format!("Failed to fetch resource: {}", e));
+                        },
+                    }
+                }
+            },
+            // [D] Delete resource
+            | KeyCode::Char('D') => {
+                if let Some((rt, name, namespace)) = self.resolve_favorite_at_cursor() {
+                    self.popup = Some(Popup::ConfirmDelete {
+                        name,
+                        namespace,
+                        resource_type: rt,
+                    });
+                }
+            },
+            // [R] Restart workload
+            | KeyCode::Char('R') => {
+                if let Some((rt, name, namespace)) = self.resolve_favorite_at_cursor() {
+                    if matches!(
+                        rt,
+                        ResourceType::Deployment | ResourceType::StatefulSet | ResourceType::DaemonSet
+                    ) {
+                        match self.kube.restart_workload(rt, &namespace, &name).await {
+                            | Ok(()) => {
+                                self.push_status(format!("Restarted {}/{}", rt.display_name(), name));
+                                self.error = None;
+                            },
+                            | Err(e) => {
+                                self.error = Some(format!("Restart failed: {}", e));
+                            },
+                        }
+                    }
+                }
+            },
+            // [S] Scale workload
+            | KeyCode::Char('S') => {
+                if let Some((rt, name, namespace)) = self.resolve_favorite_at_cursor() {
+                    if rt.supports_scale() {
+                        match self.kube.get_resource(rt, &namespace, &name).await {
+                            | Ok(value) => {
+                                let current = value
+                                    .get("spec")
+                                    .and_then(|s| s.get("replicas"))
+                                    .and_then(|r| r.as_u64())
+                                    .unwrap_or(0) as u32;
+                                self.popup = Some(Popup::ScaleInput {
+                                    name,
+                                    namespace,
+                                    resource_type: rt,
+                                    current,
+                                    buf: current.to_string(),
+                                });
+                            },
+                            | Err(e) => {
+                                self.error = Some(format!("Failed to fetch resource: {}", e));
+                            },
+                        }
+                    }
+                }
+            },
+            // [d] Mark / diff favorites
+            | KeyCode::Char('d') => {
+                if let Some((rt, name, namespace)) = self.resolve_favorite_at_cursor() {
+                    if let Some((mark_name, _mark_ns, mark_yaml)) = self.diff_mark.take() {
+                        // Second resource — fetch and show diff
+                        match self.kube.get_resource(rt, &namespace, &name).await {
+                            | Ok(value) => {
+                                let yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                                let diff_lines = compute_diff(&mark_yaml, &yaml);
+                                self.edit_ctx = Some(EditContext {
+                                    resource_type: rt,
+                                    name: format!("{} vs {}", mark_name, name),
+                                    namespace: namespace.clone(),
+                                    original_yaml: mark_yaml,
+                                    edited_yaml: yaml,
+                                    diff_lines,
+                                    diff_mode: DiffMode::Inline,
+                                    scroll: 0,
+                                    error: None,
+                                });
+                                self.return_panel = Some(Panel::Favorites);
+                                self.view = View::EditDiff;
+                                self.push_status(format!("Diff: {} vs {}", mark_name, name));
+                            },
+                            | Err(e) => {
+                                self.error = Some(format!("Failed to fetch resource: {}", e));
+                            },
+                        }
+                    } else {
+                        // First resource — mark it
+                        match self.kube.get_resource(rt, &namespace, &name).await {
+                            | Ok(value) => {
+                                let yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                                self.diff_mark = Some((name.clone(), namespace, yaml));
+                                self.push_status(format!(
+                                    "Marked '{}' for diff \u{2014} select another and press [d]",
+                                    name
+                                ));
+                            },
+                            | Err(e) => {
+                                self.error = Some(format!("Failed to fetch resource: {}", e));
+                            },
+                        }
+                    }
+                }
+            },
+            | _ => {},
+        }
+    }
+
+    /// Open logs for the favorite at cursor.
+    fn open_favorite_logs(&mut self) {
+        let favorites = self.config.active_profile().favorites.clone();
+        if let Some(fav) = favorites.get(self.favorites_cursor) {
+            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                if rt.supports_logs() {
+                    self.return_panel = Some(self.panel.clone());
+                    self.panel = Panel::ResourceList(rt);
+                    self.pending_load = Some(PendingLoad::Logs {
+                        name: fav.name.clone(),
+                        namespace: fav.namespace.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Edit the resource at the favorites cursor.
+    async fn edit_favorite_at_cursor(&mut self) {
+        let favorites = self.config.active_profile().favorites.clone();
+        if let Some(fav) = favorites.get(self.favorites_cursor) {
+            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                // Fetch the resource YAML
+                match self.kube.get_resource(rt, &fav.namespace, &fav.name).await {
+                    | Ok(value) => {
+                        let yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                        self.return_panel = Some(self.panel.clone());
+                        self.panel = Panel::ResourceList(rt);
+                        self.pending_edit = Some(PendingEdit {
+                            resource_type: rt,
+                            name: fav.name.clone(),
+                            namespace: fav.namespace.clone(),
+                            yaml,
+                            original_yaml: None,
+                        });
+                    },
+                    | Err(e) => {
+                        self.error = Some(format!("Failed to fetch resource: {}", e));
+                    },
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Profiles view
+    // -----------------------------------------------------------------------
+
+    fn sorted_profile_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.config.profiles.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    async fn handle_profiles_key(&mut self, key: KeyEvent) {
+        let names = self.sorted_profile_names();
+        let count = names.len();
+        match key.code {
+            | KeyCode::Up | KeyCode::Char('k') => {
+                if self.profiles_cursor > 0 {
+                    self.profiles_cursor -= 1;
+                }
+            },
+            | KeyCode::Down | KeyCode::Char('j') => {
+                if count > 0 && self.profiles_cursor + 1 < count {
+                    self.profiles_cursor += 1;
+                }
+            },
+            | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.profiles_cursor = self.profiles_cursor.saturating_sub(20);
+            },
+            | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.profiles_cursor = (self.profiles_cursor + 20).min(count.saturating_sub(1));
+            },
+            | KeyCode::Home | KeyCode::Char('g') => {
+                self.profiles_cursor = 0;
+            },
+            | KeyCode::End | KeyCode::Char('G') => {
+                if count > 0 {
+                    self.profiles_cursor = count - 1;
+                }
+            },
+            // [Enter] Switch to selected profile
+            | KeyCode::Enter => {
+                if let Some(name) = names.get(self.profiles_cursor) {
+                    let name = name.clone();
+                    self.switch_profile(&name).await;
+                }
+            },
+            // [c] Clone profile
+            | KeyCode::Char('c') => {
+                if let Some(source) = names.get(self.profiles_cursor) {
+                    let source = source.clone();
+                    self.popup = Some(Popup::ProfileClone {
+                        source_name: source.clone(),
+                        buf: format!("{}-copy", source),
+                    });
+                }
+            },
+            // [D] Delete profile
+            | KeyCode::Char('D') => {
+                if let Some(name) = names.get(self.profiles_cursor) {
+                    let name = name.clone();
+                    if name == "default" {
+                        self.error = Some("Cannot delete the default profile".into());
+                    } else if name == self.config.active_profile {
+                        self.error = Some("Cannot delete the active profile".into());
+                    } else {
+                        self.popup = Some(Popup::ConfirmDeleteProfile { profile_name: name });
+                    }
+                }
+            },
+            // [C] Create new empty profile
+            | KeyCode::Char('C') => {
+                self.popup = Some(Popup::ProfileSave { buf: String::new() });
+            },
+            | _ => {},
+        }
+    }
+
+    fn handle_profile_clone_key(&mut self, key: KeyEvent) {
+        let (source_name, buf) = match &mut self.popup {
+            | Some(Popup::ProfileClone { source_name, buf }) => (source_name.clone(), buf),
+            | _ => return,
+        };
+        match key.code {
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Backspace => {
+                buf.pop();
+            },
+            | KeyCode::Char(c) => {
+                buf.push(c);
+            },
+            | KeyCode::Enter => {
+                let new_name = buf.clone();
+                if new_name.is_empty() {
+                    return;
+                }
+                if self.config.profiles.contains_key(&new_name) {
+                    self.error = Some(format!("Profile '{}' already exists", new_name));
+                    return;
+                }
+                let profile = self.config.profiles.get(&source_name).cloned().unwrap_or_default();
+                self.config.profiles.insert(new_name.clone(), profile);
+                self.popup = None;
+                self.push_status(format!("Cloned '{}' → '{}'", source_name, new_name));
+                if let Err(e) = self.config.save() {
+                    self.error = Some(format!("Failed to save config: {}", e));
+                }
+            },
+            | _ => {},
+        }
+    }
+
+    fn handle_confirm_delete_profile_key(&mut self, key: KeyEvent) {
+        let profile_name = match &self.popup {
+            | Some(Popup::ConfirmDeleteProfile { profile_name }) => profile_name.clone(),
+            | _ => return,
+        };
+        match key.code {
+            | KeyCode::Enter | KeyCode::Char('y') => {
+                self.config.profiles.remove(&profile_name);
+                self.popup = None;
+                self.push_status(format!("Deleted profile '{}'", profile_name));
+                let count = self.config.profiles.len();
+                if self.profiles_cursor >= count && count > 0 {
+                    self.profiles_cursor = count - 1;
+                }
+                if let Err(e) = self.config.save() {
+                    self.error = Some(format!("Failed to save config: {}", e));
+                }
+            },
+            | KeyCode::Esc | KeyCode::Char('n') => {
+                self.popup = None;
+            },
+            | _ => {},
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile save/load
+    // -----------------------------------------------------------------------
+
+    /// Switch to a different profile: cancel all current port forwards,
+    /// update the active profile, restore the new profile's port forwards
+    /// and context.
+    async fn switch_profile(&mut self, name: &str) {
+        if name == self.config.active_profile {
+            return;
+        }
+        // Save current PF paused states before switching
+        // (already persisted on pause/resume, so just cancel runtime entries)
+        self.pf_manager.cancel_all();
+
+        self.config.active_profile = name.to_string();
+
+        // Switch cluster context if the profile has one
+        if let Some(ctx) = self.config.active_profile().context.clone() {
+            if let Err(e) = self.kube.switch_context(&ctx).await {
+                self.error = Some(format!("Failed to switch context: {}", e));
+            }
+        }
+
+        // Restore port forwards from the new profile
+        self.restore_saved_port_forwards();
+
+        self.push_status(format!("Switched to profile '{}'", name));
+        if let Err(e) = self.config.save() {
+            self.error = Some(format!("Failed to save config: {}", e));
+        }
+    }
+
+    fn open_profile_save(&mut self) {
+        let current = self.config.active_profile.clone();
+        self.popup = Some(Popup::ProfileSave { buf: current });
+    }
+
+    fn open_profile_load(&mut self) {
+        let mut names: Vec<String> = self.config.profile_names().into_iter().map(|s| s.to_string()).collect();
+        names.sort();
+        let mut state = ListState::default();
+        if !names.is_empty() {
+            let current_pos = names.iter().position(|n| n == &self.config.active_profile).unwrap_or(0);
+            state.select(Some(current_pos));
+        }
+        self.popup = Some(Popup::ProfileLoad { items: names, state });
+    }
+
+    fn handle_profile_save_key(&mut self, key: KeyEvent) {
+        let buf = match &mut self.popup {
+            | Some(Popup::ProfileSave { buf }) => buf,
+            | _ => return,
+        };
+        match key.code {
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Backspace => {
+                buf.pop();
+            },
+            | KeyCode::Char(c) => {
+                buf.push(c);
+            },
+            | KeyCode::Enter => {
+                let name = buf.clone();
+                if name.is_empty() {
+                    return;
+                }
+                // Clone current active profile into the new name
+                let profile = self.config.active_profile().clone();
+                self.config.profiles.insert(name.clone(), profile);
+                self.config.active_profile = name.clone();
+                self.popup = None;
+                self.push_status(format!("Profile saved as '{}'", name));
+                if let Err(e) = self.config.save() {
+                    self.error = Some(format!("Failed to save config: {}", e));
+                }
+            },
+            | _ => {},
+        }
+    }
+
+    async fn handle_profile_load_key(&mut self, key: KeyEvent) {
+        let (items, state) = match &mut self.popup {
+            | Some(Popup::ProfileLoad { items, state }) => (items, state),
+            | _ => return,
+        };
+        match key.code {
+            | KeyCode::Esc => {
+                self.popup = None;
+            },
+            | KeyCode::Up | KeyCode::Char('k') => {
+                let i = state.selected().unwrap_or(0);
+                if i > 0 {
+                    state.select(Some(i - 1));
+                }
+            },
+            | KeyCode::Down | KeyCode::Char('j') => {
+                let i = state.selected().unwrap_or(0);
+                if i + 1 < items.len() {
+                    state.select(Some(i + 1));
+                }
+            },
+            | KeyCode::Enter => {
+                if let Some(idx) = state.selected() {
+                    if let Some(name) = items.get(idx) {
+                        let name = name.clone();
+                        self.popup = None;
+                        self.switch_profile(&name).await;
+                    }
+                }
+            },
+            | _ => {},
+        }
+    }
+
     fn copy_logs_to_clipboard(&mut self) {
         if let Some(state) = &self.log_state {
             let visible = state.visible_lines();
@@ -2778,8 +3783,8 @@ impl App {
     // Diff between resources
     // -----------------------------------------------------------------------
 
-    fn handle_diff_mark(&mut self) {
-        let rt = match self.selected_resource_type {
+    async fn handle_diff_mark(&mut self) {
+        let rt = match self.selected_resource_type() {
             | Some(rt) => rt,
             | None => return,
         };
@@ -2798,7 +3803,7 @@ impl App {
 
         if let Some((mark_name, _mark_ns, mark_yaml)) = self.diff_mark.take() {
             // Second resource selected - fetch its YAML and show diff
-            match self.rt.block_on(self.kube.get_resource(rt, &namespace, &name)) {
+            match self.kube.get_resource(rt, &namespace, &name).await {
                 | Ok(value) => {
                     let yaml = serde_yaml::to_string(&value).unwrap_or_default();
                     let diff_lines = compute_diff(&mark_yaml, &yaml);
@@ -2822,7 +3827,7 @@ impl App {
             }
         } else {
             // First resource - mark it
-            match self.rt.block_on(self.kube.get_resource(rt, &namespace, &name)) {
+            match self.kube.get_resource(rt, &namespace, &name).await {
                 | Ok(value) => {
                     let yaml = serde_yaml::to_string(&value).unwrap_or_default();
                     self.diff_mark = Some((name.clone(), namespace, yaml));
@@ -2852,12 +3857,12 @@ impl App {
         self.pending_create = Some(PendingCreate { yaml: template });
     }
 
-    pub fn handle_create_result(&mut self, yaml: String) {
+    pub async fn handle_create_result(&mut self, yaml: String) {
         if yaml.trim().is_empty() {
             self.push_status("Empty YAML, nothing created");
             return;
         }
-        match self.rt.block_on(self.kube.create_resource_yaml(&yaml)) {
+        match self.kube.create_resource_yaml(&yaml).await {
             | Ok(_) => {
                 self.push_status("Resource created");
                 self.error = None;
@@ -2873,7 +3878,7 @@ impl App {
     // Command palette
     // -----------------------------------------------------------------------
 
-    fn toggle_palette(&mut self, global: bool) {
+    async fn toggle_palette(&mut self, global: bool) {
         if self.palette_open {
             self.palette_open = false;
             self.palette_all_resources.clear();
@@ -2890,7 +3895,7 @@ impl App {
                         if rt == ResourceType::Event {
                             continue;
                         }
-                        if let Ok(entries) = self.rt.block_on(self.kube.list_resources(rt)) {
+                        if let Ok(entries) = self.kube.list_resources(rt).await {
                             if !entries.is_empty() {
                                 self.palette_all_resources.push((rt, entries));
                             }
@@ -2959,7 +3964,7 @@ impl App {
             }
         } else {
             // Fuzzy search over current resource list
-            let singular = self.selected_resource_type.map(|rt| rt.singular_name()).unwrap_or("");
+            let singular = self.selected_resource_type().map(|rt| rt.singular_name()).unwrap_or("");
             for entry in self.resources.iter() {
                 let haystack = format!(
                     "{} {}/{} {} {}",
@@ -2996,7 +4001,7 @@ impl App {
         }
     }
 
-    fn handle_palette_key(&mut self, key: KeyEvent) {
+    async fn handle_palette_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Esc => {
                 self.palette_open = false;
@@ -3016,11 +4021,10 @@ impl App {
                             self.palette_all_resources.clear();
                             // If global result, switch to that resource type first
                             if let Some(rt) = rt {
-                                self.selected_resource_type = Some(rt);
-                                self.showing_port_forwards = false;
+                                self.panel = Panel::ResourceList(rt);
                                 self.view = View::Main;
                                 // Load the resource list for this type so detail can work
-                                if let Ok(entries) = self.rt.block_on(self.kube.list_resources(rt)) {
+                                if let Ok(entries) = self.kube.list_resources(rt).await {
                                     if let Some(idx) =
                                         entries.iter().position(|e| e.name == name && e.namespace == namespace)
                                     {
@@ -3043,7 +4047,7 @@ impl App {
                         | PaletteEntryKind::PaletteCommand { key } => {
                             let key = *key;
                             self.palette_open = false;
-                            self.execute_palette_command(key);
+                            self.execute_palette_command(key).await;
                         },
                     }
                 }
@@ -3058,7 +4062,7 @@ impl App {
                             if rt == ResourceType::Event {
                                 continue;
                             }
-                            if let Ok(entries) = self.rt.block_on(self.kube.list_resources(rt)) {
+                            if let Ok(entries) = self.kube.list_resources(rt).await {
                                 if !entries.is_empty() {
                                     self.palette_all_resources.push((rt, entries));
                                 }
@@ -3101,13 +4105,13 @@ impl App {
         }
     }
 
-    fn execute_palette_command(&mut self, key: &str) {
+    async fn execute_palette_command(&mut self, key: &str) {
         match key {
-            | "R" => self.restart_selected_workload(),
-            | "S" => self.open_scale_input(),
+            | "R" => self.restart_selected_workload().await,
+            | "S" => self.open_scale_input().await,
             | "D" => self.open_delete_confirm(),
-            | "F" => self.open_port_forward_dialog(),
-            | "X" => self.open_exec_shell(),
+            | "F" => self.open_port_forward_dialog().await,
+            | "X" => self.open_exec_shell().await,
             | "C" => self.start_create_resource(),
             | "c" => self.open_context_selector(),
             | "n" => {
@@ -3233,7 +4237,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn open_delete_confirm(&mut self) {
-        let rt = match self.selected_resource_type {
+        let rt = match self.selected_resource_type() {
             | Some(rt) => rt,
             | None => return,
         };
@@ -3255,7 +4259,7 @@ impl App {
     }
 
     fn open_delete_confirm_detail(&mut self) {
-        let rt = match self.selected_resource_type {
+        let rt = match self.selected_resource_type() {
             | Some(rt) => rt,
             | None => return,
         };
@@ -3269,7 +4273,7 @@ impl App {
         });
     }
 
-    fn handle_confirm_delete_key(&mut self, key: KeyEvent) {
+    async fn handle_confirm_delete_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Enter | KeyCode::Char('y') => {
                 let (name, namespace, rt) = match &self.popup {
@@ -3281,15 +4285,16 @@ impl App {
                     | _ => return,
                 };
                 self.popup = None;
-                match self.rt.block_on(self.kube.delete_resource(rt, &namespace, &name)) {
+                match self.kube.delete_resource(rt, &namespace, &name).await {
                     | Ok(()) => {
                         self.push_status(format!("Deleted {}/{}", rt.display_name(), name));
                         self.error = None;
                         if self.view == View::Detail {
-                            self.view = View::Main;
-                            self.focus = Focus::Resources;
+                            self.return_to_main();
                         }
-                        self.pending_load = Some(PendingLoad::Resources);
+                        if !matches!(self.panel, Panel::Favorites) {
+                            self.pending_load = Some(PendingLoad::Resources);
+                        }
                     },
                     | Err(e) => {
                         self.error = Some(format!("Delete failed: {}", e));
@@ -3303,7 +4308,7 @@ impl App {
         }
     }
 
-    fn handle_confirm_drain_key(&mut self, key: KeyEvent) {
+    async fn handle_confirm_drain_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Enter | KeyCode::Char('y') => {
                 let node_name = match &self.popup {
@@ -3311,7 +4316,7 @@ impl App {
                     | _ => return,
                 };
                 self.popup = None;
-                self.drain_node_by_name(&node_name);
+                self.drain_node_by_name(&node_name).await;
             },
             | KeyCode::Esc | KeyCode::Char('n') => {
                 self.popup = None;
@@ -3320,8 +4325,8 @@ impl App {
         }
     }
 
-    fn drain_node_by_name(&mut self, name: &str) {
-        match self.rt.block_on(self.kube.drain_node(name)) {
+    async fn drain_node_by_name(&mut self, name: &str) {
+        match self.kube.drain_node(name).await {
             | Ok(evicted) => {
                 self.push_status(format!("Drained node {} ({} pods evicted)", name, evicted));
                 self.error = None;
@@ -3337,8 +4342,8 @@ impl App {
     // Scale
     // -----------------------------------------------------------------------
 
-    fn open_scale_input(&mut self) {
-        let rt = match self.selected_resource_type {
+    async fn open_scale_input(&mut self) {
+        let rt = match self.selected_resource_type() {
             | Some(rt) if rt.supports_scale() => rt,
             | _ => return,
         };
@@ -3356,8 +4361,9 @@ impl App {
         let namespace = entry.namespace.clone();
         // Try to read current replicas from the resource value
         let current = self
-            .rt
-            .block_on(self.kube.get_resource(rt, &namespace, &name))
+            .kube
+            .get_resource(rt, &namespace, &name)
+            .await
             .ok()
             .and_then(|v| v.get("spec").and_then(|s| s.get("replicas")).and_then(|r| r.as_u64()))
             .unwrap_or(1) as u32;
@@ -3371,7 +4377,7 @@ impl App {
     }
 
     fn open_scale_input_detail(&mut self) {
-        let rt = match self.selected_resource_type {
+        let rt = match self.selected_resource_type() {
             | Some(rt) if rt.supports_scale() => rt,
             | _ => return,
         };
@@ -3393,7 +4399,7 @@ impl App {
         });
     }
 
-    fn handle_scale_input_key(&mut self, key: KeyEvent) {
+    async fn handle_scale_input_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Enter => {
                 let (name, namespace, rt, replicas) = match &self.popup {
@@ -3416,10 +4422,7 @@ impl App {
                     | _ => return,
                 };
                 self.popup = None;
-                match self
-                    .rt
-                    .block_on(self.kube.scale_resource(rt, &namespace, &name, replicas))
-                {
+                match self.kube.scale_resource(rt, &namespace, &name, replicas).await {
                     | Ok(()) => {
                         self.push_status(format!(
                             "Scaled {}/{} to {} replicas",
@@ -3460,7 +4463,7 @@ impl App {
     // Kubeconfig
     // -----------------------------------------------------------------------
 
-    fn handle_kubeconfig_input_key(&mut self, key: KeyEvent) {
+    async fn handle_kubeconfig_input_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Enter => {
                 let path = match &self.popup {
@@ -3478,12 +4481,11 @@ impl App {
                 } else {
                     path
                 };
-                match self.rt.block_on(KubeClient::new(Some(expanded), None, None)) {
+                match KubeClient::new(Some(expanded), None, None).await {
                     | Ok(new_client) => {
                         self.pf_manager.cancel_all();
                         self.kube = new_client;
-                        self.selected_resource_type = None;
-                        self.showing_port_forwards = false;
+                        self.panel = Panel::Overview;
                         self.resource_counts.clear();
                         self.cluster_stats_scroll = 0;
                         self.pending_load = Some(PendingLoad::ClusterStats);
@@ -3523,8 +4525,8 @@ impl App {
     // Exec
     // -----------------------------------------------------------------------
 
-    fn open_exec_shell(&mut self) {
-        let rt = match self.selected_resource_type {
+    async fn open_exec_shell(&mut self) {
+        let rt = match self.selected_resource_type() {
             | Some(rt) if rt.supports_exec() => rt,
             | _ => return,
         };
@@ -3543,7 +4545,7 @@ impl App {
                 | None => return,
             }
         };
-        match self.rt.block_on(self.kube.find_pods(rt, &namespace, &name)) {
+        match self.kube.find_pods(rt, &namespace, &name).await {
             | Ok(pods) if !pods.is_empty() => {
                 let pod = &pods[0];
                 let pod_name = pod.name.clone();
@@ -3679,8 +4681,8 @@ impl App {
 
     /// Start edit from the resource list view: fetch YAML for the selected
     /// resource.
-    fn start_edit_from_list(&mut self) {
-        let rt = match self.selected_resource_type {
+    async fn start_edit_from_list(&mut self) {
+        let rt = match self.selected_resource_type() {
             | Some(rt) => rt,
             | None => return,
         };
@@ -3699,7 +4701,7 @@ impl App {
         let namespace = entry.namespace.clone();
 
         // Fetch the resource YAML
-        match self.rt.block_on(self.kube.get_resource(rt, &namespace, &name)) {
+        match self.kube.get_resource(rt, &namespace, &name).await {
             | Ok(value) => {
                 let yaml = serde_yaml::to_string(&value).unwrap_or_default();
                 self.pending_edit = Some(PendingEdit {
@@ -3718,7 +4720,7 @@ impl App {
 
     /// Start edit from the detail view: use the already-loaded YAML.
     fn start_edit_from_detail(&mut self) {
-        let rt = match self.selected_resource_type {
+        let rt = match self.selected_resource_type() {
             | Some(rt) => rt,
             | None => return,
         };
@@ -3773,13 +4775,13 @@ impl App {
     }
 
     /// Key handler for the diff preview view.
-    pub fn handle_edit_diff_key(&mut self, key: KeyEvent) {
+    pub async fn handle_edit_diff_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Esc | KeyCode::Char('q') => {
                 self.edit_ctx = None;
                 // Return to previous view
                 if self.detail_name.is_empty() {
-                    self.view = View::Main;
+                    self.return_to_main();
                 } else {
                     self.view = View::Detail;
                 }
@@ -3794,7 +4796,7 @@ impl App {
                 }
             },
             | KeyCode::Enter => {
-                self.apply_edit();
+                self.apply_edit().await;
             },
             | KeyCode::Char('e') => {
                 // Re-edit: reopen editor with the edited YAML
@@ -3832,7 +4834,7 @@ impl App {
         }
     }
 
-    fn apply_edit(&mut self) {
+    async fn apply_edit(&mut self) {
         let ctx = match &self.edit_ctx {
             | Some(c) => c,
             | None => return,
@@ -3842,7 +4844,7 @@ impl App {
         let name = ctx.name.clone();
         let yaml = ctx.edited_yaml.clone();
 
-        match self.rt.block_on(self.kube.replace_resource_yaml(rt, &ns, &name, &yaml)) {
+        match self.kube.replace_resource_yaml(rt, &ns, &name, &yaml).await {
             | Ok(value) => {
                 self.push_status(format!("Applied changes to {}/{}", rt.display_name(), name));
                 self.error = None;
@@ -3908,7 +4910,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn open_metadata_edit(&mut self, kind: MetadataEditKind) {
-        let rt = match self.selected_resource_type {
+        let rt = match self.selected_resource_type() {
             | Some(rt) => rt,
             | None => return,
         };
@@ -3939,7 +4941,7 @@ impl App {
         });
     }
 
-    pub fn handle_metadata_edit_result(&mut self, edit: PendingMetadataEdit, edited_yaml: String) {
+    pub async fn handle_metadata_edit_result(&mut self, edit: PendingMetadataEdit, edited_yaml: String) {
         // Strip comment lines
         let cleaned: String = edited_yaml
             .lines()
@@ -3987,22 +4989,14 @@ impl App {
 
         let result = match edit.kind {
             | MetadataEditKind::Labels => {
-                self.rt.block_on(self.kube.patch_metadata(
-                    edit.resource_type,
-                    &edit.namespace,
-                    &edit.name,
-                    Some(&patch),
-                    None,
-                ))
+                self.kube
+                    .patch_metadata(edit.resource_type, &edit.namespace, &edit.name, Some(&patch), None)
+                    .await
             },
             | MetadataEditKind::Annotations => {
-                self.rt.block_on(self.kube.patch_metadata(
-                    edit.resource_type,
-                    &edit.namespace,
-                    &edit.name,
-                    None,
-                    Some(&patch),
-                ))
+                self.kube
+                    .patch_metadata(edit.resource_type, &edit.namespace, &edit.name, None, Some(&patch))
+                    .await
             },
         };
         match result {

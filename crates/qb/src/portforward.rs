@@ -79,6 +79,7 @@ pub struct PortForwardEntry {
     pub resource_label: String,
     pub status: PortForwardStatus,
     pub connections: usize,
+    pub target: Option<PfTarget>,
     cancel_tx: watch::Sender<bool>,
     pause_tx: watch::Sender<bool>,
 }
@@ -123,7 +124,6 @@ impl PortForwardManager {
     pub fn create(
         &mut self,
         client: Client,
-        rt: &tokio::runtime::Handle,
         namespace: String,
         pod_name: String,
         context: String,
@@ -148,6 +148,7 @@ impl PortForwardManager {
             resource_label,
             status: PortForwardStatus::Starting,
             connections: 0,
+            target: Some(target.clone()),
             cancel_tx,
             pause_tx,
         };
@@ -155,7 +156,7 @@ impl PortForwardManager {
 
         let update_tx = self.update_tx.clone();
 
-        rt.spawn(port_forward_task(
+        tokio::spawn(port_forward_task(
             id,
             client,
             namespace,
@@ -170,6 +171,84 @@ impl PortForwardManager {
         id
     }
 
+    /// Create a port forward entry in Paused state without spawning a
+    /// background task. Used when restoring saved port forwards that were
+    /// paused.
+    pub fn create_paused(
+        &mut self,
+        namespace: String,
+        pod_name: String,
+        context: String,
+        resource_label: String,
+        local_port: u16,
+        remote_port: u16,
+        target: PfTarget,
+    ) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let (pause_tx, _pause_rx) = watch::channel(true);
+
+        let entry = PortForwardEntry {
+            id,
+            local_port,
+            remote_port,
+            pod_name,
+            namespace,
+            context,
+            resource_label,
+            status: PortForwardStatus::Paused,
+            connections: 0,
+            target: Some(target),
+            cancel_tx,
+            pause_tx,
+        };
+        self.entries.push(entry);
+        id
+    }
+
+    /// Spawn a new background task for a paused or errored entry.
+    /// Returns true if a task was spawned.
+    pub fn resume_spawn(&mut self, id: usize, client: Client) -> bool {
+        let entry = match self.entries.iter_mut().find(|e| e.id == id) {
+            | Some(e) if matches!(e.status, PortForwardStatus::Paused | PortForwardStatus::Error(_)) => e,
+            | _ => return false,
+        };
+
+        let target = match entry.target.clone() {
+            | Some(t) => t,
+            | None => return false,
+        };
+
+        let local_port = entry.local_port;
+        let remote_port = entry.remote_port;
+        let namespace = entry.namespace.clone();
+
+        // Replace channels so the new task gets fresh ones
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(false);
+        entry.cancel_tx = cancel_tx;
+        entry.pause_tx = pause_tx;
+        entry.status = PortForwardStatus::Starting;
+
+        let update_tx = self.update_tx.clone();
+
+        tokio::spawn(port_forward_task(
+            id,
+            client,
+            namespace,
+            target,
+            local_port,
+            remote_port,
+            cancel_rx,
+            pause_rx,
+            update_tx,
+        ));
+
+        true
+    }
+
     pub fn cancel(&mut self, id: usize) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
             let _ = entry.cancel_tx.send(true);
@@ -181,6 +260,9 @@ impl PortForwardManager {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
             if entry.status.is_running() {
                 let _ = entry.pause_tx.send(true);
+            }
+            // Allow pausing from running or error states
+            if entry.status.is_running() || matches!(entry.status, PortForwardStatus::Error(_)) {
                 entry.status = PortForwardStatus::Paused;
             }
         }
@@ -287,10 +369,10 @@ async fn port_forward_task(
 ) {
     let listener = match TcpListener::bind(("127.0.0.1", local_port)).await {
         | Ok(l) => l,
-        | Err(e) => {
+        | Err(_) => {
             let _ = update_tx.send(PfUpdate::Status {
                 id,
-                status: PortForwardStatus::Error(format!("Bind :{}  {}", local_port, e)),
+                status: PortForwardStatus::Error(format!("Port :{} in use", local_port)),
             });
             return;
         },

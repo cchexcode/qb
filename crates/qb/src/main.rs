@@ -4,6 +4,7 @@ use {
 };
 
 mod args;
+mod config;
 mod k8s;
 mod portforward;
 mod tui;
@@ -16,7 +17,16 @@ async fn main() -> Result<()> {
             println!("qb {}", env!("CARGO_PKG_VERSION"));
         },
         | None => {
-            tui::run(None, None, None, cli.experimental).await?;
+            let config = match config::QbConfig::load() {
+                | Ok(c) => c,
+                | Err(e) => {
+                    eprintln!("Warning: Failed to load config: {}", e);
+                    eprintln!("Using default configuration.");
+                    config::QbConfig::default_config()
+                },
+            };
+            let saved_context = config.active_profile().context.clone();
+            tui::run(None, saved_context, None, cli.experimental, config).await?;
         },
     }
     Ok(())

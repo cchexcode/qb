@@ -16,20 +16,22 @@ kubeconfig — no kubectl dependency. Single binary, no external frontend, no re
 crates/qb/src/
   main.rs          Entry point, CLI routing
   args.rs          CLI argument parsing (clap derive)
+  config.rs        Persistent config: profiles, favorites, saved port forwards, version checking.
+                   Loads/saves ~/.config/qb/config.yaml.
   k8s/mod.rs       K8s API client, resource types, pod resolution, log fetching, cluster stats,
                    resource editing (replace via DynamicObject)
   portforward.rs   Port forward manager: background tasks, auto-restart, pod resolution,
                    port extraction helpers, pause/resume/cancel lifecycle
   tui/mod.rs       Terminal setup, event loop (render → load → poll logs → poll pf → poll input),
-                   external editor invocation (suspend/resume terminal)
+                   external editor invocation (suspend/resume terminal), config save on quit
   tui/app.rs       App struct (all state), key handlers, deferred loading, filter state,
                    dict entry selection/expansion, edit flow (diff, apply, re-edit),
-                   port forward dialog + creation flow
+                   port forward dialog + creation flow, favorites toggle, profile management
   tui/command.rs   Command registry — single source of truth for all keybindings.
                    Drives hotkey bars, help screen, and command palette.
   tui/ui.rs        Rendering: main view, detail view, log view, events log, cluster stats,
-                   port forwards view, edit diff view (inline + side-by-side), popups,
-                   breadcrumb with refresh indicator, hotkey bars, node grid cards, gauge bars
+                   favorites view, port forwards view, edit diff view (inline + side-by-side),
+                   popups, breadcrumb with refresh indicator, hotkey bars, node grid cards
   tui/smart.rs     Per-resource-type structured renderers, SecretDetailState, DictState,
                    selectable labels/annotations, structured resource requests/limits
   tui/logs.rs      LogViewState, follow-mode streaming, regex filter
@@ -78,6 +80,8 @@ Keyboard-only. All navigation uses vim-style bindings.
 | `Esc` | Back / dismiss popup or selection |
 | `?` | Help (context-only by default, `Tab` to show all) |
 | `Ctrl+P` | Command palette |
+| `Ctrl+S` | Save current profile |
+| `P` | Load/switch profile |
 | `p` | Pause/resume auto-refresh (except log view, port forwards view) |
 
 ### Main View
@@ -108,6 +112,7 @@ Keyboard-only. All navigation uses vim-style bindings.
 | `d` | Mark / diff resources |
 | `C` | Create new resource |
 | `X` | Exec into pod (experimental) |
+| `*` | Toggle favorite for selected resource |
 
 ### Detail View
 
@@ -132,6 +137,7 @@ Keyboard-only. All navigation uses vim-style bindings.
 | `w` | Toggle watch mode (auto-refresh detail) |
 | `Tab` | Toggle related resources selection |
 | `X` | Exec into pod (experimental) |
+| `*` | Toggle favorite for current resource |
 
 ### Log View
 
@@ -181,13 +187,14 @@ The sidebar is a flat list with category headers (non-selectable) and selectable
 Overview is always the first item and the default landing screen.
 
 1. **Overview** — Cluster stats, health, node grid (default on startup)
-2. **WORKLOADS** — Deployments, StatefulSets, DaemonSets, ReplicaSets, Pods, CronJobs, Jobs, HPAs
-3. **NETWORK** — Services, Ingresses, Endpoints, NetworkPolicies
-4. **CONFIG** — ConfigMaps, Secrets
-5. **STORAGE** — PVCs, PVs, StorageClasses
-6. **RBAC** — ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
-7. **CLUSTER** — Nodes, Namespaces, Events
-8. **FORWARDING** — Port Forwards (view, pause, resume, cancel)
+2. **Favorites** — Starred resources across all types (`*` to toggle, shows count badge)
+3. **Port Forwards** — View, pause, resume, cancel; persisted to config
+4. **WORKLOADS** — Deployments, StatefulSets, DaemonSets, ReplicaSets, Pods, CronJobs, Jobs, HPAs
+5. **NETWORK** — Services, Ingresses, Endpoints, NetworkPolicies
+6. **CONFIG** — ConfigMaps, Secrets
+7. **STORAGE** — PVCs, PVs, StorageClasses
+8. **RBAC** — ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
+9. **CLUSTER** — Nodes, Namespaces, Events
 
 Categories are non-selectable headers (`NavItemKind::Category`). Navigation with j/k
 skips over them.
@@ -240,7 +247,8 @@ Press `F` on any workload or service resource to create a port forward. The flow
 2. Navigate ports with `j`/`k`, edit local port number (defaults to same as remote)
 3. `Enter` creates the forward, `Esc` cancels
 4. Port forwards run as background tokio tasks with auto-restart on failure
-5. View all forwards in the GLOBAL > Port Forwards sidebar item
+5. View all forwards in the Port Forwards sidebar item
+6. Port forwards are automatically persisted to the active profile in config
 
 Port forward architecture:
 - `PortForwardManager` in `portforward.rs` owns all entries and communicates with tasks via
@@ -310,6 +318,35 @@ the first entry. Navigate with j/k, select with Enter.
 `⏸ paused` and log stream polling is suppressed. In the log view, `p` is the pod selector
 instead — use `f` (follow) to control live streaming there. In the port forwards view, `p`
 pauses/resumes the selected port forward instead.
+
+### Persistent Config
+
+State is persisted to `~/.config/qb/config.yaml` via `config.rs`. The config file stores:
+- **version** — Must be compatible with CLI version (secenv-style: 0.0.0 allows any, pre-1.0
+  minor must match, post-1.0 major must match).
+- **active_profile** — Name of the currently active profile.
+- **profiles** — Map of named profiles, each containing favorites, saved port forwards, and
+  an optional kubeconfig path.
+
+Config auto-saves on: favorite toggle, port forward create/cancel, profile save/switch, quit.
+Created automatically on first run with a "default" profile.
+
+### Favorites
+
+Press `*` on any resource (list or detail view) to toggle it as a favorite. Favorites are
+stored per-profile in the config file. The sidebar shows "Favorites" between Overview and
+Port Forwards, with a count badge.
+
+The favorites view acts like a normal resource list — all standard commands (Enter, `e`, `l`,
+`D`, `R`, `S`, `F`, `y`) work on the selected favorite, resolving to the favorite's resource
+type. Press `*` to de-favorite. Resources show `★` prefix when favorited. Missing resources
+(context no longer available) show `⚠` with red styling.
+
+### Profiles
+
+Profiles group favorites and saved port forwards under a name. The default profile is always
+created on first run. `Ctrl+S` opens a save dialog, `P` opens the profile switcher. Profiles
+are stored in config and auto-saved on changes.
 
 ## Coding Standards
 
@@ -427,6 +464,8 @@ for exhaustive matching. No `unreachable!()` in dispatch.
 - **arboard** — System clipboard access for secret copying.
 - **similar** — Text diff computation (unified diff for edit preview).
 - **tempfile** — Temp file creation for editor invocation.
+- **semver** — Semantic version parsing and comparison for config compatibility checking.
+- **dirs** — Cross-platform config directory resolution (`~/.config`).
 
 ## Build
 

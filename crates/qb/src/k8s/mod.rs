@@ -168,6 +168,37 @@ impl ResourceType {
         }
     }
 
+    pub fn from_singular_name(name: &str) -> Option<Self> {
+        match name {
+            | "deployment" => Some(Self::Deployment),
+            | "statefulset" => Some(Self::StatefulSet),
+            | "daemonset" => Some(Self::DaemonSet),
+            | "replicaset" => Some(Self::ReplicaSet),
+            | "pod" => Some(Self::Pod),
+            | "cronjob" => Some(Self::CronJob),
+            | "job" => Some(Self::Job),
+            | "hpa" => Some(Self::HorizontalPodAutoscaler),
+            | "configmap" => Some(Self::ConfigMap),
+            | "secret" => Some(Self::Secret),
+            | "service" => Some(Self::Service),
+            | "ingress" => Some(Self::Ingress),
+            | "endpoints" => Some(Self::Endpoints),
+            | "networkpolicy" => Some(Self::NetworkPolicy),
+            | "pvc" => Some(Self::PersistentVolumeClaim),
+            | "pv" => Some(Self::PersistentVolume),
+            | "storageclass" => Some(Self::StorageClass),
+            | "serviceaccount" => Some(Self::ServiceAccount),
+            | "role" => Some(Self::Role),
+            | "rolebinding" => Some(Self::RoleBinding),
+            | "clusterrole" => Some(Self::ClusterRole),
+            | "clusterrolebinding" => Some(Self::ClusterRoleBinding),
+            | "node" => Some(Self::Node),
+            | "namespace" => Some(Self::Namespace),
+            | "event" => Some(Self::Event),
+            | _ => None,
+        }
+    }
+
     pub fn column_headers(&self) -> Vec<&'static str> {
         match self {
             | Self::Deployment => vec!["NAME", "READY", "UP-TO-DATE", "AVAILABLE", "AGE"],

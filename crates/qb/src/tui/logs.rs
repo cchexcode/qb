@@ -157,7 +157,7 @@ impl LogViewState {
     // Follow mode — streams ALL active pod/container pairs
     // -----------------------------------------------------------------------
 
-    pub fn start_following(&mut self, client: Client, rt: &tokio::runtime::Handle) {
+    pub fn start_following(&mut self, client: Client) {
         self.stop_following();
 
         let pairs = self.active_streams();
@@ -169,7 +169,7 @@ impl LogViewState {
             let ns = ns.clone();
             let pod_tag = pod.clone();
             let container_tag = container.clone();
-            let handle = rt.spawn(async move {
+            let handle = tokio::spawn(async move {
                 log_stream_task(client, ns, pod, container, pod_tag, container_tag, tx).await;
             });
             self.receivers.push(rx);

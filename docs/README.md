@@ -57,10 +57,18 @@ It does **not** shell out to `kubectl` — all cluster communication is native v
 - **Wrap toggle** (`w`) — Wrap long log lines
 - **Pod/container selector** — `p`/`c` to narrow down
 
+### Favorites & Profiles
+- **Favorite resources** (`*`) — Star any resource from list or detail view
+- **Favorites view** — Dedicated sidebar section showing all starred resources
+- **Profiles** — Save/load named profiles (`Ctrl+S` to save, `P` to load)
+- **Persistent config** — Favorites and port forwards are saved to `~/.config/qb/config.yaml`
+- **Missing indicator** — Shows `⚠` for favorites whose cluster context is no longer reachable
+
 ### Port Forwarding
 - **Create** (`F`) — Forward any service, deployment, or pod port to localhost
 - **Auto-restart** — Forwards survive pod restarts and rolling updates
-- **Manage** — View all forwards under GLOBAL > Port Forwards; pause/resume/cancel
+- **Persistent** — Port forwards are saved to your profile and restored on next launch
+- **Manage** — View all forwards under Port Forwards in sidebar; pause/resume/cancel
 
 ### Exec (Experimental)
 - **Quick exec** (`x`) — Opens `/bin/sh` in a new terminal window
