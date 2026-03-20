@@ -673,6 +673,21 @@ impl App {
         self.status = format!("ctx: {} | ns: {} | {}: {}", ctx, ns, rt_name, count);
     }
 
+    /// Clear all cached resource data. Called on context switch, profile
+    /// switch, and namespace change.
+    fn clear_cached_state(&mut self) {
+        self.resource_counts.clear();
+        self.resources.clear();
+        self.cluster_stats = None;
+        self.detail_value = serde_json::Value::Null;
+        self.detail_yaml.clear();
+        self.detail_name.clear();
+        self.detail_namespace.clear();
+        self.related_events.clear();
+        self.related_resources.clear();
+        self.related_cursor = None;
+    }
+
     pub fn push_status(&mut self, msg: impl Into<String>) {
         let s = msg.into();
         self.status = s.clone();
@@ -922,6 +937,7 @@ impl App {
     async fn do_switch_context(&mut self, ctx: &str) {
         match self.kube.switch_context(ctx).await {
             | Ok(()) => {
+                self.clear_cached_state();
                 self.pending_load = Some(PendingLoad::Resources);
                 self.error = None;
                 // Persist selected context
@@ -2299,16 +2315,18 @@ impl App {
                             .map(PendingLoad::SwitchContext)
                     },
                     | Some(Popup::NamespaceSelect { items, state }) => {
-                        state.selected().and_then(|idx| {
-                            items.get(idx).map(|ns| {
-                                if ns == ALL_NAMESPACES_LABEL {
-                                    self.kube.set_namespace(None);
-                                } else {
-                                    self.kube.set_namespace(Some(ns.clone()));
-                                }
-                                PendingLoad::Resources
-                            })
-                        })
+                        let ns = state.selected().and_then(|idx| items.get(idx).cloned());
+                        if let Some(ns) = ns {
+                            if ns == ALL_NAMESPACES_LABEL {
+                                self.kube.set_namespace(None);
+                            } else {
+                                self.kube.set_namespace(Some(ns));
+                            }
+                            self.clear_cached_state();
+                            Some(PendingLoad::Resources)
+                        } else {
+                            None
+                        }
                     },
                     | Some(Popup::PodSelect { state, .. }) => {
                         if let Some(idx) = state.selected() {
@@ -3649,6 +3667,7 @@ impl App {
         // Save current PF paused states before switching
         // (already persisted on pause/resume, so just cancel runtime entries)
         self.pf_manager.cancel_all();
+        self.clear_cached_state();
 
         self.config.active_profile = name.to_string();
 
