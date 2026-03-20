@@ -490,6 +490,8 @@ impl App {
             profiles_cursor: 0,
             profiles_table_state: TableState::default(),
         };
+        app.config.active_profile_mut().kubeconfig = app.kube.kubeconfig_path().map(|s| s.to_string());
+        let _ = app.config.save();
         app.restore_saved_port_forwards();
         app.update_status();
         app
@@ -3671,8 +3673,22 @@ impl App {
 
         self.config.active_profile = name.to_string();
 
-        // Switch cluster context if the profile has one
-        if let Some(ctx) = self.config.active_profile().context.clone() {
+        // Reload KubeClient if the profile has a different kubeconfig
+        let profile_kubeconfig = self.config.active_profile().kubeconfig.clone();
+        let current_kubeconfig = self.kube.kubeconfig_path().map(|s| s.to_string());
+        if profile_kubeconfig != current_kubeconfig {
+            let ctx = self.config.active_profile().context.clone();
+            match KubeClient::new(profile_kubeconfig, ctx, None).await {
+                | Ok(new_client) => {
+                    self.kube = new_client;
+                    self.config.active_profile_mut().kubeconfig = self.kube.kubeconfig_path().map(|s| s.to_string());
+                },
+                | Err(e) => {
+                    self.error = Some(format!("Failed to load kubeconfig: {}", e));
+                },
+            }
+        } else if let Some(ctx) = self.config.active_profile().context.clone() {
+            // Same kubeconfig, just switch context
             if let Err(e) = self.kube.switch_context(&ctx).await {
                 self.error = Some(format!("Failed to switch context: {}", e));
             }
@@ -4504,6 +4520,11 @@ impl App {
                     | Ok(new_client) => {
                         self.pf_manager.cancel_all();
                         self.kube = new_client;
+                        self.config.active_profile_mut().kubeconfig =
+                            self.kube.kubeconfig_path().map(|s| s.to_string());
+                        if let Err(e) = self.config.save() {
+                            self.error = Some(format!("Failed to save config: {}", e));
+                        }
                         self.panel = Panel::Overview;
                         self.resource_counts.clear();
                         self.cluster_stats_scroll = 0;

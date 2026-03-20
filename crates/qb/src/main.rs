@@ -25,8 +25,9 @@ async fn main() -> Result<()> {
                     config::QbConfig::default_config()
                 },
             };
+            let saved_kubeconfig = config.active_profile().kubeconfig.clone();
             let saved_context = config.active_profile().context.clone();
-            tui::run(None, saved_context, None, cli.experimental, config).await?;
+            tui::run(saved_kubeconfig, saved_context, None, cli.experimental, config).await?;
         },
     }
     Ok(())

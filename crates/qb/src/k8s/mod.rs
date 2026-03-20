@@ -56,7 +56,16 @@ use {
         Client,
     },
     serde_json::Value,
+    std::time::Duration,
 };
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn apply_timeouts(config: &mut kube::Config) {
+    config.connect_timeout = Some(REQUEST_TIMEOUT);
+    config.read_timeout = Some(REQUEST_TIMEOUT);
+    config.write_timeout = Some(REQUEST_TIMEOUT);
+}
 
 // ---------------------------------------------------------------------------
 // Resource type definitions
@@ -439,6 +448,12 @@ impl KubeClient {
         context: Option<String>,
         namespace: Option<String>,
     ) -> Result<Self> {
+        // Always resolve the kubeconfig path so it can be persisted per profile
+        let kubeconfig_path = kubeconfig_path.or_else(|| {
+            std::env::var("KUBECONFIG")
+                .ok()
+                .or_else(|| std::env::home_dir().map(|h| h.join(".kube/config").to_string_lossy().into_owned()))
+        });
         let kubeconfig = match &kubeconfig_path {
             | Some(path) => Kubeconfig::read_from(path).context("Failed to read kubeconfig")?,
             | None => Kubeconfig::read().context("Failed to read default kubeconfig")?,
@@ -452,9 +467,10 @@ impl KubeClient {
             context: Some(current_context.clone()),
             ..Default::default()
         };
-        let config = kube::Config::from_kubeconfig(&options)
+        let mut config = kube::Config::from_kubeconfig(&options)
             .await
             .context("Failed to build kube config from kubeconfig")?;
+        apply_timeouts(&mut config);
 
         let client = Client::try_from(config)?;
         // Explicit --namespace flag sets a specific namespace; otherwise default to all
@@ -505,7 +521,8 @@ impl KubeClient {
             context: Some(ctx.to_string()),
             ..Default::default()
         };
-        let config = kube::Config::from_kubeconfig(&options).await?;
+        let mut config = kube::Config::from_kubeconfig(&options).await?;
+        apply_timeouts(&mut config);
         self.current_namespace = None;
         self.client = Client::try_from(config)?;
         self.current_context = ctx.to_string();
