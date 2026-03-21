@@ -43,7 +43,11 @@ async fn run_tui(kube_client: KubeClient, experimental: bool, config: QbConfig) 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_event_loop(&mut terminal, kube_client, experimental, config).await;
+    let (result, config) = run_event_loop(&mut terminal, kube_client, experimental, config).await;
+
+    if let Err(e) = config.save() {
+        eprintln!("Warning: Failed to save config: {}", e);
+    }
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -57,17 +61,22 @@ async fn run_event_loop(
     kube_client: KubeClient,
     experimental: bool,
     config: QbConfig,
-) -> Result<()> {
+) -> (Result<()>, QbConfig) {
+    let mut app = app::App::new(kube_client, experimental, config);
+    let result = run_event_loop_inner(terminal, &mut app).await;
+    (result, app.config)
+}
+
+async fn run_event_loop_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut app::App) -> Result<()> {
     use {
         crossterm::event::EventStream,
         futures::StreamExt,
     };
 
-    let mut app = app::App::new(kube_client, experimental, config);
     let mut event_stream = EventStream::new();
 
     loop {
-        terminal.draw(|f| ui::render(f, &mut app))?;
+        terminal.draw(|f| ui::render(f, app))?;
 
         // Process deferred loads after rendering
         app.process_pending_load().await;
@@ -95,7 +104,7 @@ async fn run_event_loop(
 
         // Handle pending editor invocation — suspend TUI, run editor, resume
         if let Some(edit) = app.pending_edit.take() {
-            if let Some((edit, edited_yaml)) = run_external_editor(terminal, &mut app, edit)? {
+            if let Some((edit, edited_yaml)) = run_external_editor(terminal, app, edit)? {
                 app.handle_edit_result(edit, edited_yaml);
             }
         }
@@ -107,23 +116,19 @@ async fn run_event_loop(
 
         // Handle pending create — suspend TUI, open editor, apply on save
         if let Some(create) = app.pending_create.take() {
-            if let Some(yaml) = run_create_editor(terminal, &mut app, create)? {
+            if let Some(yaml) = run_create_editor(terminal, app, create)? {
                 app.handle_create_result(yaml).await;
             }
         }
 
         // Handle pending metadata edit — suspend TUI, open editor, apply on save
         if let Some(meta_edit) = app.pending_metadata_edit.take() {
-            if let Some((edit, edited_yaml)) = run_metadata_editor(terminal, &mut app, meta_edit)? {
+            if let Some((edit, edited_yaml)) = run_metadata_editor(terminal, app, meta_edit)? {
                 app.handle_metadata_edit_result(edit, edited_yaml).await;
             }
         }
 
         if app.should_quit {
-            // Save config on quit
-            if let Err(e) = app.config.save() {
-                eprintln!("Warning: Failed to save config: {}", e);
-            }
             return Ok(());
         }
     }

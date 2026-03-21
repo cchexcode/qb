@@ -434,86 +434,84 @@ pub struct ClusterStatsData {
 // Kubernetes client
 // ---------------------------------------------------------------------------
 
+pub struct KubeClients {
+    /// Standard client with connect/read/write timeouts.
+    pub default: Client,
+    /// Client with only connect timeout — no read timeout so long-lived
+    /// log follow streams aren't killed.
+    pub streaming: Client,
+}
+
+pub struct KubeconfigState {
+    pub config: Kubeconfig,
+    pub path: Option<String>,
+}
+
+pub struct KubeContext {
+    pub name: String,
+    pub namespace: Option<String>,
+}
+
 pub struct KubeClient {
-    client: Client,
-    kubeconfig: Kubeconfig,
-    kubeconfig_path: Option<String>,
-    current_context: String,
-    current_namespace: Option<String>,
+    pub client: KubeClients,
+    pub kubeconfig: KubeconfigState,
+    pub context: KubeContext,
 }
 
 impl KubeClient {
     pub async fn new(
         kubeconfig_path: Option<String>,
-        context: Option<String>,
+        context_name: Option<String>,
         namespace: Option<String>,
     ) -> Result<Self> {
         // Always resolve the kubeconfig path so it can be persisted per profile
-        let kubeconfig_path = kubeconfig_path.or_else(|| {
+        let path = kubeconfig_path.or_else(|| {
             std::env::var("KUBECONFIG")
                 .ok()
                 .or_else(|| std::env::home_dir().map(|h| h.join(".kube/config").to_string_lossy().into_owned()))
         });
-        let kubeconfig = match &kubeconfig_path {
-            | Some(path) => Kubeconfig::read_from(path).context("Failed to read kubeconfig")?,
+        let config = match &path {
+            | Some(p) => Kubeconfig::read_from(p).context("Failed to read kubeconfig")?,
             | None => Kubeconfig::read().context("Failed to read default kubeconfig")?,
         };
 
-        let current_context = context
-            .or_else(|| kubeconfig.current_context.clone())
+        let name = context_name
+            .or_else(|| config.current_context.clone())
             .unwrap_or_default();
 
         let options = KubeConfigOptions {
-            context: Some(current_context.clone()),
+            context: Some(name.clone()),
             ..Default::default()
         };
-        let mut config = kube::Config::from_kubeconfig(&options)
-            .await
-            .context("Failed to build kube config from kubeconfig")?;
-        apply_timeouts(&mut config);
-
-        let client = Client::try_from(config)?;
-        // Explicit --namespace flag sets a specific namespace; otherwise default to all
-        let current_namespace = namespace;
+        let client = Self::build_clients(&options).await?;
 
         Ok(Self {
             client,
-            kubeconfig,
-            kubeconfig_path,
-            current_context,
-            current_namespace,
+            kubeconfig: KubeconfigState { config, path },
+            context: KubeContext { name, namespace },
         })
     }
 
-    pub fn kubeconfig_path(&self) -> Option<&str> {
-        self.kubeconfig_path.as_deref()
-    }
-
     pub fn contexts(&self) -> Vec<String> {
-        self.kubeconfig.contexts.iter().map(|c| c.name.clone()).collect()
+        self.kubeconfig.config.contexts.iter().map(|c| c.name.clone()).collect()
     }
 
-    pub fn current_context(&self) -> &str {
-        &self.current_context
-    }
+    async fn build_clients(options: &KubeConfigOptions) -> Result<KubeClients> {
+        let mut config = kube::Config::from_kubeconfig(options)
+            .await
+            .context("Failed to build kube config from kubeconfig")?;
+        apply_timeouts(&mut config);
+        let default = Client::try_from(config)?;
 
-    /// Returns the current namespace filter, or None if all namespaces.
-    pub fn current_namespace(&self) -> Option<&str> {
-        self.current_namespace.as_deref()
-    }
+        let mut stream_config = kube::Config::from_kubeconfig(options)
+            .await
+            .context("Failed to build kube config from kubeconfig")?;
+        stream_config.connect_timeout = Some(REQUEST_TIMEOUT);
+        stream_config.read_timeout = None;
+        stream_config.write_timeout = Some(REQUEST_TIMEOUT);
+        let streaming = Client::try_from(stream_config)?;
 
-    /// Returns a display string for the namespace: the name or "All
-    /// Namespaces".
-    pub fn namespace_display(&self) -> &str {
-        self.current_namespace.as_deref().unwrap_or("All Namespaces")
-    }
-
-    pub fn is_all_namespaces(&self) -> bool {
-        self.current_namespace.is_none()
-    }
-
-    pub fn set_namespace(&mut self, ns: Option<String>) {
-        self.current_namespace = ns;
+        Ok(KubeClients { default, streaming })
     }
 
     pub async fn switch_context(&mut self, ctx: &str) -> Result<()> {
@@ -521,16 +519,14 @@ impl KubeClient {
             context: Some(ctx.to_string()),
             ..Default::default()
         };
-        let mut config = kube::Config::from_kubeconfig(&options).await?;
-        apply_timeouts(&mut config);
-        self.current_namespace = None;
-        self.client = Client::try_from(config)?;
-        self.current_context = ctx.to_string();
+        self.client = Self::build_clients(&options).await?;
+        self.context.namespace = None;
+        self.context.name = ctx.to_string();
         Ok(())
     }
 
     pub async fn list_namespaces(&self) -> Result<Vec<String>> {
-        let api: Api<Namespace> = Api::all(self.client.clone());
+        let api: Api<Namespace> = Api::all(self.client.default.clone());
         let list = api.list(&ListParams::default()).await?;
         let mut names: Vec<String> = list.items.iter().filter_map(|ns| ns.metadata.name.clone()).collect();
         names.sort();
@@ -539,13 +535,13 @@ impl KubeClient {
 
     pub async fn fetch_cluster_stats(&self) -> Result<ClusterStatsData> {
         // Server version
-        let server_version = match self.client.apiserver_version().await {
+        let server_version = match self.client.default.apiserver_version().await {
             | Ok(info) => format!("{}.{}", info.major, info.minor),
             | Err(_) => "unknown".into(),
         };
 
         // Nodes
-        let node_api: Api<Node> = Api::all(self.client.clone());
+        let node_api: Api<Node> = Api::all(self.client.default.clone());
         let node_list = node_api.list(&ListParams::default()).await?;
         let mut nodes_ready = 0usize;
         let mut nodes_not_ready = 0usize;
@@ -622,11 +618,11 @@ impl KubeClient {
         }
 
         // Namespaces
-        let ns_api: Api<Namespace> = Api::all(self.client.clone());
+        let ns_api: Api<Namespace> = Api::all(self.client.default.clone());
         let ns_count = ns_api.list(&ListParams::default()).await?.items.len();
 
         // Pods
-        let pod_api: Api<Pod> = Api::all(self.client.clone());
+        let pod_api: Api<Pod> = Api::all(self.client.default.clone());
         let pod_list = pod_api.list(&ListParams::default()).await?;
         let pod_count = pod_list.items.len();
         let mut pods_running = 0usize;
@@ -658,9 +654,9 @@ impl KubeClient {
         }
 
         // Deployments & Services
-        let dep_api: Api<Deployment> = Api::all(self.client.clone());
+        let dep_api: Api<Deployment> = Api::all(self.client.default.clone());
         let deployment_count = dep_api.list(&ListParams::default()).await?.items.len();
-        let svc_api: Api<Service> = Api::all(self.client.clone());
+        let svc_api: Api<Service> = Api::all(self.client.default.clone());
         let service_count = svc_api.list(&ListParams::default()).await?.items.len();
 
         // Nodes with resource pressure
@@ -679,7 +675,7 @@ impl KubeClient {
         }
 
         // Recent warning events (last 1 hour)
-        let event_api: Api<Event> = Api::all(self.client.clone());
+        let event_api: Api<Event> = Api::all(self.client.default.clone());
         let recent_warnings = if let Ok(events) = event_api.list(&ListParams::default()).await {
             let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(1);
             events
@@ -795,9 +791,9 @@ impl KubeClient {
         let obj: kube::api::DynamicObject = serde_yaml::from_str(yaml).context("Invalid YAML")?;
         let ar = rt.api_resource();
         let api: Api<kube::api::DynamicObject> = if rt.is_cluster_scoped() {
-            Api::all_with(self.client.clone(), &ar)
+            Api::all_with(self.client.default.clone(), &ar)
         } else {
-            Api::namespaced_with(self.client.clone(), ns, &ar)
+            Api::namespaced_with(self.client.default.clone(), ns, &ar)
         };
         let pp = kube::api::PostParams::default();
         let result = api.replace(name, &pp, &obj).await.context("Failed to apply resource")?;
@@ -815,9 +811,9 @@ impl KubeClient {
     ) -> Result<Value> {
         let ar = rt.api_resource();
         let api: Api<kube::api::DynamicObject> = if rt.is_cluster_scoped() {
-            Api::all_with(self.client.clone(), &ar)
+            Api::all_with(self.client.default.clone(), &ar)
         } else {
-            Api::namespaced_with(self.client.clone(), ns, &ar)
+            Api::namespaced_with(self.client.default.clone(), ns, &ar)
         };
         let mut metadata = serde_json::Map::new();
         if let Some(l) = labels {
@@ -838,7 +834,7 @@ impl KubeClient {
 
     pub async fn restart_workload(&self, rt: ResourceType, ns: &str, name: &str) -> Result<()> {
         let ar = rt.api_resource();
-        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.clone(), ns, &ar);
+        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.default.clone(), ns, &ar);
         let now = Timestamp::now().to_string();
         let patch = serde_json::json!({
             "spec": {
@@ -898,11 +894,11 @@ impl KubeClient {
         let obj: kube::api::DynamicObject = serde_yaml::from_str(yaml).context("Invalid YAML for DynamicObject")?;
         // If no namespace in YAML, use current namespace (or "default")
         let effective_ns = if namespace.is_empty() {
-            self.current_namespace.as_deref().unwrap_or("default")
+            self.context.namespace.as_deref().unwrap_or("default")
         } else {
             namespace
         };
-        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.clone(), effective_ns, &ar);
+        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.default.clone(), effective_ns, &ar);
 
         let pp = kube::api::PostParams::default();
         let result = api.create(&pp, &obj).await.context("Failed to create resource")?;
@@ -913,9 +909,9 @@ impl KubeClient {
     pub async fn delete_resource(&self, rt: ResourceType, ns: &str, name: &str) -> Result<()> {
         let ar = rt.api_resource();
         let api: Api<kube::api::DynamicObject> = if rt.is_cluster_scoped() {
-            Api::all_with(self.client.clone(), &ar)
+            Api::all_with(self.client.default.clone(), &ar)
         } else {
-            Api::namespaced_with(self.client.clone(), ns, &ar)
+            Api::namespaced_with(self.client.default.clone(), ns, &ar)
         };
         let dp = kube::api::DeleteParams::default();
         api.delete(name, &dp).await.context("Failed to delete resource")?;
@@ -924,7 +920,7 @@ impl KubeClient {
 
     pub async fn scale_resource(&self, rt: ResourceType, ns: &str, name: &str, replicas: u32) -> Result<()> {
         let ar = rt.api_resource();
-        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.clone(), ns, &ar);
+        let api: Api<kube::api::DynamicObject> = Api::namespaced_with(self.client.default.clone(), ns, &ar);
         let patch = serde_json::json!({ "spec": { "replicas": replicas } });
         let pp = kube::api::PatchParams::default();
         api.patch(name, &pp, &kube::api::Patch::Merge(&patch))
@@ -941,7 +937,7 @@ impl KubeClient {
 
     /// Create a Job from a CronJob's jobTemplate (manual trigger).
     pub async fn trigger_cronjob(&self, ns: &str, name: &str, job_name: &str) -> Result<String> {
-        let cj_api: Api<CronJob> = Api::namespaced(self.client.clone(), ns);
+        let cj_api: Api<CronJob> = Api::namespaced(self.client.default.clone(), ns);
         let cj = cj_api.get(name).await.context("Failed to get CronJob")?;
 
         let job_template = cj
@@ -972,7 +968,7 @@ impl KubeClient {
             ..Default::default()
         };
 
-        let job_api: Api<Job> = Api::namespaced(self.client.clone(), ns);
+        let job_api: Api<Job> = Api::namespaced(self.client.default.clone(), ns);
         let pp = kube::api::PostParams::default();
         job_api
             .create(&pp, &job)
@@ -984,7 +980,7 @@ impl KubeClient {
 
     /// Cordon a node (mark as unschedulable).
     pub async fn cordon_node(&self, name: &str) -> Result<()> {
-        let api: Api<Node> = Api::all(self.client.clone());
+        let api: Api<Node> = Api::all(self.client.default.clone());
         let patch = serde_json::json!({ "spec": { "unschedulable": true } });
         let pp = kube::api::PatchParams::default();
         api.patch(name, &pp, &kube::api::Patch::Merge(&patch))
@@ -995,7 +991,7 @@ impl KubeClient {
 
     /// Uncordon a node (mark as schedulable).
     pub async fn uncordon_node(&self, name: &str) -> Result<()> {
-        let api: Api<Node> = Api::all(self.client.clone());
+        let api: Api<Node> = Api::all(self.client.default.clone());
         let patch = serde_json::json!({ "spec": { "unschedulable": false } });
         let pp = kube::api::PatchParams::default();
         api.patch(name, &pp, &kube::api::Patch::Merge(&patch))
@@ -1010,7 +1006,7 @@ impl KubeClient {
         self.cordon_node(name).await?;
 
         // Step 2: list pods on this node
-        let pod_api: Api<Pod> = Api::all(self.client.clone());
+        let pod_api: Api<Pod> = Api::all(self.client.default.clone());
         let lp = ListParams::default().fields(&format!("spec.nodeName={}", name));
         let pods = pod_api.list(&lp).await.context("Failed to list pods on node")?;
 
@@ -1035,7 +1031,7 @@ impl KubeClient {
             }
 
             // Evict the pod
-            let ns_api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+            let ns_api: Api<Pod> = Api::namespaced(self.client.default.clone(), ns);
             let ep = kube::api::EvictParams::default();
             match ns_api.evict(pod_name, &ep).await {
                 | Ok(_) => evicted += 1,
@@ -1050,9 +1046,9 @@ impl KubeClient {
 
     pub async fn fetch_related_events(&self, ns: &str, resource_name: &str) -> Result<Vec<RelatedEvent>> {
         let api: Api<Event> = if ns.is_empty() {
-            Api::all(self.client.clone())
+            Api::all(self.client.default.clone())
         } else {
-            Api::namespaced(self.client.clone(), ns)
+            Api::namespaced(self.client.default.clone(), ns)
         };
         let lp = ListParams::default().fields(&format!("regarding.name={}", resource_name));
         let list = api.list(&lp).await.context("Failed to fetch events")?;
@@ -1190,7 +1186,7 @@ impl KubeClient {
                 Self::add_service_account(&mut related, value, ns, true);
             },
             | ResourceType::CronJob => {
-                let job_api: Api<Job> = Api::namespaced(self.client.clone(), ns);
+                let job_api: Api<Job> = Api::namespaced(self.client.default.clone(), ns);
                 if let Ok(jobs) = job_api.list(&ListParams::default()).await {
                     for job in &jobs.items {
                         let is_owned = job
@@ -1329,7 +1325,7 @@ impl KubeClient {
                     }
                 }
                 // RoleBindings referencing this SA
-                let rb_api: Api<RoleBinding> = Api::namespaced(self.client.clone(), ns);
+                let rb_api: Api<RoleBinding> = Api::namespaced(self.client.default.clone(), ns);
                 if let Ok(list) = rb_api.list(&ListParams::default()).await {
                     for rb in &list.items {
                         let refs_sa = rb
@@ -1350,7 +1346,7 @@ impl KubeClient {
                     }
                 }
                 // ClusterRoleBindings referencing this SA
-                let crb_api: Api<ClusterRoleBinding> = Api::all(self.client.clone());
+                let crb_api: Api<ClusterRoleBinding> = Api::all(self.client.default.clone());
                 if let Ok(list) = crb_api.list(&ListParams::default()).await {
                     for crb in &list.items {
                         let refs_sa = crb
@@ -1545,7 +1541,7 @@ impl KubeClient {
                 .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or("")))
                 .collect::<Vec<_>>()
                 .join(",");
-            let api: Api<ReplicaSet> = Api::namespaced(self.client.clone(), ns);
+            let api: Api<ReplicaSet> = Api::namespaced(self.client.default.clone(), ns);
             if let Ok(list) = api.list(&ListParams::default().labels(&sel)).await {
                 for rs in &list.items {
                     let rs_name = meta_name(&rs.metadata);
@@ -1625,7 +1621,7 @@ impl KubeClient {
     }
 
     async fn add_pods_by_label(&self, related: &mut Vec<RelatedResource>, ns: &str, label_sel: &str) {
-        let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+        let api: Api<Pod> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = api.list(&ListParams::default().labels(label_sel)).await {
             for pod in &list.items {
                 let phase = pod
@@ -1652,7 +1648,7 @@ impl KubeClient {
     }
 
     async fn add_hpa_for_workload(&self, related: &mut Vec<RelatedResource>, ns: &str, name: &str) {
-        let api: Api<HorizontalPodAutoscaler> = Api::namespaced(self.client.clone(), ns);
+        let api: Api<HorizontalPodAutoscaler> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = api.list(&ListParams::default()).await {
             for hpa in &list.items {
                 let target = hpa
@@ -1813,7 +1809,7 @@ impl KubeClient {
         };
 
         // Search Deployments
-        let dep_api: Api<Deployment> = Api::namespaced(self.client.clone(), ns);
+        let dep_api: Api<Deployment> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = dep_api.list(&ListParams::default()).await {
             for dep in &list.items {
                 let val = serde_json::to_value(dep).unwrap_or_default();
@@ -1836,7 +1832,7 @@ impl KubeClient {
             }
         }
         // Search StatefulSets
-        let ss_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), ns);
+        let ss_api: Api<StatefulSet> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = ss_api.list(&ListParams::default()).await {
             for ss in &list.items {
                 let val = serde_json::to_value(ss).unwrap_or_default();
@@ -1859,7 +1855,7 @@ impl KubeClient {
             }
         }
         // Search DaemonSets
-        let ds_api: Api<DaemonSet> = Api::namespaced(self.client.clone(), ns);
+        let ds_api: Api<DaemonSet> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = ds_api.list(&ListParams::default()).await {
             for ds in &list.items {
                 let val = serde_json::to_value(ds).unwrap_or_default();
@@ -1882,7 +1878,7 @@ impl KubeClient {
             }
         }
         // Search Jobs
-        let job_api: Api<Job> = Api::namespaced(self.client.clone(), ns);
+        let job_api: Api<Job> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = job_api.list(&ListParams::default()).await {
             for job in &list.items {
                 let val = serde_json::to_value(job).unwrap_or_default();
@@ -1905,7 +1901,7 @@ impl KubeClient {
             }
         }
         // Search CronJobs
-        let cj_api: Api<CronJob> = Api::namespaced(self.client.clone(), ns);
+        let cj_api: Api<CronJob> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = cj_api.list(&ListParams::default()).await {
             for cj in &list.items {
                 let val = serde_json::to_value(cj).unwrap_or_default();
@@ -1940,7 +1936,7 @@ impl KubeClient {
                 .and_then(|n| n.as_str())
                 == Some(sa_name)
         };
-        let dep_api: Api<Deployment> = Api::namespaced(self.client.clone(), ns);
+        let dep_api: Api<Deployment> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = dep_api.list(&ListParams::default()).await {
             for dep in &list.items {
                 let val = serde_json::to_value(dep).unwrap_or_default();
@@ -1956,7 +1952,7 @@ impl KubeClient {
                 }
             }
         }
-        let ss_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), ns);
+        let ss_api: Api<StatefulSet> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = ss_api.list(&ListParams::default()).await {
             for ss in &list.items {
                 let val = serde_json::to_value(ss).unwrap_or_default();
@@ -1972,7 +1968,7 @@ impl KubeClient {
                 }
             }
         }
-        let ds_api: Api<DaemonSet> = Api::namespaced(self.client.clone(), ns);
+        let ds_api: Api<DaemonSet> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = ds_api.list(&ListParams::default()).await {
             for ds in &list.items {
                 let val = serde_json::to_value(ds).unwrap_or_default();
@@ -1988,7 +1984,7 @@ impl KubeClient {
                 }
             }
         }
-        let job_api: Api<Job> = Api::namespaced(self.client.clone(), ns);
+        let job_api: Api<Job> = Api::namespaced(self.client.default.clone(), ns);
         if let Ok(list) = job_api.list(&ListParams::default()).await {
             for job in &list.items {
                 let val = serde_json::to_value(job).unwrap_or_default();
@@ -2102,12 +2098,8 @@ impl KubeClient {
 
     // -- Log support -----------------------------------------------------------
 
-    pub fn client(&self) -> &Client {
-        &self.client
-    }
-
     pub async fn find_pods(&self, rt: ResourceType, ns: &str, name: &str) -> Result<Vec<PodInfo>> {
-        let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+        let api: Api<Pod> = Api::namespaced(self.client.default.clone(), ns);
         match rt {
             | ResourceType::Pod => {
                 let pod = api.get(name).await?;
@@ -2127,7 +2119,7 @@ impl KubeClient {
             },
             | ResourceType::CronJob => {
                 // Find latest Job owned by this CronJob, then find its pods
-                let job_api: Api<Job> = Api::namespaced(self.client.clone(), ns);
+                let job_api: Api<Job> = Api::namespaced(self.client.default.clone(), ns);
                 let jobs = job_api.list(&ListParams::default()).await?;
                 let latest = jobs
                     .items
@@ -2204,7 +2196,7 @@ impl KubeClient {
         tail: i64,
         since_seconds: Option<i64>,
     ) -> Result<String> {
-        let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+        let api: Api<Pod> = Api::namespaced(self.client.default.clone(), ns);
         let lp = kube::api::LogParams {
             container: Some(container.to_string()),
             tail_lines: Some(tail),
@@ -2251,9 +2243,9 @@ impl KubeClient {
         K: kube::Resource<Scope=k8s_openapi::NamespaceResourceScope>,
     {
         let lp = ListParams::default();
-        let list = match &self.current_namespace {
-            | Some(ns) => Api::<K>::namespaced(self.client.clone(), ns).list(&lp).await?,
-            | None => Api::<K>::all(self.client.clone()).list(&lp).await?,
+        let list = match &self.context.namespace {
+            | Some(ns) => Api::<K>::namespaced(self.client.default.clone(), ns).list(&lp).await?,
+            | None => Api::<K>::all(self.client.default.clone()).list(&lp).await?,
         };
         Ok(list.items.iter().map(mapper).collect())
     }
@@ -2265,7 +2257,7 @@ impl KubeClient {
         K: kube::Resource<DynamicType=()>+serde::de::DeserializeOwned+serde::Serialize+Clone+std::fmt::Debug,
         K: kube::Resource<Scope=k8s_openapi::NamespaceResourceScope>,
     {
-        let api: Api<K> = Api::namespaced(self.client.clone(), ns);
+        let api: Api<K> = Api::namespaced(self.client.default.clone(), ns);
         let obj = api.get(name).await?;
         strip_managed_fields(serde_json::to_value(&obj)?)
     }
@@ -2277,7 +2269,7 @@ impl KubeClient {
         K: kube::Resource<DynamicType=()>+serde::de::DeserializeOwned+Clone+std::fmt::Debug,
         K: kube::Resource<Scope=k8s_openapi::ClusterResourceScope>,
     {
-        let api: Api<K> = Api::all(self.client.clone());
+        let api: Api<K> = Api::all(self.client.default.clone());
         let list = api.list(&ListParams::default()).await?;
         Ok(list.items.iter().map(mapper).collect())
     }
@@ -2289,7 +2281,7 @@ impl KubeClient {
         K: kube::Resource<DynamicType=()>+serde::de::DeserializeOwned+serde::Serialize+Clone+std::fmt::Debug,
         K: kube::Resource<Scope=k8s_openapi::ClusterResourceScope>,
     {
-        let api: Api<K> = Api::all(self.client.clone());
+        let api: Api<K> = Api::all(self.client.default.clone());
         let obj = api.get(name).await?;
         strip_managed_fields(serde_json::to_value(&obj)?)
     }

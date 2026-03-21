@@ -38,11 +38,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_popup(f, app);
     }
 
-    if app.palette_open {
+    if app.palette.is_some() {
         render_palette(f, app);
     }
 
-    if app.help_open {
+    if app.help.is_some() {
         render_help(f, app);
     }
 }
@@ -62,13 +62,19 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
 
     let mut spans: Vec<Span> = vec![Span::styled(" ", dim)];
 
-    let ctx = app.kube.current_context().to_string();
+    let ctx = app.kube.context.name.as_str().to_string();
     let is_top = app.view == View::Main && app.selected_resource_type().is_none();
     spans.push(Span::styled(ctx, if is_top { active } else { seg }));
 
     // Namespace
     spans.push(sep.clone());
-    let ns = app.kube.namespace_display().to_string();
+    let ns = app
+        .kube
+        .context
+        .namespace
+        .as_deref()
+        .unwrap_or("All Namespaces")
+        .to_string();
     spans.push(Span::styled(ns, seg));
 
     // Resource type
@@ -83,15 +89,16 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
         // Resource name (detail/logs)
         if app.view == View::Detail || app.view == View::Logs {
             let name = app
-                .resource_state
+                .resources
+                .state
                 .selected()
-                .and_then(|idx| app.resources.get(idx))
+                .and_then(|idx| app.resources.entries.get(idx))
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| "?".into());
             spans.push(sep.clone());
             let is_detail = app.view == View::Detail;
             // Star indicator for favorites
-            if app.is_favorite(rt, &app.detail_name, &app.detail_namespace) {
+            if app.is_favorite(rt, &app.detail.name, &app.detail.namespace) {
                 spans.push(Span::styled(
                     "★ ",
                     Style::default().fg(Color::Yellow).bg(Color::DarkGray),
@@ -112,10 +119,10 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Badges (filter, error, status)
-    if !app.resource_filter_text.is_empty() && app.view == View::Main {
+    if !app.resources.filter.text.is_empty() && app.view == View::Main {
         spans.push(Span::styled("  ", dim));
         spans.push(Span::styled(
-            format!(" /{} ", app.resource_filter_text),
+            format!(" /{} ", app.resources.filter.text),
             Style::default().fg(Color::Black).bg(Color::Yellow),
         ));
     }
@@ -168,7 +175,7 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_main(f: &mut Frame, app: &mut App) {
-    let has_filter_bar = app.resource_filter_editing;
+    let has_filter_bar = app.resources.filter.editing;
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -204,7 +211,8 @@ fn render_main(f: &mut Frame, app: &mut App) {
 
 fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app
-        .nav_items
+        .nav
+        .items
         .iter()
         .map(|item| {
             let is_active = match (&item.kind, &app.panel) {
@@ -223,7 +231,7 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
             };
             // Append resource count badge if available
             let label = if let NavItemKind::Resource(rt) = &item.kind {
-                if let Some(&count) = app.resource_counts.get(rt) {
+                if let Some(&count) = app.resources.counts.get(rt) {
                     format!("{} ({})", item.label, count)
                 } else {
                     item.label.clone()
@@ -247,7 +255,8 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Show active port forward count in nav title
     let pf_count = app
-        .pf_manager
+        .pf
+        .manager
         .entries()
         .iter()
         .filter(|e| e.status.is_running())
@@ -269,7 +278,7 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▶ ")
         .scroll_padding(1);
 
-    f.render_stateful_widget(list, area, &mut app.nav_state);
+    f.render_stateful_widget(list, area, &mut app.nav.state);
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +325,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
 
     let visible_indices = app.visible_resource_indices();
 
-    let all_ns = app.kube.is_all_namespaces();
+    let all_ns = app.kube.context.namespace.is_none();
     let base_headers = rt.column_headers();
 
     // Build logical columns: [NAME, (NAMESPACE)?, col1, col2, ...]
@@ -337,7 +346,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Pre-compute favorite set for this resource type to avoid borrow conflicts
     let fav_set: std::collections::HashSet<(String, String)> = if let Some(rt) = app.selected_resource_type() {
-        let context = app.kube.current_context();
+        let context = app.kube.context.name.as_str();
         let rt_name = rt.singular_name();
         app.config
             .active_profile()
@@ -353,7 +362,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let rows: Vec<Row> = visible_indices
         .iter()
         .map(|&idx| {
-            let entry = &app.resources[idx];
+            let entry = &app.resources.entries[idx];
             let is_diff_marked = app
                 .diff_mark
                 .as_ref()
@@ -392,7 +401,6 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
                     | s if s.starts_with("Init:") => Style::default().fg(Color::Yellow),
                     | "CrashLoopBackOff"
                     | "Error"
-                    | "Failed"
                     | "OOMKilled"
                     | "ImagePullBackOff"
                     | "ErrImagePull"
@@ -422,7 +430,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let num_cols = col_headers.len();
     let mut max_widths: Vec<usize> = col_headers.iter().map(|h| h.len()).collect();
     for &idx in &visible_indices {
-        let entry = &app.resources[idx];
+        let entry = &app.resources.entries[idx];
         // Column 0 = NAME
         max_widths[0] = max_widths[0].max(entry.name.len());
         let data_start = if all_ns {
@@ -455,15 +463,15 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Map real selection index to filtered row position for highlight.
     // Preserve the table offset across renders for smooth edge-scrolling.
-    if let Some(sel) = app.resource_state.selected() {
+    if let Some(sel) = app.resources.state.selected() {
         if let Some(vis_pos) = visible_indices.iter().position(|&i| i == sel) {
-            app.resource_table_state.select(Some(vis_pos));
+            app.resources.table_state.select(Some(vis_pos));
         } else if !visible_indices.is_empty() {
-            app.resource_table_state.select(Some(0));
-            app.resource_state.select(Some(visible_indices[0]));
+            app.resources.table_state.select(Some(0));
+            app.resources.state.select(Some(visible_indices[0]));
         }
     } else {
-        app.resource_table_state.select(None);
+        app.resources.table_state.select(None);
     }
 
     let table = Table::new(rows, constraints)
@@ -477,7 +485,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
         .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(table, area, &mut app.resource_table_state);
+    f.render_stateful_widget(table, area, &mut app.resources.table_state);
 }
 
 /// Builds a text gauge bar: `[████████░░░░░░░░░░░░] 75%`
@@ -674,7 +682,7 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Resources;
     let border_color = if focused { Color::Cyan } else { Color::DarkGray };
 
-    let stats = match &app.cluster_stats {
+    let stats = match &app.overview.stats {
         | Some(s) => s,
         | None => {
             let block = Block::default()
@@ -875,25 +883,25 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
                 .border_style(Style::default().fg(border_color))
                 .title(" Cluster Overview "),
         )
-        .scroll((app.cluster_stats_scroll, 0));
+        .scroll((app.overview.scroll, 0));
     f.render_widget(paragraph, area);
 }
 
 fn render_resource_filter_bar(f: &mut Frame, app: &App, area: Rect) {
     let visible = app.visible_resource_indices();
-    let total = app.resources.len();
+    let total = app.resources.entries.len();
     let count_suffix = if visible.len() < total {
         format!(" ({}/{})", visible.len(), total)
     } else {
         String::new()
     };
 
-    let display = if app.resource_filter_editing {
-        format!(" /{}▏{}", app.resource_filter_buf, count_suffix)
+    let display = if app.resources.filter.editing {
+        format!(" /{}▏{}", app.resources.filter.buf, count_suffix)
     } else {
-        format!(" /{}/{}", app.resource_filter_text, count_suffix)
+        format!(" /{}/{}", app.resources.filter.text, count_suffix)
     };
-    let style = if app.resource_filter_editing {
+    let style = if app.resources.filter.editing {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -930,26 +938,26 @@ fn render_events_log(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Resources;
     let border_color = if focused { Color::Cyan } else { Color::DarkGray };
     let inner_height = area.height.saturating_sub(2) as usize; // minus top/bottom borders
-    let all_ns = app.kube.is_all_namespaces();
+    let all_ns = app.kube.context.namespace.is_none();
     let visible_indices = app.visible_resource_indices();
     let total = visible_indices.len();
-    let cursor = app.events_cursor.min(total.saturating_sub(1));
-    app.events_cursor = cursor;
+    let cursor = app.events.cursor.min(total.saturating_sub(1));
+    app.events.cursor = cursor;
 
     // Auto-scroll keeps cursor at the bottom (newest event)
-    if app.events_auto_scroll && total > 0 {
-        app.events_cursor = total - 1;
+    if app.events.auto_scroll && total > 0 {
+        app.events.cursor = total - 1;
     }
 
     // Scroll follows cursor: ensure cursor is always visible
-    let mut scroll = app.events_scroll;
-    if app.events_cursor < scroll {
-        scroll = app.events_cursor;
-    } else if inner_height > 0 && app.events_cursor >= scroll + inner_height {
-        scroll = app.events_cursor - inner_height + 1;
+    let mut scroll = app.events.scroll;
+    if app.events.cursor < scroll {
+        scroll = app.events.cursor;
+    } else if inner_height > 0 && app.events.cursor >= scroll + inner_height {
+        scroll = app.events.cursor - inner_height + 1;
     }
     scroll = scroll.min(total.saturating_sub(inner_height));
-    app.events_scroll = scroll;
+    app.events.scroll = scroll;
 
     let lines: Vec<Line> = visible_indices
         .iter()
@@ -957,8 +965,8 @@ fn render_events_log(f: &mut Frame, app: &mut App, area: Rect) {
         .skip(scroll)
         .take(inner_height)
         .map(|(vis_idx, &real_idx)| {
-            let entry = &app.resources[real_idx];
-            let is_selected = vis_idx == app.events_cursor;
+            let entry = &app.resources.entries[real_idx];
+            let is_selected = vis_idx == app.events.cursor;
             // columns: [0]=TYPE  [1]=REASON  [2]=OBJECT  [3]=AGE  [4]=MESSAGE  [5]=COUNT
             let event_type = entry.columns.first().map(|s| s.as_str()).unwrap_or("");
             let reason = entry.columns.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -1054,19 +1062,19 @@ fn render_detail(f: &mut Frame, app: &mut App) {
 
     render_breadcrumb(f, app, outer[0]);
 
-    let mode_label = match app.detail_mode {
+    let mode_label = match app.detail.mode {
         | DetailMode::Smart => "Smart",
         | DetailMode::Yaml => "YAML",
     };
     let title = format!(" [{}] ", mode_label);
 
-    let lines: Vec<Line> = match app.detail_mode {
+    let lines: Vec<Line> = match app.detail.mode {
         | DetailMode::Smart => render_smart_lines(app),
-        | DetailMode::Yaml => render_yaml_lines(&app.detail_yaml),
+        | DetailMode::Yaml => render_yaml_lines(&app.detail.yaml),
     };
 
     // Store inner height for scroll-to-cursor calculations (minus 2 for borders)
-    app.detail_area_height = outer[1].height.saturating_sub(2) as usize;
+    app.detail.area_height = outer[1].height.saturating_sub(2) as usize;
 
     let paragraph = Paragraph::new(lines)
         .block(
@@ -1075,7 +1083,7 @@ fn render_detail(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(title),
         )
-        .scroll((app.detail_scroll, 0));
+        .scroll((app.detail.scroll, 0));
     f.render_widget(paragraph, outer[1]);
 
     let bar = build_hotkey_bar(app);
@@ -1279,21 +1287,21 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
     let mut ds = smart::DictState {
         entries: Vec::new(),
         line_offsets: Vec::new(),
-        cursor: app.dict_cursor,
-        expanded: app.expanded_keys.clone(),
+        cursor: app.detail.dict.cursor,
+        expanded: app.detail.dict.expanded_keys.clone(),
     };
-    let lines = smart::render(rt, &app.detail_value, app.secret_state.as_mut(), &mut ds);
+    let lines = smart::render(rt, &app.detail.value, app.detail.secret.as_mut(), &mut ds);
     // Sync state back to App
-    app.dict_entries = ds.entries;
-    app.dict_line_offsets = ds.line_offsets;
-    app.expanded_keys = ds.expanded;
+    app.detail.dict.entries = ds.entries;
+    app.detail.dict.line_offsets = ds.line_offsets;
+    app.detail.dict.expanded_keys = ds.expanded;
     // Clamp cursor if entries changed
-    if let Some(c) = app.dict_cursor {
-        if c >= app.dict_entries.len() {
-            app.dict_cursor = if app.dict_entries.is_empty() {
+    if let Some(c) = app.detail.dict.cursor {
+        if c >= app.detail.dict.entries.len() {
+            app.detail.dict.cursor = if app.detail.dict.entries.is_empty() {
                 None
             } else {
-                Some(app.dict_entries.len() - 1)
+                Some(app.detail.dict.entries.len() - 1)
             };
         }
     }
@@ -1301,16 +1309,22 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
     let mut all_lines = lines;
 
     // Related resources — tabbed by category
-    if !app.related_resources.is_empty() {
+    if !app.detail.related.resources.is_empty() {
         all_lines.push(Line::from(""));
 
         // Tab bar
         let cats = app.related_categories();
-        let in_related = app.related_cursor.is_some();
+        let in_related = app.detail.related.cursor.is_some();
         let mut tab_spans: Vec<Span> = vec![Span::styled("  ", Style::default())];
         for (ci, cat) in cats.iter().enumerate() {
-            let count = app.related_resources.iter().filter(|r| r.category == *cat).count();
-            let is_active = ci == app.related_tab;
+            let count = app
+                .detail
+                .related
+                .resources
+                .iter()
+                .filter(|r| r.category == *cat)
+                .count();
+            let is_active = ci == app.detail.related.tab;
             let style = if in_related && is_active {
                 Style::default()
                     .fg(Color::Black)
@@ -1337,11 +1351,11 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
         all_lines.push(Line::from(tab_spans));
 
         // Items for current tab only
-        app.related_line_start = all_lines.len();
+        app.detail.related.line_start = all_lines.len();
         let tab_indices = app.related_tab_indices();
         for &idx in &tab_indices {
-            let rel = &app.related_resources[idx];
-            let is_selected = app.related_cursor == Some(idx);
+            let rel = &app.detail.related.resources[idx];
+            let is_selected = app.detail.related.cursor == Some(idx);
             let marker = if is_selected { "▶ " } else { "  " };
             let type_name = rel.resource_type.singular_name();
 
@@ -1362,7 +1376,7 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
     }
 
     // Related events (describe-style)
-    if !app.related_events.is_empty() {
+    if !app.detail.related.events.is_empty() {
         all_lines.push(Line::from(""));
         all_lines.push(Line::from(Span::styled(
             "Events:",
@@ -1377,7 +1391,7 @@ fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
             Span::styled("MESSAGE", Style::default().fg(Color::DarkGray)),
         ]));
 
-        for ev in &app.related_events {
+        for ev in &app.detail.related.events {
             let type_style = if ev.type_ == "Warning" {
                 Style::default().fg(Color::Yellow)
             } else {
@@ -1429,7 +1443,7 @@ fn render_yaml_lines(yaml: &str) -> Vec<Line<'_>> {
 // ---------------------------------------------------------------------------
 
 fn render_logs(f: &mut Frame, app: &mut App) {
-    let state = match &app.log_state {
+    let state = match &app.log {
         | Some(s) => s,
         | None => return,
     };
@@ -1656,14 +1670,14 @@ fn build_hotkey_bar(app: &App) -> Line<'static> {
                 }
             },
             | ("p", Ctx::Logs) => {
-                if let Some(s) = &app.log_state {
+                if let Some(s) = &app.log {
                     format!(" Pod: {}", s.pod_label())
                 } else {
                     " Pod".into()
                 }
             },
             | ("c", Ctx::Logs) => {
-                if let Some(s) = &app.log_state {
+                if let Some(s) = &app.log {
                     format!(" Container: {}", s.container_label())
                 } else {
                     " Container".into()
@@ -1684,13 +1698,13 @@ fn build_hotkey_bar(app: &App) -> Line<'static> {
                 }
             },
             | ("c", Ctx::Nav | Ctx::Resources | Ctx::ClusterStats) => {
-                format!(" {}", app.kube.current_context())
+                format!(" {}", app.kube.context.name.as_str())
             },
             | ("n", Ctx::Nav | Ctx::Resources | Ctx::ClusterStats) => {
-                if app.kube.is_all_namespaces() {
+                if app.kube.context.namespace.is_none() {
                     " All".into()
                 } else {
-                    format!(" {}", app.kube.current_namespace().unwrap_or("All"))
+                    format!(" {}", app.kube.context.namespace.as_deref().unwrap_or("All"))
                 }
             },
             | _ => format!(" {}", cmd.label),
@@ -1755,10 +1769,10 @@ fn render_profiles(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    app.profiles_table_state.select(if names.is_empty() {
+    app.profiles.table_state.select(if names.is_empty() {
         None
     } else {
-        Some(app.profiles_cursor)
+        Some(app.profiles.cursor)
     });
 
     let header = Row::new(vec!["NAME", "CONTEXT", "FAVORITES", "PORT FORWARDS"])
@@ -1812,12 +1826,10 @@ fn render_profiles(f: &mut Frame, app: &mut App, area: Rect) {
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
     .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(table, area, &mut app.profiles_table_state);
+    f.render_stateful_widget(table, area, &mut app.profiles.table_state);
 }
 
 fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
-    use crate::tui::app::FavDisplayItem;
-
     let favorites = &app.config.active_profile().favorites;
 
     let focused = app.focus == Focus::Resources;
@@ -1842,83 +1854,85 @@ fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let display = app.favorites_display_items();
-
     // Sync table state with cursor
-    app.favorites_table_state.select(if display.is_empty() {
+    app.favorites.table_state.select(if favorites.is_empty() {
         None
     } else {
-        Some(app.favorites_cursor)
+        Some(app.favorites.cursor)
     });
 
-    let current_context = app.kube.current_context().to_string();
+    let header = Row::new(vec!["TYPE", "NAME", "NAMESPACE", "CONTEXT"])
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .bottom_margin(0);
+
+    let current_context = app.kube.context.name.as_str().to_string();
     let available_contexts = app.kube.contexts();
 
-    let rows: Vec<Row> = display
+    let rows: Vec<Row> = favorites
         .iter()
-        .map(|item| {
-            match item {
-                | FavDisplayItem::Header(label) => {
-                    Row::new(vec![Cell::from(Span::styled(
-                        format!("  {}", label),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-                    ))])
-                },
-                | FavDisplayItem::Entry(idx) => {
-                    let fav = &favorites[*idx];
-                    let missing = !available_contexts.iter().any(|c| c == &fav.context);
-                    let is_diff_marked = app
-                        .diff_mark
-                        .as_ref()
-                        .map(|(n, ns, _)| n == &fav.name && ns == &fav.namespace)
-                        .unwrap_or(false);
+        .map(|fav| {
+            let missing = !available_contexts.iter().any(|c| c == &fav.context);
+            let is_diff_marked = app
+                .diff_mark
+                .as_ref()
+                .map(|(n, ns, _)| n == &fav.name && ns == &fav.namespace)
+                .unwrap_or(false);
 
-                    let name_cell = if is_diff_marked {
-                        Cell::from(Span::styled(
-                            format!("* {}", fav.name),
-                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                        ))
-                    } else {
-                        let name_style = if missing {
-                            Style::default().fg(Color::DarkGray)
-                        } else if fav.context == current_context {
-                            Style::default().fg(Color::Green)
-                        } else {
-                            Style::default()
-                        };
-                        let name_prefix = if missing { "⚠ " } else { "★ " };
-                        Cell::from(Span::styled(format!("{}{}", name_prefix, fav.name), name_style))
-                    };
+            let type_label = crate::k8s::ResourceType::from_singular_name(&fav.resource_type)
+                .map(|rt| rt.display_name())
+                .unwrap_or(&fav.resource_type);
 
-                    Row::new(vec![
-                        name_cell,
-                        Cell::from(fav.namespace.as_str()),
-                        Cell::from(if missing {
-                            Span::styled(format!("{} (missing)", fav.context), Style::default().fg(Color::Red))
-                        } else {
-                            Span::raw(fav.context.as_str())
-                        }),
-                    ])
-                },
-            }
+            let name_cell = if is_diff_marked {
+                Cell::from(Span::styled(
+                    format!("* {}", fav.name),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                let name_style = if missing {
+                    Style::default().fg(Color::DarkGray)
+                } else if fav.context == current_context {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                let name_prefix = if missing { "⚠ " } else { "★ " };
+                Cell::from(Span::styled(format!("{}{}", name_prefix, fav.name), name_style))
+            };
+
+            Row::new(vec![
+                Cell::from(type_label),
+                name_cell,
+                Cell::from(fav.namespace.as_str()),
+                Cell::from(if missing {
+                    Span::styled(format!("{} (missing)", fav.context), Style::default().fg(Color::Red))
+                } else {
+                    Span::raw(fav.context.as_str())
+                }),
+            ])
         })
         .collect();
 
-    let table = Table::new(rows, [Constraint::Min(20), Constraint::Length(18), Constraint::Min(14)])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(format!(" ★ Favorites ({}) ", favorites.len())),
-        )
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Yellow))
-        .highlight_symbol("▶ ");
+    let table = Table::new(rows, [
+        Constraint::Length(18),
+        Constraint::Min(20),
+        Constraint::Length(18),
+        Constraint::Min(14),
+    ])
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(format!(" ★ Favorites ({}) ", favorites.len())),
+    )
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Yellow))
+    .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(table, area, &mut app.favorites_table_state);
+    f.render_stateful_widget(table, area, &mut app.favorites.table_state);
 }
 
 fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
-    let entries = app.pf_manager.entries();
+    let entries = app.pf.manager.entries();
 
     let focused = app.focus == Focus::Resources;
     let border_color = if focused { Color::Cyan } else { Color::DarkGray };
@@ -1946,8 +1960,9 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Sync table state with cursor
-    app.pf_table_state
-        .select(if entries.is_empty() { None } else { Some(app.pf_cursor) });
+    app.pf
+        .table_state
+        .select(if entries.is_empty() { None } else { Some(app.pf.cursor) });
 
     // Build table rows
     let header = Row::new(vec!["STATUS", "LOCAL", "REMOTE", "CLUSTER", "RESOURCE", "POD", "CONNS"])
@@ -2002,7 +2017,7 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
             .title(" Port Forwards "),
     );
 
-    f.render_stateful_widget(table, area, &mut app.pf_table_state);
+    f.render_stateful_widget(table, area, &mut app.pf.table_state);
 }
 
 // ---------------------------------------------------------------------------
@@ -2010,6 +2025,9 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_help(f: &mut Frame, app: &mut App) {
+    if app.help.is_none() {
+        return;
+    }
     let area = f.area();
     let width = (area.width * 70 / 100).max(50).min(area.width);
     let x = (area.width.saturating_sub(width)) / 2;
@@ -2019,30 +2037,34 @@ fn render_help(f: &mut Frame, app: &mut App) {
 
     f.render_widget(Clear, help_area);
 
+    // Compute these before mutable borrow of help
     let entries = app.filtered_help_entries();
+    let context_label = app.current_context().label().to_string();
+
+    let h = app.help.as_mut().unwrap();
     let mut lines: Vec<Line> = Vec::new();
 
     // Search input
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
         Span::styled(
-            format!("{}|", app.help_buf),
+            format!("{}|", h.buf),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ]));
 
     let visible_rows = (height.saturating_sub(3)) as usize;
     // Edge-only scrolling: only scroll when cursor hits the boundary
-    if app.help_cursor < app.help_scroll {
-        app.help_scroll = app.help_cursor;
-    } else if visible_rows > 0 && app.help_cursor >= app.help_scroll + visible_rows {
-        app.help_scroll = app.help_cursor - visible_rows + 1;
+    if h.cursor < h.scroll {
+        h.scroll = h.cursor;
+    } else if visible_rows > 0 && h.cursor >= h.scroll + visible_rows {
+        h.scroll = h.cursor - visible_rows + 1;
     }
-    app.help_scroll = app.help_scroll.min(entries.len().saturating_sub(visible_rows));
+    h.scroll = h.scroll.min(entries.len().saturating_sub(visible_rows));
 
-    for (i, cmd) in entries.iter().skip(app.help_scroll).take(visible_rows).enumerate() {
-        let actual_idx = i + app.help_scroll;
-        let is_selected = actual_idx == app.help_cursor;
+    for (i, cmd) in entries.iter().skip(h.scroll).take(visible_rows).enumerate() {
+        let actual_idx = i + h.scroll;
+        let is_selected = actual_idx == h.cursor;
         let ctx_label = cmd.contexts.iter().map(|c| c.label()).collect::<Vec<_>>().join(", ");
         let row_style = if is_selected {
             Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan)
@@ -2070,7 +2092,7 @@ fn render_help(f: &mut Frame, app: &mut App) {
         ]));
     }
 
-    if entries.is_empty() && !app.help_buf.is_empty() {
+    if entries.is_empty() && !h.buf.is_empty() {
         lines.push(Line::from(Span::styled(
             "    No matching keybinds",
             Style::default().fg(Color::DarkGray),
@@ -2078,13 +2100,12 @@ fn render_help(f: &mut Frame, app: &mut App) {
     }
 
     let count = entries.len();
-    let mode_label = if app.help_context_only {
-        let ctx = app.current_context();
-        format!("{}", ctx.label())
+    let mode_label = if h.context_only {
+        context_label
     } else {
         "All".to_string()
     };
-    let toggle_hint = if app.help_context_only { "All" } else { "Context" };
+    let toggle_hint = if h.context_only { "All" } else { "Context" };
     let title = format!(
         " Keybindings — {} ({})  |  Tab: {}  |  Esc to close ",
         mode_label, count, toggle_hint
@@ -2100,6 +2121,10 @@ fn render_help(f: &mut Frame, app: &mut App) {
 }
 
 fn render_palette(f: &mut Frame, app: &mut App) {
+    let p = match &app.palette {
+        | Some(p) => p,
+        | None => return,
+    };
     // Top-centered palette, like VS Code
     let area = f.area();
     let width = (area.width * 60 / 100).max(40).min(area.width);
@@ -2113,11 +2138,11 @@ fn render_palette(f: &mut Frame, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
 
     // Input line
-    let prefix = if app.palette_buf.starts_with('>') { "" } else { "  " };
+    let prefix = if p.buf.starts_with('>') { "" } else { "  " };
     lines.push(Line::from(vec![
         Span::styled(prefix, Style::default()),
         Span::styled(
-            format!("{}|", app.palette_buf),
+            format!("{}|", p.buf),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -2125,21 +2150,15 @@ fn render_palette(f: &mut Frame, app: &mut App) {
     // Results
     let visible_results = (height.saturating_sub(3)) as usize;
     // Scroll to keep cursor visible
-    let scroll = if app.palette_cursor >= visible_results {
-        app.palette_cursor - visible_results + 1
+    let scroll = if p.cursor >= visible_results {
+        p.cursor - visible_results + 1
     } else {
         0
     };
 
-    for (i, entry) in app
-        .palette_results
-        .iter()
-        .skip(scroll)
-        .take(visible_results)
-        .enumerate()
-    {
+    for (i, entry) in p.results.iter().skip(scroll).take(visible_results).enumerate() {
         let actual_idx = i + scroll;
-        let is_selected = actual_idx == app.palette_cursor;
+        let is_selected = actual_idx == p.cursor;
         let style = if is_selected {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED)
         } else {
@@ -2159,16 +2178,16 @@ fn render_palette(f: &mut Frame, app: &mut App) {
         ]));
     }
 
-    if app.palette_results.is_empty() && !app.palette_buf.is_empty() {
+    if p.results.is_empty() && !p.buf.is_empty() {
         lines.push(Line::from(Span::styled(
             "    No matches",
             Style::default().fg(Color::DarkGray),
         )));
     }
 
-    let hint = if app.palette_buf.starts_with('>') {
+    let hint = if p.buf.starts_with('>') {
         " Commands (type to filter) "
-    } else if app.palette_global {
+    } else if p.global {
         " Search ALL resources  |  Tab=local  |  > commands "
     } else {
         " Search resources  |  Tab=all types  |  > commands "
@@ -2188,8 +2207,8 @@ fn render_palette(f: &mut Frame, app: &mut App) {
 // ---------------------------------------------------------------------------
 
 fn render_popup(f: &mut Frame, app: &mut App) {
-    let current_context = app.kube.current_context().to_string();
-    let current_namespace = app.kube.current_namespace().map(|s| s.to_string());
+    let current_context = app.kube.context.name.as_str().to_string();
+    let current_namespace = app.kube.context.namespace.as_deref().map(|s| s.to_string());
 
     let popup = match &mut app.popup {
         | Some(p) => p,

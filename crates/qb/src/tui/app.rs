@@ -271,13 +271,6 @@ pub enum NavItemKind {
     Profiles,
 }
 
-/// An item in the favorites display list — either a section header or a
-/// reference (by original index) into the profile's favorites Vec.
-pub enum FavDisplayItem {
-    Header(String),
-    Entry(usize),
-}
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -286,66 +279,121 @@ pub enum FavDisplayItem {
 pub const ALL_NAMESPACES_LABEL: &str = "All Namespaces";
 
 // ---------------------------------------------------------------------------
+// Sub-state structs
+// ---------------------------------------------------------------------------
+
+pub struct NavState {
+    pub items: Vec<NavItem>,
+    pub state: ListState,
+}
+
+pub struct ResourceFilter {
+    pub text: String,
+    pub regex: Option<Regex>,
+    pub editing: bool,
+    pub buf: String,
+}
+
+pub struct ResourceTable {
+    pub entries: Vec<ResourceEntry>,
+    pub state: TableState,
+    pub table_state: TableState,
+    pub counts: std::collections::HashMap<ResourceType, usize>,
+    pub filter: ResourceFilter,
+}
+
+pub struct ClusterOverview {
+    pub stats: Option<ClusterStatsData>,
+    pub scroll: u16,
+}
+
+pub struct RelatedState {
+    pub events: Vec<RelatedEvent>,
+    pub resources: Vec<crate::k8s::RelatedResource>,
+    pub cursor: Option<usize>,
+    pub tab: usize,
+    pub line_start: usize,
+}
+
+pub struct DictSelection {
+    pub entries: Vec<(String, String, String)>,
+    pub cursor: Option<usize>,
+    pub line_offsets: Vec<usize>,
+    pub expanded_keys: std::collections::HashSet<String>,
+}
+
+pub struct DetailState {
+    pub value: Value,
+    pub yaml: String,
+    pub scroll: u16,
+    pub mode: DetailMode,
+    pub secret: Option<SecretDetailState>,
+    pub name: String,
+    pub namespace: String,
+    pub auto_refresh: bool,
+    pub area_height: usize,
+    pub related: RelatedState,
+    pub dict: DictSelection,
+}
+
+pub struct EventsState {
+    pub scroll: usize,
+    pub cursor: usize,
+    pub auto_scroll: bool,
+}
+
+pub struct PaletteState {
+    pub global: bool,
+    pub buf: String,
+    pub results: Vec<PaletteEntry>,
+    pub cursor: usize,
+    pub all_resources: Vec<(ResourceType, Vec<crate::k8s::ResourceEntry>)>,
+}
+
+pub struct HelpState {
+    pub buf: String,
+    pub cursor: usize,
+    pub scroll: usize,
+    pub context_only: bool,
+}
+
+pub struct PortForwardView {
+    pub manager: PortForwardManager,
+    pub cursor: usize,
+    pub table_state: TableState,
+}
+
+pub struct FavoritesView {
+    pub cursor: usize,
+    pub table_state: TableState,
+}
+
+pub struct ProfilesView {
+    pub cursor: usize,
+    pub table_state: TableState,
+}
+
+// ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
 pub struct App {
     pub kube: KubeClient,
-
-    // Navigation sidebar
-    pub nav_items: Vec<NavItem>,
-    pub nav_state: ListState,
-
-    // Resource table
-    pub resources: Vec<ResourceEntry>,
-    pub resource_state: TableState,
-    pub resource_table_state: TableState,
+    pub nav: NavState,
+    pub resources: ResourceTable,
     pub panel: Panel,
     pub return_panel: Option<Panel>,
-    pub resource_counts: std::collections::HashMap<ResourceType, usize>,
-
-    // Cluster stats (shown when "Overview" is selected)
-    pub cluster_stats: Option<ClusterStatsData>,
-    pub cluster_stats_scroll: u16,
-
-    // Detail view
-    pub detail_value: Value,
-    pub detail_yaml: String,
-    pub detail_scroll: u16,
-    pub detail_mode: DetailMode,
-    pub secret_state: Option<SecretDetailState>,
-    pub detail_name: String,
-    pub detail_namespace: String,
-    pub related_events: Vec<RelatedEvent>,
-    pub related_resources: Vec<crate::k8s::RelatedResource>,
-    pub related_cursor: Option<usize>,
-    pub related_tab: usize,
-    /// Line offset where related resource items start (after tab bar). Set by
-    /// render.
-    pub related_line_start: usize,
-    /// Inner height of the detail view content area. Set by render.
-    pub detail_area_height: usize,
-
-    // Edit / Exec / Create
+    pub overview: ClusterOverview,
+    pub detail: DetailState,
+    pub log: Option<LogViewState>,
+    pub log_detail_line: Option<String>,
+    pub events: EventsState,
     pub pending_edit: Option<PendingEdit>,
     pub pending_exec: Option<PendingExec>,
     pub pending_create: Option<PendingCreate>,
     pub pending_metadata_edit: Option<PendingMetadataEdit>,
     pub exec_terminal_override: Option<String>,
     pub edit_ctx: Option<EditContext>,
-    /// Tracks which label/annotation keys are expanded in smart view.
-    pub expanded_keys: std::collections::HashSet<String>,
-    /// Ordered list of all label/annotation dict entries: ("section:key",
-    /// "key", "value"). Populated each render by smart.rs. Enables j/k
-    /// navigation and y copy.
-    pub dict_entries: Vec<(String, String, String)>,
-    /// Currently selected dict entry index (into dict_entries).
-    pub dict_cursor: Option<usize>,
-    /// Line offsets for each dict entry (for scroll-to-cursor). Populated
-    /// each render.
-    pub dict_line_offsets: Vec<usize>,
-
-    // UI state
     pub focus: Focus,
     pub view: View,
     pub popup: Option<Popup>,
@@ -355,58 +403,15 @@ pub struct App {
     pub status_history: Vec<(std::time::Instant, String)>,
     pub error: Option<String>,
     pub pending_load: Option<PendingLoad>,
-
-    // Log view
-    pub log_state: Option<LogViewState>,
-    pub log_detail_line: Option<String>,
-
-    // Resource filter (regex on name, namespace, columns)
-    pub resource_filter_text: String,
-    pub resource_filter_regex: Option<Regex>,
-    pub resource_filter_editing: bool,
-    pub resource_filter_buf: String,
-
-    // Events log-style view state
-    pub events_scroll: usize,
-    pub events_cursor: usize,
-    pub events_auto_scroll: bool,
-
-    // Auto-refresh
     pub paused: bool,
     pub last_refresh: std::time::Instant,
-
-    // Watch mode for detail view
-    pub detail_auto_refresh: bool,
-
-    // Diff between resources
-    pub diff_mark: Option<(String, String, String)>, // (name, namespace, yaml)
-
-    // Command palette
-    pub palette_open: bool,
-    pub palette_global: bool,
-    pub palette_buf: String,
-    pub palette_results: Vec<PaletteEntry>,
-    pub palette_cursor: usize,
-    pub palette_all_resources: Vec<(ResourceType, Vec<crate::k8s::ResourceEntry>)>,
-
-    // Help palette
-    pub help_open: bool,
-    pub help_buf: String,
-    pub help_cursor: usize,
-    pub help_scroll: usize,
-    pub help_context_only: bool,
-
-    // Port forwards
-    pub pf_manager: PortForwardManager,
-    pub pf_cursor: usize,
-    pub pf_table_state: TableState,
-
-    // Config & profiles
+    pub diff_mark: Option<(String, String, String)>,
+    pub palette: Option<PaletteState>,
+    pub help: Option<HelpState>,
+    pub pf: PortForwardView,
     pub config: QbConfig,
-    pub favorites_cursor: usize,
-    pub favorites_table_state: TableState,
-    pub profiles_cursor: usize,
-    pub profiles_table_state: TableState,
+    pub favorites: FavoritesView,
+    pub profiles: ProfilesView,
 }
 
 impl App {
@@ -422,48 +427,62 @@ impl App {
 
         let mut app = Self {
             kube,
-            nav_items,
-            nav_state,
-            resources: Vec::new(),
-            resource_state: TableState::default(),
-            resource_table_state: TableState::default(),
+            nav: NavState {
+                items: nav_items,
+                state: nav_state,
+            },
+            resources: ResourceTable {
+                entries: Vec::new(),
+                state: TableState::default(),
+                table_state: TableState::default(),
+                counts: std::collections::HashMap::new(),
+                filter: ResourceFilter {
+                    text: String::new(),
+                    regex: None,
+                    editing: false,
+                    buf: String::new(),
+                },
+            },
             panel: Panel::Overview,
             return_panel: None,
-            resource_counts: std::collections::HashMap::new(),
-            cluster_stats: None,
-            cluster_stats_scroll: 0,
-            detail_value: Value::Null,
-            detail_yaml: String::new(),
-            detail_scroll: 0,
-            detail_mode: DetailMode::Smart,
-            secret_state: None,
-            detail_name: String::new(),
-            detail_namespace: String::new(),
-            related_events: Vec::new(),
-            related_resources: Vec::new(),
-            related_cursor: None,
-            related_tab: 0,
-            related_line_start: 0,
-            detail_area_height: 0,
+            overview: ClusterOverview { stats: None, scroll: 0 },
+            detail: DetailState {
+                value: Value::Null,
+                yaml: String::new(),
+                scroll: 0,
+                mode: DetailMode::Smart,
+                secret: None,
+                name: String::new(),
+                namespace: String::new(),
+                auto_refresh: true,
+                area_height: 0,
+                related: RelatedState {
+                    events: Vec::new(),
+                    resources: Vec::new(),
+                    cursor: None,
+                    tab: 0,
+                    line_start: 0,
+                },
+                dict: DictSelection {
+                    entries: Vec::new(),
+                    cursor: None,
+                    line_offsets: Vec::new(),
+                    expanded_keys: std::collections::HashSet::new(),
+                },
+            },
+            log: None,
+            log_detail_line: None,
+            events: EventsState {
+                scroll: 0,
+                cursor: 0,
+                auto_scroll: true,
+            },
             pending_edit: None,
             pending_exec: None,
             pending_create: None,
             pending_metadata_edit: None,
             exec_terminal_override: None,
             edit_ctx: None,
-            expanded_keys: std::collections::HashSet::new(),
-            dict_entries: Vec::new(),
-            dict_cursor: None,
-            dict_line_offsets: Vec::new(),
-            log_state: None,
-            log_detail_line: None,
-            resource_filter_text: String::new(),
-            resource_filter_regex: None,
-            resource_filter_editing: false,
-            resource_filter_buf: String::new(),
-            events_scroll: 0,
-            events_cursor: 0,
-            events_auto_scroll: true,
             paused: false,
             focus: Focus::Nav,
             view: View::Main,
@@ -475,29 +494,25 @@ impl App {
             error: None,
             pending_load: Some(PendingLoad::ClusterStats),
             last_refresh: std::time::Instant::now(),
-            detail_auto_refresh: true,
             diff_mark: None,
-            palette_open: false,
-            palette_global: false,
-            palette_buf: String::new(),
-            palette_results: Vec::new(),
-            palette_cursor: 0,
-            palette_all_resources: Vec::new(),
-            help_open: false,
-            help_buf: String::new(),
-            help_cursor: 0,
-            help_scroll: 0,
-            help_context_only: true,
-            pf_manager: PortForwardManager::new(),
-            pf_cursor: 0,
-            pf_table_state: TableState::default(),
+            palette: None,
+            help: None,
+            pf: PortForwardView {
+                manager: PortForwardManager::new(),
+                cursor: 0,
+                table_state: TableState::default(),
+            },
             config,
-            favorites_cursor: 0,
-            favorites_table_state: TableState::default(),
-            profiles_cursor: 0,
-            profiles_table_state: TableState::default(),
+            favorites: FavoritesView {
+                cursor: 0,
+                table_state: TableState::default(),
+            },
+            profiles: ProfilesView {
+                cursor: 0,
+                table_state: TableState::default(),
+            },
         };
-        app.config.active_profile_mut().kubeconfig = app.kube.kubeconfig_path().map(|s| s.to_string());
+        app.config.active_profile_mut().kubeconfig = app.kube.kubeconfig.path.clone();
         let _ = app.config.save();
         app.restore_saved_port_forwards();
         app.update_status();
@@ -533,7 +548,7 @@ impl App {
 
             if spf.paused {
                 // Create entry in Paused state without spawning a task
-                self.pf_manager.create_paused(
+                self.pf.manager.create_paused(
                     spf.namespace.clone(),
                     pod_name,
                     spf.context.clone(),
@@ -544,8 +559,8 @@ impl App {
                 );
             } else {
                 // Create and start immediately
-                let client = self.kube.client().clone();
-                self.pf_manager.create(
+                let client = self.kube.client.streaming.clone();
+                self.pf.manager.create(
                     client,
                     spf.namespace.clone(),
                     pod_name,
@@ -582,7 +597,7 @@ impl App {
 
     /// Snapshot of app state for command availability checks.
     pub fn cmd_flags(&self) -> super::command::CmdFlags {
-        let (has_pods_gt1, has_containers_gt1, following, wrapping, has_since) = if let Some(s) = &self.log_state {
+        let (has_pods_gt1, has_containers_gt1, following, wrapping, has_since) = if let Some(s) = &self.log {
             (
                 s.pods.len() > 1,
                 s.active_containers().len() > 1,
@@ -598,31 +613,38 @@ impl App {
         super::command::CmdFlags {
             resource_type: effective_resource_type,
             experimental: self.experimental,
-            has_filter: !self.resource_filter_text.is_empty(),
+            has_filter: !self.resources.filter.text.is_empty(),
             has_pods_gt1,
             has_containers_gt1,
             following,
             wrapping,
             has_since,
-            has_labels: self.dict_entries.iter().any(|(q, ..)| q.starts_with("Labels:")),
-            has_annotations: self.dict_entries.iter().any(|(q, ..)| q.starts_with("Annotations:")),
-            dict_cursor_active: self.dict_cursor.is_some(),
-            has_related: !self.related_resources.is_empty(),
+            has_labels: self.detail.dict.entries.iter().any(|(q, ..)| q.starts_with("Labels:")),
+            has_annotations: self
+                .detail
+                .dict
+                .entries
+                .iter()
+                .any(|(q, ..)| q.starts_with("Annotations:")),
+            dict_cursor_active: self.detail.dict.cursor.is_some(),
+            has_related: !self.detail.related.resources.is_empty(),
             paused: self.paused,
-            detail_auto_refresh: self.detail_auto_refresh,
-            pf_count: self.pf_manager.entries().len(),
+            detail_auto_refresh: self.detail.auto_refresh,
+            pf_count: self.pf.manager.entries().len(),
             diff_mark_set: self.diff_mark.is_some(),
             node_cordoned: if effective_resource_type == Some(ResourceType::Node) {
                 if self.view == View::Detail {
-                    self.detail_value
+                    self.detail
+                        .value
                         .get("spec")
                         .and_then(|s| s.get("unschedulable"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
                 } else {
-                    self.resource_state
+                    self.resources
+                        .state
                         .selected()
-                        .and_then(|idx| self.resources.get(idx))
+                        .and_then(|idx| self.resources.entries.get(idx))
                         .and_then(|e| e.columns.first())
                         .map(|s| s.contains("SchedulingDisabled"))
                         .unwrap_or(false)
@@ -672,29 +694,29 @@ impl App {
     }
 
     fn update_status(&mut self) {
-        let ctx = self.kube.current_context();
-        let ns = self.kube.namespace_display();
+        let ctx = self.kube.context.name.as_str();
+        let ns = self.kube.context.namespace.as_deref().unwrap_or("All Namespaces");
         let rt_name = self
             .selected_resource_type()
             .map(|r| r.display_name())
             .unwrap_or("None");
-        let count = self.resources.len();
+        let count = self.resources.entries.len();
         self.status = format!("ctx: {} | ns: {} | {}: {}", ctx, ns, rt_name, count);
     }
 
     /// Clear all cached resource data. Called on context switch, profile
     /// switch, and namespace change.
     fn clear_cached_state(&mut self) {
-        self.resource_counts.clear();
-        self.resources.clear();
-        self.cluster_stats = None;
-        self.detail_value = serde_json::Value::Null;
-        self.detail_yaml.clear();
-        self.detail_name.clear();
-        self.detail_namespace.clear();
-        self.related_events.clear();
-        self.related_resources.clear();
-        self.related_cursor = None;
+        self.resources.counts.clear();
+        self.resources.entries.clear();
+        self.overview.stats = None;
+        self.detail.value = serde_json::Value::Null;
+        self.detail.yaml.clear();
+        self.detail.name.clear();
+        self.detail.namespace.clear();
+        self.detail.related.events.clear();
+        self.detail.related.resources.clear();
+        self.detail.related.cursor = None;
     }
 
     pub fn push_status(&mut self, msg: impl Into<String>) {
@@ -721,7 +743,7 @@ impl App {
                 self.config
                     .active_profile()
                     .favorites
-                    .get(self.favorites_cursor)
+                    .get(self.favorites.cursor)
                     .and_then(|fav| ResourceType::from_singular_name(&fav.resource_type))
             },
             | _ => None,
@@ -737,21 +759,23 @@ impl App {
     }
 
     fn is_secret_smart_view(&self) -> bool {
-        self.detail_mode == DetailMode::Smart
+        self.detail.mode == DetailMode::Smart
             && self.selected_resource_type() == Some(ResourceType::Secret)
-            && self.secret_state.is_some()
+            && self.detail.secret.is_some()
     }
 
     // -----------------------------------------------------------------------
     // Resource filter
     // -----------------------------------------------------------------------
 
-    /// Returns indices into `self.resources` that match the current filter.
+    /// Returns indices into `self.resources.entries` that match the current
+    /// filter.
     pub fn visible_resource_indices(&self) -> Vec<usize> {
-        if self.resource_filter_text.is_empty() {
-            (0..self.resources.len()).collect()
+        if self.resources.filter.text.is_empty() {
+            (0..self.resources.entries.len()).collect()
         } else {
             self.resources
+                .entries
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| self.resource_matches(e))
@@ -761,10 +785,10 @@ impl App {
     }
 
     fn resource_matches(&self, entry: &ResourceEntry) -> bool {
-        if let Some(re) = &self.resource_filter_regex {
+        if let Some(re) = &self.resources.filter.regex {
             re.is_match(&entry.name) || re.is_match(&entry.namespace) || entry.columns.iter().any(|c| re.is_match(c))
         } else {
-            let needle = &self.resource_filter_text;
+            let needle = &self.resources.filter.text;
             entry.name.contains(needle)
                 || entry.namespace.contains(needle)
                 || entry.columns.iter().any(|c| c.contains(needle))
@@ -772,35 +796,35 @@ impl App {
     }
 
     fn begin_resource_filter(&mut self) {
-        self.resource_filter_editing = true;
-        self.resource_filter_buf = self.resource_filter_text.clone();
+        self.resources.filter.editing = true;
+        self.resources.filter.buf = self.resources.filter.text.clone();
     }
 
     fn apply_resource_filter(&mut self) {
-        self.resource_filter_text = self.resource_filter_buf.clone();
-        self.resource_filter_regex = if self.resource_filter_text.is_empty() {
+        self.resources.filter.text = self.resources.filter.buf.clone();
+        self.resources.filter.regex = if self.resources.filter.text.is_empty() {
             None
         } else {
-            Regex::new(&self.resource_filter_text).ok()
+            Regex::new(&self.resources.filter.text).ok()
         };
-        self.resource_filter_editing = false;
+        self.resources.filter.editing = false;
         // Reset selection to first visible entry
         let visible = self.visible_resource_indices();
         if let Some(&first) = visible.first() {
-            self.resource_state.select(Some(first));
-            self.events_cursor = 0;
+            self.resources.state.select(Some(first));
+            self.events.cursor = 0;
         }
     }
 
     fn cancel_resource_filter(&mut self) {
-        self.resource_filter_editing = false;
-        self.resource_filter_buf = self.resource_filter_text.clone();
+        self.resources.filter.editing = false;
+        self.resources.filter.buf = self.resources.filter.text.clone();
     }
 
     fn clear_resource_filter(&mut self) {
-        self.resource_filter_text.clear();
-        self.resource_filter_regex = None;
-        self.resource_filter_buf.clear();
+        self.resources.filter.text.clear();
+        self.resources.filter.regex = None;
+        self.resources.filter.buf.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -827,7 +851,7 @@ impl App {
         if self.paused {
             return;
         }
-        if let Some(state) = &mut self.log_state {
+        if let Some(state) = &mut self.log {
             state.poll_stream();
         }
     }
@@ -835,9 +859,10 @@ impl App {
     async fn load_resources(&mut self) {
         if let Some(rt) = self.selected_resource_type() {
             let prev_selected = self
-                .resource_state
+                .resources
+                .state
                 .selected()
-                .and_then(|idx| self.resources.get(idx))
+                .and_then(|idx| self.resources.entries.get(idx))
                 .map(|e| (e.name.clone(), e.namespace.clone()));
 
             match self.kube.list_resources(rt).await {
@@ -850,30 +875,35 @@ impl App {
                             ts_a.cmp(ts_b)
                         });
                     }
-                    self.resources = entries;
-                    self.resource_counts.insert(rt, self.resources.len());
+                    self.resources.entries = entries;
+                    self.resources.counts.insert(rt, self.resources.entries.len());
                     let new_idx = prev_selected
-                        .and_then(|(name, ns)| self.resources.iter().position(|e| e.name == name && e.namespace == ns))
+                        .and_then(|(name, ns)| {
+                            self.resources
+                                .entries
+                                .iter()
+                                .position(|e| e.name == name && e.namespace == ns)
+                        })
                         .or_else(|| {
-                            if self.resources.is_empty() {
+                            if self.resources.entries.is_empty() {
                                 None
                             } else {
-                                let prev_idx = self.resource_state.selected().unwrap_or(0);
-                                Some(prev_idx.min(self.resources.len() - 1))
+                                let prev_idx = self.resources.state.selected().unwrap_or(0);
+                                Some(prev_idx.min(self.resources.entries.len() - 1))
                             }
                         });
                     // Preserve viewport offset — only update the selected index, not the
                     // entire TableState, so auto-refresh doesn't jump the scroll position.
-                    self.resource_state.select(new_idx);
+                    self.resources.state.select(new_idx);
                     // Clamp events cursor to new list size
-                    if rt == ResourceType::Event && !self.resources.is_empty() {
-                        self.events_cursor = self.events_cursor.min(self.resources.len() - 1);
+                    if rt == ResourceType::Event && !self.resources.entries.is_empty() {
+                        self.events.cursor = self.events.cursor.min(self.resources.entries.len() - 1);
                     }
                     self.error = None;
                 },
                 | Err(e) => {
-                    self.resources.clear();
-                    self.resource_state.select(None);
+                    self.resources.entries.clear();
+                    self.resources.state.select(None);
                     self.error = Some(format!("Failed to load {}: {}", rt.display_name(), e));
                 },
             }
@@ -902,16 +932,16 @@ impl App {
             }
         }
         // Detail view watch mode
-        if self.detail_auto_refresh
+        if self.detail.auto_refresh
             && self.view == View::Detail
             && self.popup.is_none()
             && self.pending_load.is_none()
             && self.last_refresh.elapsed() >= std::time::Duration::from_secs(2)
         {
-            if !self.detail_name.is_empty() {
+            if !self.detail.name.is_empty() {
                 self.pending_load = Some(PendingLoad::ResourceDetail {
-                    name: self.detail_name.clone(),
-                    namespace: self.detail_namespace.clone(),
+                    name: self.detail.name.clone(),
+                    namespace: self.detail.namespace.clone(),
                 });
                 self.last_refresh = std::time::Instant::now();
             }
@@ -924,7 +954,7 @@ impl App {
                 let mut items = vec![ALL_NAMESPACES_LABEL.to_string()];
                 items.extend(namespaces);
                 let mut state = ListState::default();
-                match self.kube.current_namespace() {
+                match self.kube.context.namespace.as_deref() {
                     | None => state.select(Some(0)),
                     | Some(current) => {
                         if let Some(idx) = items.iter().position(|n| n == current) {
@@ -965,57 +995,57 @@ impl App {
         if let Some(rt) = self.selected_resource_type() {
             match self.kube.get_resource(rt, ns, name).await {
                 | Ok(value) => {
-                    self.detail_yaml = serde_yaml::to_string(&value).unwrap_or_default();
-                    let is_same_resource = self.detail_name == name && self.detail_namespace == ns;
+                    self.detail.yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                    let is_same_resource = self.detail.name == name && self.detail.namespace == ns;
                     if rt == ResourceType::Secret {
-                        if is_same_resource && self.detail_auto_refresh && self.secret_state.is_some() {
+                        if is_same_resource && self.detail.auto_refresh && self.detail.secret.is_some() {
                             // Preserve selection and decoded state on watch refresh
-                            if let Some(state) = &mut self.secret_state {
+                            if let Some(state) = &mut self.detail.secret {
                                 state.update_values(&value);
                             }
                         } else {
-                            self.secret_state = Some(SecretDetailState::from_value(&value));
+                            self.detail.secret = Some(SecretDetailState::from_value(&value));
                         }
                     } else {
-                        self.secret_state = None;
+                        self.detail.secret = None;
                     }
-                    self.detail_value = value;
-                    self.detail_name = name.to_string();
-                    self.detail_namespace = ns.to_string();
-                    if !self.detail_auto_refresh || !is_same_resource {
-                        self.detail_scroll = 0;
-                        self.detail_mode = DetailMode::Smart;
-                        self.expanded_keys.clear();
-                        self.dict_entries.clear();
-                        self.dict_cursor = None;
-                        self.dict_line_offsets.clear();
+                    self.detail.value = value;
+                    self.detail.name = name.to_string();
+                    self.detail.namespace = ns.to_string();
+                    if !self.detail.auto_refresh || !is_same_resource {
+                        self.detail.scroll = 0;
+                        self.detail.mode = DetailMode::Smart;
+                        self.detail.dict.expanded_keys.clear();
+                        self.detail.dict.entries.clear();
+                        self.detail.dict.cursor = None;
+                        self.detail.dict.line_offsets.clear();
                     }
                     self.view = View::Detail;
                     self.error = None;
-                    self.related_events = self.kube.fetch_related_events(ns, name).await.unwrap_or_default();
+                    self.detail.related.events = self.kube.fetch_related_events(ns, name).await.unwrap_or_default();
                     // Always re-fetch related resources (they change as pods scale, etc.)
                     let new_related = self
                         .kube
-                        .fetch_related_resources(rt, ns, name, &self.detail_value)
+                        .fetch_related_resources(rt, ns, name, &self.detail.value)
                         .await;
-                    if is_same_resource && self.detail_auto_refresh {
+                    if is_same_resource && self.detail.auto_refresh {
                         // Preserve cursor position by matching the selected resource
-                        if let Some(cursor) = self.related_cursor {
-                            if let Some(old) = self.related_resources.get(cursor) {
+                        if let Some(cursor) = self.detail.related.cursor {
+                            if let Some(old) = self.detail.related.resources.get(cursor) {
                                 let old_name = &old.name;
                                 let old_ns = &old.namespace;
                                 let old_rt = old.resource_type;
                                 // Find the same resource in the new list
-                                self.related_cursor = new_related.iter().position(|r| {
+                                self.detail.related.cursor = new_related.iter().position(|r| {
                                     r.resource_type == old_rt && r.name == *old_name && r.namespace == *old_ns
                                 });
                             }
                         }
                     } else {
-                        self.related_cursor = None;
-                        self.related_tab = 0;
+                        self.detail.related.cursor = None;
+                        self.detail.related.tab = 0;
                     }
-                    self.related_resources = new_related;
+                    self.detail.related.resources = new_related;
                 },
                 | Err(e) => {
                     self.error = Some(format!("Failed to load resource: {}", e));
@@ -1046,7 +1076,7 @@ impl App {
                     | Ok(lines) => {
                         let mut state = LogViewState::new(pods, ns.to_string(), lines);
                         state.since_seconds = default_since;
-                        self.log_state = Some(state);
+                        self.log = Some(state);
                         self.view = View::Logs;
                         self.error = None;
                     },
@@ -1062,7 +1092,7 @@ impl App {
     }
 
     async fn reload_logs(&mut self) {
-        let log_state = match &mut self.log_state {
+        let log_state = match &mut self.log {
             | Some(s) => s,
             | None => return,
         };
@@ -1089,7 +1119,7 @@ impl App {
     async fn load_cluster_stats(&mut self) {
         match self.kube.fetch_cluster_stats().await {
             | Ok(stats) => {
-                self.cluster_stats = Some(stats);
+                self.overview.stats = Some(stats);
                 // Preserve scroll position on auto-refresh
                 self.error = None;
             },
@@ -1120,19 +1150,19 @@ impl App {
             return;
         }
 
-        if self.help_open {
+        if self.help.is_some() {
             self.handle_help_key(key);
             return;
         }
 
-        if self.palette_open {
+        if self.palette.is_some() {
             self.handle_palette_key(key).await;
             return;
         }
 
         // [p] Toggle pause — global, works in any view (except popups/filter
         // editing/port forwards/logs)
-        if key.code == KeyCode::Char('p') && self.popup.is_none() && !self.resource_filter_editing {
+        if key.code == KeyCode::Char('p') && self.popup.is_none() && !self.resources.filter.editing {
             // Don't consume 'p' in: log view (pod selector), edit diff, port forwards view
             // (pause/resume)
             if self.view != View::Logs && self.view != View::EditDiff && !matches!(self.panel, Panel::PortForwards) {
@@ -1146,11 +1176,13 @@ impl App {
             }
         }
 
-        if key.code == KeyCode::Char('?') && self.popup.is_none() && !self.resource_filter_editing {
-            self.help_open = true;
-            self.help_buf.clear();
-            self.help_cursor = 0;
-            self.help_context_only = true;
+        if key.code == KeyCode::Char('?') && self.popup.is_none() && !self.resources.filter.editing {
+            self.help = Some(HelpState {
+                buf: String::new(),
+                cursor: 0,
+                scroll: 0,
+                context_only: true,
+            });
             return;
         }
 
@@ -1175,7 +1207,7 @@ impl App {
         }
 
         // Resource filter editing captures all input in main view
-        if self.resource_filter_editing {
+        if self.resources.filter.editing {
             self.handle_resource_filter_key(key);
             return;
         }
@@ -1196,10 +1228,11 @@ impl App {
             | KeyCode::Char('O') => {
                 let default = self
                     .kube
-                    .kubeconfig_path()
-                    .or_else(|| std::env::var("KUBECONFIG").ok().as_deref().map(|_| ""))
-                    .unwrap_or("~/.kube/config")
-                    .to_string();
+                    .kubeconfig
+                    .path
+                    .clone()
+                    .or_else(|| std::env::var("KUBECONFIG").ok())
+                    .unwrap_or_else(|| "~/.kube/config".to_string());
                 let default = if default.is_empty() {
                     std::env::var("KUBECONFIG").unwrap_or_else(|_| "~/.kube/config".to_string())
                 } else {
@@ -1213,7 +1246,7 @@ impl App {
             | KeyCode::Char('/') => {
                 self.begin_resource_filter();
             },
-            | KeyCode::Char('x') if !self.resource_filter_text.is_empty() => {
+            | KeyCode::Char('x') if !self.resources.filter.text.is_empty() => {
                 self.clear_resource_filter();
             },
             | KeyCode::Tab | KeyCode::BackTab => {
@@ -1236,10 +1269,10 @@ impl App {
             | KeyCode::Enter => self.apply_resource_filter(),
             | KeyCode::Esc => self.cancel_resource_filter(),
             | KeyCode::Backspace => {
-                self.resource_filter_buf.pop();
+                self.resources.filter.buf.pop();
             },
             | KeyCode::Char(c) => {
-                self.resource_filter_buf.push(c);
+                self.resources.filter.buf.push(c);
             },
             | _ => {},
         }
@@ -1279,11 +1312,11 @@ impl App {
     /// in the nav.
     fn load_nav_selection(&mut self) {
         self.return_panel = None;
-        let idx = match self.nav_state.selected() {
+        let idx = match self.nav.state.selected() {
             | Some(i) => i,
             | None => return,
         };
-        let kind = &self.nav_items[idx].kind;
+        let kind = &self.nav.items[idx].kind;
         match kind {
             | NavItemKind::Favorites => {
                 self.panel = Panel::Favorites;
@@ -1304,7 +1337,7 @@ impl App {
                 if !matches!(self.panel, Panel::Overview) {
                     self.panel = Panel::Overview;
                     self.clear_resource_filter();
-                    self.cluster_stats_scroll = 0;
+                    self.overview.scroll = 0;
                     self.pending_load = Some(PendingLoad::ClusterStats);
                 }
             },
@@ -1312,10 +1345,10 @@ impl App {
                 let rt = *rt;
                 if self.selected_resource_type() != Some(rt) {
                     self.panel = Panel::ResourceList(rt);
-                    self.resource_table_state = TableState::default();
-                    self.events_scroll = 0;
-                    self.events_cursor = 0;
-                    self.events_auto_scroll = true;
+                    self.resources.table_state = TableState::default();
+                    self.events.scroll = 0;
+                    self.events.cursor = 0;
+                    self.events.auto_scroll = true;
                     self.clear_resource_filter();
                     self.pending_load = Some(PendingLoad::Resources);
                 }
@@ -1336,37 +1369,37 @@ impl App {
     }
 
     fn nav_up(&mut self) {
-        let current = self.nav_state.selected().unwrap_or(0);
+        let current = self.nav.state.selected().unwrap_or(0);
         if current == 0 {
             return;
         }
         let mut next = current - 1;
         while next > 0 {
-            if Self::is_selectable_nav(&self.nav_items[next].kind) {
+            if Self::is_selectable_nav(&self.nav.items[next].kind) {
                 break;
             }
             next -= 1;
         }
-        if Self::is_selectable_nav(&self.nav_items[next].kind) {
-            self.nav_state.select(Some(next));
+        if Self::is_selectable_nav(&self.nav.items[next].kind) {
+            self.nav.state.select(Some(next));
         }
     }
 
     fn nav_down(&mut self) {
-        let current = self.nav_state.selected().unwrap_or(0);
-        let max = self.nav_items.len() - 1;
+        let current = self.nav.state.selected().unwrap_or(0);
+        let max = self.nav.items.len() - 1;
         if current >= max {
             return;
         }
         let mut next = current + 1;
         while next < max {
-            if Self::is_selectable_nav(&self.nav_items[next].kind) {
+            if Self::is_selectable_nav(&self.nav.items[next].kind) {
                 break;
             }
             next += 1;
         }
-        if Self::is_selectable_nav(&self.nav_items[next].kind) {
-            self.nav_state.select(Some(next));
+        if Self::is_selectable_nav(&self.nav.items[next].kind) {
+            self.nav.state.select(Some(next));
         }
     }
 
@@ -1388,19 +1421,19 @@ impl App {
                 // Cluster stats: scroll only
                 match key.code {
                     | KeyCode::Up | KeyCode::Char('k') => {
-                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_sub(1);
+                        self.overview.scroll = self.overview.scroll.saturating_sub(1);
                     },
                     | KeyCode::Down | KeyCode::Char('j') => {
-                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(1);
+                        self.overview.scroll = self.overview.scroll.saturating_add(1);
                     },
                     | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_sub(20);
+                        self.overview.scroll = self.overview.scroll.saturating_sub(20);
                     },
                     | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.cluster_stats_scroll = self.cluster_stats_scroll.saturating_add(20);
+                        self.overview.scroll = self.overview.scroll.saturating_add(20);
                     },
                     | KeyCode::Home => {
-                        self.cluster_stats_scroll = 0;
+                        self.overview.scroll = 0;
                     },
                     | _ => {},
                 }
@@ -1418,7 +1451,8 @@ impl App {
         let vis_len = visible.len();
         // Map current TableState selection (real index) to filtered position
         let vis_pos = self
-            .resource_state
+            .resources
+            .state
             .selected()
             .and_then(|sel| visible.iter().position(|&i| i == sel))
             .unwrap_or(0);
@@ -1426,18 +1460,18 @@ impl App {
         match key.code {
             | KeyCode::Up | KeyCode::Char('k') => {
                 if vis_pos > 0 {
-                    self.resource_state.select(Some(visible[vis_pos - 1]));
+                    self.resources.state.select(Some(visible[vis_pos - 1]));
                 }
             },
             | KeyCode::Down | KeyCode::Char('j') => {
                 if vis_pos + 1 < vis_len {
-                    self.resource_state.select(Some(visible[vis_pos + 1]));
+                    self.resources.state.select(Some(visible[vis_pos + 1]));
                 }
             },
             | KeyCode::Enter => {
                 if let Some(&real_idx) = visible.get(vis_pos) {
-                    if let Some(entry) = self.resources.get(real_idx) {
-                        self.resource_state.select(Some(real_idx));
+                    if let Some(entry) = self.resources.entries.get(real_idx) {
+                        self.resources.state.select(Some(real_idx));
                         self.pending_load = Some(PendingLoad::ResourceDetail {
                             name: entry.name.clone(),
                             namespace: entry.namespace.clone(),
@@ -1448,23 +1482,23 @@ impl App {
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let new_pos = vis_pos.saturating_sub(20);
                 if let Some(&idx) = visible.get(new_pos) {
-                    self.resource_state.select(Some(idx));
+                    self.resources.state.select(Some(idx));
                 }
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let new_pos = (vis_pos + 20).min(vis_len.saturating_sub(1));
                 if let Some(&idx) = visible.get(new_pos) {
-                    self.resource_state.select(Some(idx));
+                    self.resources.state.select(Some(idx));
                 }
             },
             | KeyCode::Home => {
                 if let Some(&first) = visible.first() {
-                    self.resource_state.select(Some(first));
+                    self.resources.state.select(Some(first));
                 }
             },
             | KeyCode::End => {
                 if let Some(&last) = visible.last() {
-                    self.resource_state.select(Some(last));
+                    self.resources.state.select(Some(last));
                 }
             },
             | KeyCode::Char('l') => {
@@ -1522,36 +1556,36 @@ impl App {
         let max = visible.len().saturating_sub(1);
         match key.code {
             | KeyCode::Up | KeyCode::Char('k') => {
-                self.events_cursor = self.events_cursor.saturating_sub(1);
-                self.events_auto_scroll = false;
+                self.events.cursor = self.events.cursor.saturating_sub(1);
+                self.events.auto_scroll = false;
             },
             | KeyCode::Down | KeyCode::Char('j') => {
-                if self.events_cursor < max {
-                    self.events_cursor += 1;
+                if self.events.cursor < max {
+                    self.events.cursor += 1;
                 }
-                self.events_auto_scroll = self.events_cursor == max;
+                self.events.auto_scroll = self.events.cursor == max;
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.events_cursor = self.events_cursor.saturating_sub(30);
-                self.events_auto_scroll = false;
+                self.events.cursor = self.events.cursor.saturating_sub(30);
+                self.events.auto_scroll = false;
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.events_cursor = (self.events_cursor + 30).min(max);
-                self.events_auto_scroll = self.events_cursor == max;
+                self.events.cursor = (self.events.cursor + 30).min(max);
+                self.events.auto_scroll = self.events.cursor == max;
             },
             | KeyCode::Home | KeyCode::Char('g') => {
-                self.events_cursor = 0;
-                self.events_auto_scroll = false;
+                self.events.cursor = 0;
+                self.events.auto_scroll = false;
             },
             | KeyCode::End | KeyCode::Char('G') => {
-                self.events_cursor = max;
-                self.events_auto_scroll = true;
+                self.events.cursor = max;
+                self.events.auto_scroll = true;
             },
             | KeyCode::Enter => {
                 // Translate cursor position in filtered view → real resource index
-                if let Some(&real_idx) = visible.get(self.events_cursor) {
-                    if let Some(entry) = self.resources.get(real_idx) {
-                        self.resource_state.select(Some(real_idx));
+                if let Some(&real_idx) = visible.get(self.events.cursor) {
+                    if let Some(entry) = self.resources.entries.get(real_idx) {
+                        self.resources.state.select(Some(real_idx));
                         self.pending_load = Some(PendingLoad::ResourceDetail {
                             name: entry.name.clone(),
                             namespace: entry.namespace.clone(),
@@ -1569,156 +1603,165 @@ impl App {
         match key.code {
             | KeyCode::Esc | KeyCode::Char('q') => {
                 // Cascading dismiss: selection → related → view
-                if self.dict_cursor.is_some() {
-                    self.dict_cursor = None;
-                } else if self.related_cursor.is_some() {
-                    self.related_cursor = None;
+                if self.detail.dict.cursor.is_some() {
+                    self.detail.dict.cursor = None;
+                } else if self.detail.related.cursor.is_some() {
+                    self.detail.related.cursor = None;
                 } else {
                     self.return_to_main();
                 }
             },
             // [v] Cycle view: Smart → YAML → Smart
             | KeyCode::Char('v') => {
-                self.detail_mode = match self.detail_mode {
+                self.detail.mode = match self.detail.mode {
                     | DetailMode::Smart => DetailMode::Yaml,
                     | DetailMode::Yaml => DetailMode::Smart,
                 };
-                self.detail_scroll = 0;
+                self.detail.scroll = 0;
             },
-            // [y] Copy to clipboard
+            // [y] Copy to clipboard — dict selection takes priority over secret data
             | KeyCode::Char('y') => {
-                if secret_smart {
-                    self.copy_secret_to_clipboard();
-                } else if self.detail_mode == DetailMode::Yaml {
-                    self.copy_yaml_to_clipboard();
-                } else if self.dict_cursor.is_some() {
+                if self.detail.dict.cursor.is_some() {
                     self.copy_dict_entry_to_clipboard();
+                } else if secret_smart {
+                    self.copy_secret_to_clipboard();
+                } else if self.detail.mode == DetailMode::Yaml {
+                    self.copy_yaml_to_clipboard();
                 }
             },
-            // [Space] Expand/decode selected item
+            // [Space] Expand/decode — dict selection takes priority over secret data
             | KeyCode::Char(' ') => {
-                if secret_smart {
-                    if let Some(state) = &mut self.secret_state {
-                        state.toggle_decode();
-                    }
-                } else if let Some(cursor) = self.dict_cursor {
-                    if let Some((qualified_key, ..)) = self.dict_entries.get(cursor) {
+                if let Some(cursor) = self.detail.dict.cursor {
+                    if let Some((qualified_key, ..)) = self.detail.dict.entries.get(cursor) {
                         let key = qualified_key.clone();
-                        if self.expanded_keys.contains(&key) {
-                            self.expanded_keys.remove(&key);
+                        if self.detail.dict.expanded_keys.contains(&key) {
+                            self.detail.dict.expanded_keys.remove(&key);
                         } else {
-                            self.expanded_keys.insert(key);
+                            self.detail.dict.expanded_keys.insert(key);
                         }
+                    }
+                } else if secret_smart {
+                    if let Some(state) = &mut self.detail.secret {
+                        state.toggle_decode();
                     }
                 }
             },
             // j/k: navigate dict entries (when selected) or secret keys, scroll otherwise
             | KeyCode::Left => {
-                if self.related_cursor.is_some() {
+                if self.detail.related.cursor.is_some() {
                     let cat_count = self.related_categories().len();
-                    if cat_count > 0 && self.related_tab > 0 {
-                        self.related_tab -= 1;
-                        self.related_cursor = Some(self.related_tab_indices().first().copied().unwrap_or(0));
+                    if cat_count > 0 && self.detail.related.tab > 0 {
+                        self.detail.related.tab -= 1;
+                        self.detail.related.cursor = Some(self.related_tab_indices().first().copied().unwrap_or(0));
                         self.scroll_to_related_cursor(0);
                     }
                 }
             },
             | KeyCode::Right => {
-                if self.related_cursor.is_some() {
+                if self.detail.related.cursor.is_some() {
                     let cat_count = self.related_categories().len();
-                    if cat_count > 0 && self.related_tab + 1 < cat_count {
-                        self.related_tab += 1;
-                        self.related_cursor = Some(self.related_tab_indices().first().copied().unwrap_or(0));
+                    if cat_count > 0 && self.detail.related.tab + 1 < cat_count {
+                        self.detail.related.tab += 1;
+                        self.detail.related.cursor = Some(self.related_tab_indices().first().copied().unwrap_or(0));
                         self.scroll_to_related_cursor(0);
                     }
                 }
             },
             | KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(c) = self.related_cursor {
+                if let Some(c) = self.detail.related.cursor {
                     let indices = self.related_tab_indices();
                     if let Some(pos) = indices.iter().position(|&i| i == c) {
                         if pos > 0 {
-                            self.related_cursor = Some(indices[pos - 1]);
+                            self.detail.related.cursor = Some(indices[pos - 1]);
                             self.scroll_to_related_cursor(pos - 1);
                         }
                     }
                 } else if secret_smart {
-                    if let Some(state) = &mut self.secret_state {
+                    if let Some(state) = &mut self.detail.secret {
                         state.nav_up();
                     }
-                } else if self.dict_cursor.is_some() {
+                } else if self.detail.dict.cursor.is_some() {
                     self.dict_nav_up();
                 } else {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                    self.detail.scroll = self.detail.scroll.saturating_sub(1);
                 }
             },
             | KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(c) = self.related_cursor {
+                if let Some(c) = self.detail.related.cursor {
                     let indices = self.related_tab_indices();
                     if let Some(pos) = indices.iter().position(|&i| i == c) {
                         if pos + 1 < indices.len() {
-                            self.related_cursor = Some(indices[pos + 1]);
+                            self.detail.related.cursor = Some(indices[pos + 1]);
                             self.scroll_to_related_cursor(pos + 1);
                         }
                     }
                 } else if secret_smart {
-                    if let Some(state) = &mut self.secret_state {
+                    if let Some(state) = &mut self.detail.secret {
                         state.nav_down();
                     }
-                } else if self.dict_cursor.is_some() {
+                } else if self.detail.dict.cursor.is_some() {
                     self.dict_nav_down();
                 } else {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    self.detail.scroll = self.detail.scroll.saturating_add(1);
                 }
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(20);
+                self.detail.scroll = self.detail.scroll.saturating_sub(20);
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.detail_scroll = self.detail_scroll.saturating_add(20);
+                self.detail.scroll = self.detail.scroll.saturating_add(20);
             },
             | KeyCode::Home => {
-                self.detail_scroll = 0;
+                self.detail.scroll = 0;
             },
             // [l] Enter/leave label selection mode
             | KeyCode::Char('l') => {
                 if secret_smart {
                     // no-op for secrets
-                } else if self.dict_cursor.is_some()
+                } else if self.detail.dict.cursor.is_some()
                     && self
-                        .dict_entries
-                        .get(self.dict_cursor.unwrap_or(0))
+                        .detail
+                        .dict
+                        .entries
+                        .get(self.detail.dict.cursor.unwrap_or(0))
                         .map_or(false, |(q, ..)| q.starts_with("Labels:"))
                 {
-                    self.dict_cursor = None;
+                    self.detail.dict.cursor = None;
                 } else {
-                    let first_label = self.dict_entries.iter().position(|(q, ..)| q.starts_with("Labels:"));
+                    let first_label = self
+                        .detail
+                        .dict
+                        .entries
+                        .iter()
+                        .position(|(q, ..)| q.starts_with("Labels:"));
                     if let Some(idx) = first_label {
-                        self.related_cursor = None;
-                        self.dict_cursor = Some(idx);
+                        self.detail.related.cursor = None;
+                        self.detail.dict.cursor = Some(idx);
                         self.scroll_to_dict_cursor();
                     }
                 }
             },
             // [a] Enter/leave annotation selection mode
             | KeyCode::Char('a') => {
-                if secret_smart {
-                    // no-op for secrets
-                } else if self.dict_cursor.is_some()
+                if self.detail.dict.cursor.is_some()
                     && self
-                        .dict_entries
-                        .get(self.dict_cursor.unwrap_or(0))
+                        .detail
+                        .dict
+                        .entries
+                        .get(self.detail.dict.cursor.unwrap_or(0))
                         .map_or(false, |(q, ..)| q.starts_with("Annotations:"))
                 {
-                    self.dict_cursor = None;
+                    self.detail.dict.cursor = None;
                 } else {
                     let first_annot = self
-                        .dict_entries
+                        .detail
+                        .dict
+                        .entries
                         .iter()
                         .position(|(q, ..)| q.starts_with("Annotations:"));
                     if let Some(idx) = first_annot {
-                        self.related_cursor = None;
-                        self.dict_cursor = Some(idx);
+                        self.detail.related.cursor = None;
+                        self.detail.dict.cursor = Some(idx);
                         self.scroll_to_dict_cursor();
                     }
                 }
@@ -1742,8 +1785,8 @@ impl App {
                 self.restart_selected_workload().await;
             },
             | KeyCode::Char('w') => {
-                self.detail_auto_refresh = !self.detail_auto_refresh;
-                self.push_status(if self.detail_auto_refresh {
+                self.detail.auto_refresh = !self.detail.auto_refresh;
+                self.push_status(if self.detail.auto_refresh {
                     "Watch mode enabled"
                 } else {
                     "Watch mode disabled"
@@ -1760,7 +1803,7 @@ impl App {
             },
             | KeyCode::Char('T') => {
                 if self.selected_resource_type() == Some(ResourceType::Node) {
-                    let name = self.detail_name.clone();
+                    let name = self.detail.name.clone();
                     if !name.is_empty() {
                         self.popup = Some(Popup::ConfirmDrain { node_name: name });
                     }
@@ -1770,25 +1813,25 @@ impl App {
             },
             // [r] Toggle related resource selection
             | KeyCode::Char('r') => {
-                if self.related_resources.is_empty() {
+                if self.detail.related.resources.is_empty() {
                     // no-op
-                } else if self.related_cursor.is_some() {
-                    self.related_cursor = None;
+                } else if self.detail.related.cursor.is_some() {
+                    self.detail.related.cursor = None;
                 } else {
-                    self.dict_cursor = None; // exit dict selection
+                    self.detail.dict.cursor = None; // exit dict selection
                     let cats = self.related_categories();
                     if !cats.is_empty() {
-                        self.related_tab = self.related_tab.min(cats.len().saturating_sub(1));
+                        self.detail.related.tab = self.detail.related.tab.min(cats.len().saturating_sub(1));
                         let indices = self.related_tab_indices();
-                        self.related_cursor = indices.first().copied();
+                        self.detail.related.cursor = indices.first().copied();
                         self.scroll_to_related_cursor(0);
                     }
                 }
             },
             // [Enter] Edit selected label/annotation, or navigate to related resource
             | KeyCode::Enter => {
-                if let Some(cursor) = self.dict_cursor {
-                    if let Some((qualified_key, ..)) = self.dict_entries.get(cursor) {
+                if let Some(cursor) = self.detail.dict.cursor {
+                    if let Some((qualified_key, ..)) = self.detail.dict.entries.get(cursor) {
                         let kind = if qualified_key.starts_with("Labels:") {
                             MetadataEditKind::Labels
                         } else {
@@ -1796,8 +1839,8 @@ impl App {
                         };
                         self.open_metadata_edit(kind);
                     }
-                } else if let Some(cursor) = self.related_cursor {
-                    if let Some(rel) = self.related_resources.get(cursor) {
+                } else if let Some(cursor) = self.detail.related.cursor {
+                    if let Some(rel) = self.detail.related.resources.get(cursor) {
                         self.navigate_to_related(rel.resource_type, rel.name.clone(), rel.namespace.clone())
                             .await;
                     }
@@ -1813,7 +1856,7 @@ impl App {
     /// Returns the unique category names from related resources, in order.
     pub fn related_categories(&self) -> Vec<&'static str> {
         let mut cats = Vec::new();
-        for r in &self.related_resources {
+        for r in &self.detail.related.resources {
             if !cats.contains(&r.category) {
                 cats.push(r.category);
             }
@@ -1824,8 +1867,10 @@ impl App {
     /// Returns indices into related_resources for the currently selected tab.
     pub fn related_tab_indices(&self) -> Vec<usize> {
         let cats = self.related_categories();
-        let current_cat = cats.get(self.related_tab).copied().unwrap_or("");
-        self.related_resources
+        let current_cat = cats.get(self.detail.related.tab).copied().unwrap_or("");
+        self.detail
+            .related
+            .resources
             .iter()
             .enumerate()
             .filter(|(_, r)| r.category == current_cat)
@@ -1835,51 +1880,52 @@ impl App {
 
     /// Scroll detail view to keep the related resource at `pos` visible.
     fn scroll_to_related_cursor(&mut self, pos: usize) {
-        let target_line = self.related_line_start + pos;
-        let scroll = self.detail_scroll as usize;
-        let visible = self.detail_area_height;
+        let target_line = self.detail.related.line_start + pos;
+        let scroll = self.detail.scroll as usize;
+        let visible = self.detail.area_height;
         if visible == 0 {
             return;
         }
         if target_line >= scroll + visible {
-            self.detail_scroll = (target_line - visible + 1) as u16;
+            self.detail.scroll = (target_line - visible + 1) as u16;
         } else if target_line < scroll {
-            self.detail_scroll = target_line as u16;
+            self.detail.scroll = target_line as u16;
         }
     }
 
     async fn navigate_to_related(&mut self, rt: ResourceType, name: String, namespace: String) {
         // Switch to the related resource's type and load its detail
         self.panel = Panel::ResourceList(rt);
-        self.related_cursor = None;
-        self.related_tab = 0;
-        self.resource_table_state = TableState::default();
+        self.detail.related.cursor = None;
+        self.detail.related.tab = 0;
+        self.resources.table_state = TableState::default();
         // Update nav selection
         if let Some(nav_idx) = self
-            .nav_items
+            .nav
+            .items
             .iter()
             .position(|item| matches!(&item.kind, NavItemKind::Resource(r) if *r == rt))
         {
-            self.nav_state.select(Some(nav_idx));
+            self.nav.state.select(Some(nav_idx));
         }
         // Load the resource list for this type
         if let Ok(entries) = self.kube.list_resources(rt).await {
             if let Some(idx) = entries.iter().position(|e| e.name == name && e.namespace == namespace) {
-                self.resource_state.select(Some(idx));
+                self.resources.state.select(Some(idx));
             }
-            self.resource_counts.insert(rt, entries.len());
-            self.resources = entries;
+            self.resources.counts.insert(rt, entries.len());
+            self.resources.entries = entries;
         }
         self.pending_load = Some(PendingLoad::ResourceDetail { name, namespace });
     }
 
     fn dict_nav_up(&mut self) {
-        match self.dict_cursor {
+        match self.detail.dict.cursor {
             | Some(0) => {
                 // Stay at first entry — don't exit selection mode
             },
             | Some(i) => {
-                self.dict_cursor = Some(i - 1);
+                self.detail.dict.cursor = Some(i - 1);
                 self.scroll_to_dict_cursor();
             },
             | None => {},
@@ -1887,13 +1933,13 @@ impl App {
     }
 
     fn dict_nav_down(&mut self) {
-        let max = self.dict_entries.len().saturating_sub(1);
-        match self.dict_cursor {
+        let max = self.detail.dict.entries.len().saturating_sub(1);
+        match self.detail.dict.cursor {
             | Some(i) if i >= max => {
                 // Stay at last entry — don't exit selection mode
             },
             | Some(i) => {
-                self.dict_cursor = Some(i + 1);
+                self.detail.dict.cursor = Some(i + 1);
                 self.scroll_to_dict_cursor();
             },
             | None => {},
@@ -1902,25 +1948,25 @@ impl App {
 
     /// Scroll the detail view to keep the selected dict entry visible.
     fn scroll_to_dict_cursor(&mut self) {
-        if let Some(cursor) = self.dict_cursor {
-            if let Some(&line_offset) = self.dict_line_offsets.get(cursor) {
-                let scroll = self.detail_scroll as usize;
+        if let Some(cursor) = self.detail.dict.cursor {
+            if let Some(&line_offset) = self.detail.dict.line_offsets.get(cursor) {
+                let scroll = self.detail.scroll as usize;
                 // Rough visible height estimate (will be exact next frame)
                 let visible_height = 30usize;
                 if line_offset < scroll {
-                    self.detail_scroll = line_offset as u16;
+                    self.detail.scroll = line_offset as u16;
                 } else if line_offset >= scroll + visible_height {
-                    self.detail_scroll = line_offset.saturating_sub(visible_height / 2) as u16;
+                    self.detail.scroll = line_offset.saturating_sub(visible_height / 2) as u16;
                 }
             }
         }
     }
 
     fn copy_yaml_to_clipboard(&mut self) {
-        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&self.detail_yaml)) {
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&self.detail.yaml)) {
             | Ok(()) => {
                 self.error = None;
-                self.push_status(format!("Copied YAML ({} bytes)", self.detail_yaml.len()));
+                self.push_status(format!("Copied YAML ({} bytes)", self.detail.yaml.len()));
             },
             | Err(e) => {
                 self.error = Some(format!("Clipboard error: {}", e));
@@ -1929,8 +1975,8 @@ impl App {
     }
 
     fn copy_dict_entry_to_clipboard(&mut self) {
-        if let Some(cursor) = self.dict_cursor {
-            if let Some((_, key, value)) = self.dict_entries.get(cursor) {
+        if let Some(cursor) = self.detail.dict.cursor {
+            if let Some((_, key, value)) = self.detail.dict.entries.get(cursor) {
                 let key = key.clone();
                 let value = value.clone();
                 let text = format!("{}: {}", key, value);
@@ -1949,52 +1995,47 @@ impl App {
 
     fn handle_log_key(&mut self, key: KeyEvent) {
         // Filter editing mode captures all input
-        if let Some(state) = &self.log_state {
+        if let Some(state) = &self.log {
             if state.filter_editing {
                 self.handle_log_filter_key(key);
                 return;
             }
         }
 
-        let visible_count = self.log_state.as_ref().map(|s| s.visible_lines().len()).unwrap_or(0);
+        let visible_count = self.log.as_ref().map(|s| s.visible_lines().len()).unwrap_or(0);
 
         match key.code {
             | KeyCode::Esc | KeyCode::Char('q') => {
                 // Dismiss detail popup first, then deselect, then exit
                 if self.log_detail_line.is_some() {
                     self.log_detail_line = None;
-                } else if self
-                    .log_state
-                    .as_ref()
-                    .map(|s| s.selected_line.is_some())
-                    .unwrap_or(false)
-                {
-                    if let Some(state) = &mut self.log_state {
+                } else if self.log.as_ref().map(|s| s.selected_line.is_some()).unwrap_or(false) {
+                    if let Some(state) = &mut self.log {
                         state.selected_line = None;
                         state.selection_anchor = None;
                     }
                 } else {
-                    if let Some(state) = &mut self.log_state {
+                    if let Some(state) = &mut self.log {
                         state.stop_following();
                     }
-                    self.log_state = None;
+                    self.log = None;
                     self.log_detail_line = None;
                     self.return_to_main();
                 }
             },
             // [/] Start filter edit
             | KeyCode::Char('/') => {
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     state.begin_filter_edit();
                 }
             },
             // [f] Toggle follow
             | KeyCode::Char('f') => {
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     if state.following {
                         state.stop_following();
                     } else {
-                        state.start_following(self.kube.client().clone());
+                        state.start_following(self.kube.client.streaming.clone());
                     }
                 }
             },
@@ -2012,13 +2053,13 @@ impl App {
             },
             // [x] Clear filter
             | KeyCode::Char('x') => {
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     state.clear_filter();
                 }
             },
             // [w] Toggle wrap
             | KeyCode::Char('w') => {
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     state.wrap = !state.wrap;
                 }
             },
@@ -2028,7 +2069,7 @@ impl App {
             },
             // [Enter] Open selected line in detail popup
             | KeyCode::Enter => {
-                if let Some(state) = &self.log_state {
+                if let Some(state) = &self.log {
                     if let Some(sel) = state.selected_line {
                         let visible = state.visible_lines();
                         if let Some(line) = visible.get(sel) {
@@ -2041,7 +2082,7 @@ impl App {
             // Shift+Up/K extends selection from anchor
             | KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
                 let extending = key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('K');
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     match state.selected_line {
                         | Some(sel) if sel > 0 => {
                             if extending && state.selection_anchor.is_none() {
@@ -2069,7 +2110,7 @@ impl App {
             },
             | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
                 let extending = key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('J');
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     let vis_count = state.visible_lines().len();
                     match state.selected_line {
                         | Some(sel) if sel + 1 < vis_count => {
@@ -2090,17 +2131,17 @@ impl App {
                 }
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     state.scroll_up(30);
                 }
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     state.scroll_down(30, visible_count);
                 }
             },
             | KeyCode::Home | KeyCode::Char('g') => {
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     let vis_count = state.visible_lines().len();
                     if vis_count > 0 {
                         state.selected_line = Some(0);
@@ -2111,7 +2152,7 @@ impl App {
                 }
             },
             | KeyCode::End | KeyCode::Char('G') => {
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     let vis_count = state.visible_lines().len();
                     if vis_count > 0 {
                         state.selected_line = Some(vis_count.saturating_sub(1));
@@ -2126,7 +2167,7 @@ impl App {
     }
 
     fn handle_log_filter_key(&mut self, key: KeyEvent) {
-        let state = match &mut self.log_state {
+        let state = match &mut self.log {
             | Some(s) => s,
             | None => return,
         };
@@ -2145,7 +2186,7 @@ impl App {
     }
 
     fn copy_secret_to_clipboard(&mut self) {
-        if let Some(state) = &self.secret_state {
+        if let Some(state) = &self.detail.secret {
             let key_name = state.selected_key().unwrap_or("").to_string();
 
             let decoded = match state.selected_plaintext_value() {
@@ -2327,9 +2368,9 @@ impl App {
                         let ns = state.selected().and_then(|idx| items.get(idx).cloned());
                         if let Some(ns) = ns {
                             if ns == ALL_NAMESPACES_LABEL {
-                                self.kube.set_namespace(None);
+                                self.kube.context.namespace = None;
                             } else {
-                                self.kube.set_namespace(Some(ns));
+                                self.kube.context.namespace = Some(ns);
                             }
                             self.clear_cached_state();
                             Some(PendingLoad::Resources)
@@ -2339,7 +2380,7 @@ impl App {
                     },
                     | Some(Popup::PodSelect { state, .. }) => {
                         if let Some(idx) = state.selected() {
-                            if let Some(log_state) = &mut self.log_state {
+                            if let Some(log_state) = &mut self.log {
                                 log_state.selected_pod = if idx == 0 { None } else { Some(idx - 1) };
                                 log_state.selected_container = None;
                             }
@@ -2350,7 +2391,7 @@ impl App {
                     },
                     | Some(Popup::ContainerSelect { state, .. }) => {
                         if let Some(idx) = state.selected() {
-                            if let Some(log_state) = &mut self.log_state {
+                            if let Some(log_state) = &mut self.log {
                                 log_state.selected_container = if idx == 0 { None } else { Some(idx - 1) };
                             }
                             Some(PendingLoad::ReloadLogs)
@@ -2386,8 +2427,8 @@ impl App {
     fn open_logs_for_selected(&mut self) {
         if let Some(rt) = self.selected_resource_type() {
             if rt.supports_logs() {
-                if let Some(idx) = self.resource_state.selected() {
-                    if let Some(entry) = self.resources.get(idx) {
+                if let Some(idx) = self.resources.state.selected() {
+                    if let Some(entry) = self.resources.entries.get(idx) {
                         self.pending_load = Some(PendingLoad::Logs {
                             name: entry.name.clone(),
                             namespace: entry.namespace.clone(),
@@ -2400,7 +2441,7 @@ impl App {
 
     fn open_context_selector(&mut self) {
         let contexts = self.kube.contexts();
-        let current = self.kube.current_context().to_string();
+        let current = self.kube.context.name.as_str().to_string();
         let mut state = ListState::default();
         if let Some(idx) = contexts.iter().position(|c| c == &current) {
             state.select(Some(idx));
@@ -2411,7 +2452,7 @@ impl App {
     }
 
     fn open_pod_selector(&mut self) {
-        let log_state = match &self.log_state {
+        let log_state = match &self.log {
             | Some(s) => s,
             | None => return,
         };
@@ -2428,7 +2469,7 @@ impl App {
     }
 
     fn open_container_selector(&mut self) {
-        let log_state = match &self.log_state {
+        let log_state = match &self.log {
             | Some(s) => s,
             | None => return,
         };
@@ -2449,33 +2490,33 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn handle_port_forwards_key(&mut self, key: KeyEvent) {
-        let count = self.pf_manager.entries().len();
+        let count = self.pf.manager.entries().len();
         match key.code {
             | KeyCode::Up | KeyCode::Char('k') => {
-                if self.pf_cursor > 0 {
-                    self.pf_cursor -= 1;
-                    self.pf_table_state.select(Some(self.pf_cursor));
+                if self.pf.cursor > 0 {
+                    self.pf.cursor -= 1;
+                    self.pf.table_state.select(Some(self.pf.cursor));
                 }
             },
             | KeyCode::Down | KeyCode::Char('j') => {
-                if count > 0 && self.pf_cursor < count.saturating_sub(1) {
-                    self.pf_cursor += 1;
-                    self.pf_table_state.select(Some(self.pf_cursor));
+                if count > 0 && self.pf.cursor < count.saturating_sub(1) {
+                    self.pf.cursor += 1;
+                    self.pf.table_state.select(Some(self.pf.cursor));
                 }
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.pf_cursor = self.pf_cursor.saturating_sub(10);
-                self.pf_table_state.select(Some(self.pf_cursor));
+                self.pf.cursor = self.pf.cursor.saturating_sub(10);
+                self.pf.table_state.select(Some(self.pf.cursor));
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if count > 0 {
-                    self.pf_cursor = (self.pf_cursor + 10).min(count.saturating_sub(1));
-                    self.pf_table_state.select(Some(self.pf_cursor));
+                    self.pf.cursor = (self.pf.cursor + 10).min(count.saturating_sub(1));
+                    self.pf.table_state.select(Some(self.pf.cursor));
                 }
             },
             // [p] Toggle: running→pause, paused→activate, error→pause
             | KeyCode::Char('p') => {
-                if let Some(entry) = self.pf_manager.entries().get(self.pf_cursor) {
+                if let Some(entry) = self.pf.manager.entries().get(self.pf.cursor) {
                     let id = entry.id;
                     let local_port = entry.local_port;
                     let resource_name = entry.resource_label.split('/').nth(1).unwrap_or("").to_string();
@@ -2483,32 +2524,32 @@ impl App {
                     let context = entry.context.clone();
                     if matches!(entry.status, portforward::PortForwardStatus::Paused) {
                         // Paused → activate: spawn a new task
-                        let client = self.kube.client().clone();
-                        if !self.pf_manager.resume_spawn(id, client) {
-                            self.pf_manager.resume(id);
+                        let client = self.kube.client.streaming.clone();
+                        if !self.pf.manager.resume_spawn(id, client) {
+                            self.pf.manager.resume(id);
                         }
                         self.update_saved_pf_paused(&resource_name, &namespace, &context, local_port, false);
                     } else if matches!(entry.status, portforward::PortForwardStatus::Error(_)) {
                         // Error → pause (stop retrying, user can activate later)
-                        self.pf_manager.pause(id);
+                        self.pf.manager.pause(id);
                         self.update_saved_pf_paused(&resource_name, &namespace, &context, local_port, true);
                     } else if entry.status.is_running() {
                         // Running → pause
-                        self.pf_manager.pause(id);
+                        self.pf.manager.pause(id);
                         self.update_saved_pf_paused(&resource_name, &namespace, &context, local_port, true);
                     }
                 }
             },
             // [d] Cancel (delete) selected forward
             | KeyCode::Char('d') => {
-                if let Some(entry) = self.pf_manager.entries().get(self.pf_cursor) {
+                if let Some(entry) = self.pf.manager.entries().get(self.pf.cursor) {
                     let id = entry.id;
                     let resource_name = entry.resource_label.split('/').nth(1).unwrap_or("").to_string();
                     let namespace = entry.namespace.clone();
                     let context = entry.context.clone();
                     let local_port = entry.local_port;
-                    self.pf_manager.cancel(id);
-                    self.pf_manager.remove_cancelled();
+                    self.pf.manager.cancel(id);
+                    self.pf.manager.remove_cancelled();
                     self.config.active_profile_mut().remove_port_forward(
                         &resource_name,
                         &namespace,
@@ -2518,17 +2559,17 @@ impl App {
                     if let Err(e) = self.config.save() {
                         self.error = Some(format!("Failed to save config: {}", e));
                     }
-                    let new_count = self.pf_manager.entries().len();
+                    let new_count = self.pf.manager.entries().len();
                     if new_count == 0 {
-                        self.pf_cursor = 0;
+                        self.pf.cursor = 0;
                     } else {
-                        self.pf_cursor = self.pf_cursor.min(new_count.saturating_sub(1));
+                        self.pf.cursor = self.pf.cursor.min(new_count.saturating_sub(1));
                     }
                 }
             },
             // [e] Edit local port
             | KeyCode::Char('e') => {
-                if let Some(entry) = self.pf_manager.entries().get(self.pf_cursor) {
+                if let Some(entry) = self.pf.manager.entries().get(self.pf.cursor) {
                     let id = entry.id;
                     let old_port = entry.local_port;
                     self.popup = Some(Popup::PortForwardEditPort {
@@ -2581,7 +2622,7 @@ impl App {
     /// Change the local port of a port forward: cancel old, create new with
     /// updated port, update config.
     fn apply_pf_port_change(&mut self, pf_id: usize, old_port: u16, new_port: u16) {
-        let entry = match self.pf_manager.entries().iter().find(|e| e.id == pf_id) {
+        let entry = match self.pf.manager.entries().iter().find(|e| e.id == pf_id) {
             | Some(e) => e,
             | None => return,
         };
@@ -2596,8 +2637,8 @@ impl App {
         let resource_name = entry.resource_label.split('/').nth(1).unwrap_or("").to_string();
 
         // Cancel old
-        self.pf_manager.cancel(pf_id);
-        self.pf_manager.remove_cancelled();
+        self.pf.manager.cancel(pf_id);
+        self.pf.manager.remove_cancelled();
 
         // Update config: remove old, add new
         self.config
@@ -2645,12 +2686,13 @@ impl App {
         // Create new forward
         if was_paused {
             if let Some(t) = target {
-                self.pf_manager
+                self.pf
+                    .manager
                     .create_paused(namespace, pod_name, context, resource_label, new_port, remote_port, t);
             }
         } else if let Some(t) = target {
-            let client = self.kube.client().clone();
-            self.pf_manager.create(
+            let client = self.kube.client.streaming.clone();
+            self.pf.manager.create(
                 client,
                 namespace,
                 pod_name,
@@ -2696,11 +2738,12 @@ impl App {
         // Get the selected resource entry
         let visible = self.visible_resource_indices();
         let vis_pos = self
-            .resource_state
+            .resources
+            .state
             .selected()
             .and_then(|sel| visible.iter().position(|&i| i == sel))
             .unwrap_or(0);
-        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.entries.get(i)) {
             | Some(e) => e,
             | None => return,
         };
@@ -2808,10 +2851,10 @@ impl App {
             | PfTarget::LabelSelector { .. } => "(resolving)".to_string(),
         };
 
-        let context = self.kube.current_context().to_string();
-        let client = self.kube.client().clone();
+        let context = self.kube.context.name.as_str().to_string();
+        let client = self.kube.client.streaming.clone();
 
-        self.pf_manager.create(
+        self.pf.manager.create(
             client,
             namespace,
             pod_name,
@@ -2831,7 +2874,7 @@ impl App {
             resource_type: dialog.resource_type.singular_name().to_string(),
             resource_name: dialog.resource_name.clone(),
             namespace: dialog.namespace.clone(),
-            context: self.kube.current_context().to_string(),
+            context: self.kube.context.name.as_str().to_string(),
             local_port,
             remote_port,
             target_type,
@@ -2850,7 +2893,7 @@ impl App {
 
     /// Poll port forward status updates (called every event loop tick).
     pub fn poll_port_forwards(&mut self) {
-        self.pf_manager.poll_updates();
+        self.pf.manager.poll_updates();
     }
 
     // -----------------------------------------------------------------------
@@ -2872,10 +2915,12 @@ impl App {
             },
         };
 
-        let context = self.kube.current_context().to_string();
+        let context = self.kube.context.name.as_str().to_string();
         let kubeconfig_flag = self
             .kube
-            .kubeconfig_path()
+            .kubeconfig
+            .path
+            .as_deref()
             .map(|p| format!(" --kubeconfig {}", p))
             .unwrap_or_default();
         let cmd_str = exec.command.join(" ");
@@ -2967,15 +3012,16 @@ impl App {
             | _ => return,
         };
         let (name, namespace) = if self.view == View::Detail {
-            (self.detail_name.clone(), self.detail_namespace.clone())
+            (self.detail.name.clone(), self.detail.namespace.clone())
         } else {
             let visible = self.visible_resource_indices();
             let vis_pos = self
-                .resource_state
+                .resources
+                .state
                 .selected()
                 .and_then(|sel| visible.iter().position(|&i| i == sel))
                 .unwrap_or(0);
-            match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+            match visible.get(vis_pos).and_then(|&i| self.resources.entries.get(i)) {
                 | Some(e) => (e.name.clone(), e.namespace.clone()),
                 | None => return,
             }
@@ -3000,7 +3046,7 @@ impl App {
             return;
         }
         let (name, namespace) = if self.view == View::Detail {
-            (self.detail_name.clone(), self.detail_namespace.clone())
+            (self.detail.name.clone(), self.detail.namespace.clone())
         } else {
             self.selected_resource_name_ns()
         };
@@ -3081,16 +3127,18 @@ impl App {
         let is_schedulable = if self.view == View::Detail {
             // Read from the detail JSON value
             !self
-                .detail_value
+                .detail
+                .value
                 .get("spec")
                 .and_then(|s| s.get("unschedulable"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
         } else {
             // Read from the table columns (STATUS column)
-            self.resource_state
+            self.resources
+                .state
                 .selected()
-                .and_then(|idx| self.resources.get(idx))
+                .and_then(|idx| self.resources.entries.get(idx))
                 .and_then(|e| e.columns.first())
                 .map(|status| !status.contains("SchedulingDisabled"))
                 .unwrap_or(true)
@@ -3126,15 +3174,16 @@ impl App {
     /// Returns (name, namespace) of the currently selected resource.
     fn selected_resource_name_ns(&self) -> (String, String) {
         if self.view == View::Detail {
-            return (self.detail_name.clone(), self.detail_namespace.clone());
+            return (self.detail.name.clone(), self.detail.namespace.clone());
         }
         let visible = self.visible_resource_indices();
         let vis_pos = self
-            .resource_state
+            .resources
+            .state
             .selected()
             .and_then(|sel| visible.iter().position(|&i| i == sel))
             .unwrap_or(0);
-        match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+        match visible.get(vis_pos).and_then(|&i| self.resources.entries.get(i)) {
             | Some(e) => (e.name.clone(), e.namespace.clone()),
             | None => (String::new(), String::new()),
         }
@@ -3147,11 +3196,12 @@ impl App {
     fn copy_resource_name(&mut self) {
         let visible = self.visible_resource_indices();
         let vis_pos = self
-            .resource_state
+            .resources
+            .state
             .selected()
             .and_then(|sel| visible.iter().position(|&i| i == sel))
             .unwrap_or(0);
-        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.entries.get(i)) {
             | Some(e) => e,
             | None => return,
         };
@@ -3173,7 +3223,7 @@ impl App {
 
     /// Check if a resource is favorited in the active profile.
     pub fn is_favorite(&self, resource_type: ResourceType, name: &str, namespace: &str) -> bool {
-        let context = self.kube.current_context();
+        let context = self.kube.context.name.as_str();
         self.config
             .active_profile()
             .is_favorite(resource_type.singular_name(), name, namespace, context)
@@ -3189,7 +3239,7 @@ impl App {
         if name.is_empty() {
             return;
         }
-        let context = self.kube.current_context().to_string();
+        let context = self.kube.context.name.as_str().to_string();
         let added = self.config.active_profile_mut().toggle_favorite(
             rt.singular_name().to_string(),
             name.clone(),
@@ -3214,12 +3264,12 @@ impl App {
             | Some(rt) => rt,
             | None => return,
         };
-        let name = self.detail_name.clone();
-        let namespace = self.detail_namespace.clone();
+        let name = self.detail.name.clone();
+        let namespace = self.detail.namespace.clone();
         if name.is_empty() {
             return;
         }
-        let context = self.kube.current_context().to_string();
+        let context = self.kube.context.name.as_str().to_string();
         let added = self.config.active_profile_mut().toggle_favorite(
             rt.singular_name().to_string(),
             name.clone(),
@@ -3238,78 +3288,31 @@ impl App {
         }
     }
 
-    /// Build a sorted, grouped display list for the favorites panel.
-    /// Groups favorites by resource type (alphabetically by display name),
-    /// then sorts entries within each group by name.
-    pub fn favorites_display_items(&self) -> Vec<FavDisplayItem> {
-        let favorites = &self.config.active_profile().favorites;
-        if favorites.is_empty() {
-            return Vec::new();
-        }
-        let mut indexed: Vec<(usize, &crate::config::FavoriteEntry)> = favorites.iter().enumerate().collect();
-        indexed.sort_by(|a, b| {
-            let type_a = ResourceType::from_singular_name(&a.1.resource_type)
-                .map(|rt| rt.display_name())
-                .unwrap_or(&a.1.resource_type);
-            let type_b = ResourceType::from_singular_name(&b.1.resource_type)
-                .map(|rt| rt.display_name())
-                .unwrap_or(&b.1.resource_type);
-            type_a.cmp(type_b).then(a.1.name.cmp(&b.1.name))
-        });
-
-        let mut items = Vec::new();
-        let mut current_type = "";
-        for (idx, fav) in &indexed {
-            if fav.resource_type != current_type {
-                current_type = &fav.resource_type;
-                let label = ResourceType::from_singular_name(current_type)
-                    .map(|rt| rt.display_name().to_string())
-                    .unwrap_or_else(|| current_type.to_string());
-                items.push(FavDisplayItem::Header(label));
-            }
-            items.push(FavDisplayItem::Entry(*idx));
-        }
-        items
-    }
-
-    /// Resolve the original favorite index for the current display cursor.
-    fn favorites_entry_at_cursor(&self) -> Option<usize> {
-        let display = self.favorites_display_items();
-        match display.get(self.favorites_cursor) {
-            | Some(FavDisplayItem::Entry(idx)) => Some(*idx),
-            | _ => None,
-        }
-    }
-
     /// Navigate to a favorite from the favorites view.
     fn open_favorite_at_cursor(&mut self) {
-        if let Some(idx) = self.favorites_entry_at_cursor() {
-            let favorites = self.config.active_profile().favorites.clone();
-            if let Some(fav) = favorites.get(idx) {
-                if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
-                    self.return_panel = Some(self.panel.clone());
-                    self.panel = Panel::ResourceList(rt);
-                    self.pending_load = Some(PendingLoad::ResourceDetail {
-                        name: fav.name.clone(),
-                        namespace: fav.namespace.clone(),
-                    });
-                }
+        let favorites = self.config.active_profile().favorites.clone();
+        if let Some(fav) = favorites.get(self.favorites.cursor) {
+            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                self.return_panel = Some(self.panel.clone());
+                self.panel = Panel::ResourceList(rt);
+                self.pending_load = Some(PendingLoad::ResourceDetail {
+                    name: fav.name.clone(),
+                    namespace: fav.namespace.clone(),
+                });
             }
         }
     }
 
     /// Remove a favorite from the favorites view.
     fn remove_favorite_at_cursor(&mut self) {
-        if let Some(idx) = self.favorites_entry_at_cursor() {
-            let fav = self.config.active_profile().favorites[idx].clone();
+        let favorites = self.config.active_profile().favorites.clone();
+        if let Some(fav) = favorites.get(self.favorites.cursor) {
+            let fav = fav.clone();
             self.config.active_profile_mut().favorites.retain(|f| f != &fav);
-            // Clamp cursor to valid display range
-            let display_len = self.favorites_display_items().len();
-            if self.favorites_cursor >= display_len {
-                self.favorites_cursor = display_len.saturating_sub(1);
+            let count = self.config.active_profile().favorites.len();
+            if self.favorites.cursor >= count && count > 0 {
+                self.favorites.cursor = count - 1;
             }
-            // If cursor landed on a header, advance to next entry
-            self.snap_favorites_cursor_to_entry();
             self.push_status(format!("Removed '{}' from favorites", fav.name));
             if let Err(e) = self.config.save() {
                 self.error = Some(format!("Failed to save config: {}", e));
@@ -3320,86 +3323,38 @@ impl App {
     /// Resolve the favorite at the cursor, setting the panel to ResourceList
     /// for downstream commands. Returns (rt, name, namespace) if valid.
     fn resolve_favorite_at_cursor(&self) -> Option<(ResourceType, String, String)> {
-        let idx = self.favorites_entry_at_cursor()?;
-        let fav = self.config.active_profile().favorites.get(idx)?;
+        let fav = self.config.active_profile().favorites.get(self.favorites.cursor)?;
         let rt = ResourceType::from_singular_name(&fav.resource_type)?;
         Some((rt, fav.name.clone(), fav.namespace.clone()))
-    }
-
-    /// If the favorites cursor is on a header, snap it to the nearest entry.
-    fn snap_favorites_cursor_to_entry(&mut self) {
-        let display = self.favorites_display_items();
-        if display.is_empty() {
-            self.favorites_cursor = 0;
-            return;
-        }
-        // Try forward first, then backward
-        let len = display.len();
-        for i in self.favorites_cursor..len {
-            if matches!(display[i], FavDisplayItem::Entry(_)) {
-                self.favorites_cursor = i;
-                return;
-            }
-        }
-        for i in (0..self.favorites_cursor).rev() {
-            if matches!(display[i], FavDisplayItem::Entry(_)) {
-                self.favorites_cursor = i;
-                return;
-            }
-        }
-    }
-
-    /// Move the favorites cursor up, skipping headers.
-    fn favorites_cursor_up(&mut self) {
-        let display = self.favorites_display_items();
-        for i in (0..self.favorites_cursor).rev() {
-            if matches!(display[i], FavDisplayItem::Entry(_)) {
-                self.favorites_cursor = i;
-                return;
-            }
-        }
-    }
-
-    /// Move the favorites cursor down, skipping headers.
-    fn favorites_cursor_down(&mut self) {
-        let display = self.favorites_display_items();
-        for i in (self.favorites_cursor + 1)..display.len() {
-            if matches!(display[i], FavDisplayItem::Entry(_)) {
-                self.favorites_cursor = i;
-                return;
-            }
-        }
     }
 
     /// Handle keys in the favorites view.
     /// Supports all standard resource list commands plus `*` to de-favorite.
     async fn handle_favorites_key(&mut self, key: KeyEvent) {
-        let display = self.favorites_display_items();
-        let display_len = display.len();
-        drop(display);
+        let count = self.config.active_profile().favorites.len();
         match key.code {
             | KeyCode::Up | KeyCode::Char('k') => {
-                self.favorites_cursor_up();
+                if self.favorites.cursor > 0 {
+                    self.favorites.cursor -= 1;
+                }
             },
             | KeyCode::Down | KeyCode::Char('j') => {
-                self.favorites_cursor_down();
+                if count > 0 && self.favorites.cursor + 1 < count {
+                    self.favorites.cursor += 1;
+                }
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.favorites_cursor = self.favorites_cursor.saturating_sub(20);
-                self.snap_favorites_cursor_to_entry();
+                self.favorites.cursor = self.favorites.cursor.saturating_sub(20);
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.favorites_cursor = (self.favorites_cursor + 20).min(display_len.saturating_sub(1));
-                self.snap_favorites_cursor_to_entry();
+                self.favorites.cursor = (self.favorites.cursor + 20).min(count.saturating_sub(1));
             },
             | KeyCode::Home | KeyCode::Char('g') => {
-                self.favorites_cursor = 0;
-                self.snap_favorites_cursor_to_entry();
+                self.favorites.cursor = 0;
             },
             | KeyCode::End | KeyCode::Char('G') => {
-                if display_len > 0 {
-                    self.favorites_cursor = display_len - 1;
-                    self.snap_favorites_cursor_to_entry();
+                if count > 0 {
+                    self.favorites.cursor = count - 1;
                 }
             },
             // [Enter] Open detail view for this favorite
@@ -3420,8 +3375,8 @@ impl App {
             },
             // [y] Copy resource name
             | KeyCode::Char('y') => {
-                if let Some(idx) = self.favorites_entry_at_cursor() {
-                    let name = self.config.active_profile().favorites[idx].name.clone();
+                if let Some(fav) = self.config.active_profile().favorites.get(self.favorites.cursor) {
+                    let name = fav.name.clone();
                     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&name)) {
                         | Ok(()) => {
                             self.push_status(format!("Copied '{}'", name));
@@ -3578,18 +3533,16 @@ impl App {
 
     /// Open logs for the favorite at cursor.
     fn open_favorite_logs(&mut self) {
-        if let Some(idx) = self.favorites_entry_at_cursor() {
-            let favorites = self.config.active_profile().favorites.clone();
-            if let Some(fav) = favorites.get(idx) {
-                if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
-                    if rt.supports_logs() {
-                        self.return_panel = Some(self.panel.clone());
-                        self.panel = Panel::ResourceList(rt);
-                        self.pending_load = Some(PendingLoad::Logs {
-                            name: fav.name.clone(),
-                            namespace: fav.namespace.clone(),
-                        });
-                    }
+        let favorites = self.config.active_profile().favorites.clone();
+        if let Some(fav) = favorites.get(self.favorites.cursor) {
+            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                if rt.supports_logs() {
+                    self.return_panel = Some(self.panel.clone());
+                    self.panel = Panel::ResourceList(rt);
+                    self.pending_load = Some(PendingLoad::Logs {
+                        name: fav.name.clone(),
+                        namespace: fav.namespace.clone(),
+                    });
                 }
             }
         }
@@ -3597,28 +3550,26 @@ impl App {
 
     /// Edit the resource at the favorites cursor.
     async fn edit_favorite_at_cursor(&mut self) {
-        if let Some(idx) = self.favorites_entry_at_cursor() {
-            let favorites = self.config.active_profile().favorites.clone();
-            if let Some(fav) = favorites.get(idx) {
-                if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
-                    // Fetch the resource YAML
-                    match self.kube.get_resource(rt, &fav.namespace, &fav.name).await {
-                        | Ok(value) => {
-                            let yaml = serde_yaml::to_string(&value).unwrap_or_default();
-                            self.return_panel = Some(self.panel.clone());
-                            self.panel = Panel::ResourceList(rt);
-                            self.pending_edit = Some(PendingEdit {
-                                resource_type: rt,
-                                name: fav.name.clone(),
-                                namespace: fav.namespace.clone(),
-                                yaml,
-                                original_yaml: None,
-                            });
-                        },
-                        | Err(e) => {
-                            self.error = Some(format!("Failed to fetch resource: {}", e));
-                        },
-                    }
+        let favorites = self.config.active_profile().favorites.clone();
+        if let Some(fav) = favorites.get(self.favorites.cursor) {
+            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                // Fetch the resource YAML
+                match self.kube.get_resource(rt, &fav.namespace, &fav.name).await {
+                    | Ok(value) => {
+                        let yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                        self.return_panel = Some(self.panel.clone());
+                        self.panel = Panel::ResourceList(rt);
+                        self.pending_edit = Some(PendingEdit {
+                            resource_type: rt,
+                            name: fav.name.clone(),
+                            namespace: fav.namespace.clone(),
+                            yaml,
+                            original_yaml: None,
+                        });
+                    },
+                    | Err(e) => {
+                        self.error = Some(format!("Failed to fetch resource: {}", e));
+                    },
                 }
             }
         }
@@ -3639,39 +3590,39 @@ impl App {
         let count = names.len();
         match key.code {
             | KeyCode::Up | KeyCode::Char('k') => {
-                if self.profiles_cursor > 0 {
-                    self.profiles_cursor -= 1;
+                if self.profiles.cursor > 0 {
+                    self.profiles.cursor -= 1;
                 }
             },
             | KeyCode::Down | KeyCode::Char('j') => {
-                if count > 0 && self.profiles_cursor + 1 < count {
-                    self.profiles_cursor += 1;
+                if count > 0 && self.profiles.cursor + 1 < count {
+                    self.profiles.cursor += 1;
                 }
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.profiles_cursor = self.profiles_cursor.saturating_sub(20);
+                self.profiles.cursor = self.profiles.cursor.saturating_sub(20);
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.profiles_cursor = (self.profiles_cursor + 20).min(count.saturating_sub(1));
+                self.profiles.cursor = (self.profiles.cursor + 20).min(count.saturating_sub(1));
             },
             | KeyCode::Home | KeyCode::Char('g') => {
-                self.profiles_cursor = 0;
+                self.profiles.cursor = 0;
             },
             | KeyCode::End | KeyCode::Char('G') => {
                 if count > 0 {
-                    self.profiles_cursor = count - 1;
+                    self.profiles.cursor = count - 1;
                 }
             },
             // [Enter] Switch to selected profile
             | KeyCode::Enter => {
-                if let Some(name) = names.get(self.profiles_cursor) {
+                if let Some(name) = names.get(self.profiles.cursor) {
                     let name = name.clone();
                     self.switch_profile(&name).await;
                 }
             },
             // [c] Clone profile
             | KeyCode::Char('c') => {
-                if let Some(source) = names.get(self.profiles_cursor) {
+                if let Some(source) = names.get(self.profiles.cursor) {
                     let source = source.clone();
                     self.popup = Some(Popup::ProfileClone {
                         source_name: source.clone(),
@@ -3681,7 +3632,7 @@ impl App {
             },
             // [D] Delete profile
             | KeyCode::Char('D') => {
-                if let Some(name) = names.get(self.profiles_cursor) {
+                if let Some(name) = names.get(self.profiles.cursor) {
                     let name = name.clone();
                     if name == "default" {
                         self.error = Some("Cannot delete the default profile".into());
@@ -3747,8 +3698,8 @@ impl App {
                 self.popup = None;
                 self.push_status(format!("Deleted profile '{}'", profile_name));
                 let count = self.config.profiles.len();
-                if self.profiles_cursor >= count && count > 0 {
-                    self.profiles_cursor = count - 1;
+                if self.profiles.cursor >= count && count > 0 {
+                    self.profiles.cursor = count - 1;
                 }
                 if let Err(e) = self.config.save() {
                     self.error = Some(format!("Failed to save config: {}", e));
@@ -3774,20 +3725,20 @@ impl App {
         }
         // Save current PF paused states before switching
         // (already persisted on pause/resume, so just cancel runtime entries)
-        self.pf_manager.cancel_all();
+        self.pf.manager.cancel_all();
         self.clear_cached_state();
 
         self.config.active_profile = name.to_string();
 
         // Reload KubeClient if the profile has a different kubeconfig
         let profile_kubeconfig = self.config.active_profile().kubeconfig.clone();
-        let current_kubeconfig = self.kube.kubeconfig_path().map(|s| s.to_string());
+        let current_kubeconfig = self.kube.kubeconfig.path.clone();
         if profile_kubeconfig != current_kubeconfig {
             let ctx = self.config.active_profile().context.clone();
             match KubeClient::new(profile_kubeconfig, ctx, None).await {
                 | Ok(new_client) => {
                     self.kube = new_client;
-                    self.config.active_profile_mut().kubeconfig = self.kube.kubeconfig_path().map(|s| s.to_string());
+                    self.config.active_profile_mut().kubeconfig = self.kube.kubeconfig.path.clone();
                 },
                 | Err(e) => {
                     self.error = Some(format!("Failed to load kubeconfig: {}", e));
@@ -3894,7 +3845,7 @@ impl App {
     }
 
     fn copy_logs_to_clipboard(&mut self) {
-        if let Some(state) = &self.log_state {
+        if let Some(state) = &self.log {
             let visible = state.visible_lines();
             let (text, count) = if let Some((start, end)) = state.selection_range() {
                 let selected: Vec<&str> = visible
@@ -3931,11 +3882,12 @@ impl App {
         };
         let visible = self.visible_resource_indices();
         let vis_pos = self
-            .resource_state
+            .resources
+            .state
             .selected()
             .and_then(|sel| visible.iter().position(|&i| i == sel))
             .unwrap_or(0);
-        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.entries.get(i)) {
             | Some(e) => e,
             | None => return,
         };
@@ -3990,7 +3942,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn start_create_resource(&mut self) {
-        let ns = self.kube.current_namespace().unwrap_or("default").to_string();
+        let ns = self.kube.context.namespace.as_deref().unwrap_or("default").to_string();
         let template = format!(
             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: new-resource\n  namespace: {}\ndata: {{}}\n",
             ns
@@ -4020,17 +3972,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     async fn toggle_palette(&mut self, global: bool) {
-        if self.palette_open {
-            self.palette_open = false;
-            self.palette_all_resources.clear();
+        if self.palette.is_some() {
+            self.palette = None;
         } else {
-            self.palette_open = true;
-            self.palette_global = global;
-            self.palette_buf.clear();
-            self.palette_cursor = 0;
+            let mut all_resources = Vec::new();
 
             if global {
-                self.palette_all_resources.clear();
                 for (_, types) in ResourceType::all_by_category() {
                     for rt in types {
                         if rt == ResourceType::Event {
@@ -4038,41 +3985,55 @@ impl App {
                         }
                         if let Ok(entries) = self.kube.list_resources(rt).await {
                             if !entries.is_empty() {
-                                self.palette_all_resources.push((rt, entries));
+                                all_resources.push((rt, entries));
                             }
                         }
                     }
                 }
             }
 
+            self.palette = Some(PaletteState {
+                global,
+                buf: String::new(),
+                results: Vec::new(),
+                cursor: 0,
+                all_resources,
+            });
+
             self.update_palette_results();
         }
     }
 
     fn update_palette_results(&mut self) {
-        self.palette_results.clear();
-        let query = self.palette_buf.to_lowercase();
+        // Extract values we need before mutably borrowing palette
+        let query = match &self.palette {
+            | Some(p) => p.buf.to_lowercase(),
+            | None => return,
+        };
         let is_command = query.starts_with('>');
+        let flags = self.cmd_flags();
+        let singular = self.selected_resource_type().map(|rt| rt.singular_name()).unwrap_or("");
+
+        let p = self.palette.as_mut().unwrap();
+        p.results.clear();
 
         if is_command {
             let cmd_query = query.trim_start_matches('>');
-            let flags = self.cmd_flags();
             for cmd in super::command::palette_commands(&flags) {
                 let haystack = format!("{} {} {}", cmd.label, cmd.description, cmd.key).to_lowercase();
                 if cmd_query.is_empty() || haystack.contains(cmd_query) {
-                    self.palette_results.push(PaletteEntry {
+                    p.results.push(PaletteEntry {
                         label: cmd.label.to_string(),
                         description: cmd.description.to_string(),
                         kind: PaletteEntryKind::PaletteCommand { key: cmd.key },
                     });
                 }
             }
-        } else if self.palette_global {
+        } else if p.global {
             // Fuzzy search over ALL resource types — searchable as "type/name"
-            for (rt, entries) in &self.palette_all_resources {
+            for (rt, entries) in &p.all_resources {
                 let singular = rt.singular_name();
                 for entry in entries {
-                    // Include "type/name" so users can search e.g. "deployment/myapp"
                     let haystack = format!(
                         "{} {}/{} {} {}",
                         singular,
@@ -4088,7 +4049,7 @@ impl App {
                         } else {
                             format!("{}/{}  ({})", singular, entry.name, entry.namespace)
                         };
-                        self.palette_results.push(PaletteEntry {
+                        p.results.push(PaletteEntry {
                             label,
                             description: String::new(),
                             kind: PaletteEntryKind::Resource {
@@ -4098,15 +4059,14 @@ impl App {
                             },
                         });
                     }
-                    if self.palette_results.len() >= 100 {
+                    if p.results.len() >= 100 {
                         break;
                     }
                 }
             }
         } else {
             // Fuzzy search over current resource list
-            let singular = self.selected_resource_type().map(|rt| rt.singular_name()).unwrap_or("");
-            for entry in self.resources.iter() {
+            for entry in &self.resources.entries {
                 let haystack = format!(
                     "{} {}/{} {} {}",
                     singular,
@@ -4122,7 +4082,8 @@ impl App {
                     } else {
                         format!("{}/{}  ({})", singular, entry.name, entry.namespace)
                     };
-                    self.palette_results.push(PaletteEntry {
+                    // Re-borrow p for the push
+                    self.palette.as_mut().unwrap().results.push(PaletteEntry {
                         label,
                         description: String::new(),
                         kind: PaletteEntryKind::Resource {
@@ -4135,111 +4096,130 @@ impl App {
             }
         }
         // Clamp cursor
-        if !self.palette_results.is_empty() {
-            self.palette_cursor = self.palette_cursor.min(self.palette_results.len() - 1);
+        let p = match &mut self.palette {
+            | Some(p) => p,
+            | None => return,
+        };
+        if !p.results.is_empty() {
+            p.cursor = p.cursor.min(p.results.len() - 1);
         } else {
-            self.palette_cursor = 0;
+            p.cursor = 0;
         }
     }
 
     async fn handle_palette_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Esc => {
-                self.palette_open = false;
+                self.palette = None;
             },
             | KeyCode::Enter => {
-                if let Some(entry) = self.palette_results.get(self.palette_cursor) {
-                    match &entry.kind {
-                        | PaletteEntryKind::Resource {
-                            name,
-                            namespace,
-                            resource_type,
-                        } => {
-                            let name = name.clone();
-                            let namespace = namespace.clone();
-                            let rt = *resource_type;
-                            self.palette_open = false;
-                            self.palette_all_resources.clear();
-                            // If global result, switch to that resource type first
-                            if let Some(rt) = rt {
-                                self.panel = Panel::ResourceList(rt);
-                                self.view = View::Main;
-                                // Load the resource list for this type so detail can work
-                                if let Ok(entries) = self.kube.list_resources(rt).await {
-                                    if let Some(idx) =
-                                        entries.iter().position(|e| e.name == name && e.namespace == namespace)
-                                    {
-                                        self.resource_state.select(Some(idx));
-                                    }
-                                    self.resource_counts.insert(rt, entries.len());
-                                    self.resources = entries;
-                                }
-                                // Select the matching nav item
-                                if let Some(nav_idx) = self
-                                    .nav_items
-                                    .iter()
-                                    .position(|item| matches!(&item.kind, NavItemKind::Resource(r) if *r == rt))
+                let action = self.palette.as_ref().and_then(|p| {
+                    p.results.get(p.cursor).map(|entry| {
+                        match &entry.kind {
+                            | PaletteEntryKind::Resource {
+                                name,
+                                namespace,
+                                resource_type,
+                            } => (Some((name.clone(), namespace.clone(), *resource_type)), None),
+                            | PaletteEntryKind::PaletteCommand { key } => (None, Some(*key)),
+                        }
+                    })
+                });
+                if let Some((resource, command)) = action {
+                    if let Some((name, namespace, rt)) = resource {
+                        self.palette = None;
+                        // If global result, switch to that resource type first
+                        if let Some(rt) = rt {
+                            self.panel = Panel::ResourceList(rt);
+                            self.view = View::Main;
+                            // Load the resource list for this type so detail can work
+                            if let Ok(entries) = self.kube.list_resources(rt).await {
+                                if let Some(idx) =
+                                    entries.iter().position(|e| e.name == name && e.namespace == namespace)
                                 {
-                                    self.nav_state.select(Some(nav_idx));
+                                    self.resources.state.select(Some(idx));
                                 }
+                                self.resources.counts.insert(rt, entries.len());
+                                self.resources.entries = entries;
                             }
-                            self.pending_load = Some(PendingLoad::ResourceDetail { name, namespace });
-                        },
-                        | PaletteEntryKind::PaletteCommand { key } => {
-                            let key = *key;
-                            self.palette_open = false;
-                            self.execute_palette_command(key).await;
-                        },
+                            // Select the matching nav item
+                            if let Some(nav_idx) = self
+                                .nav
+                                .items
+                                .iter()
+                                .position(|item| matches!(&item.kind, NavItemKind::Resource(r) if *r == rt))
+                            {
+                                self.nav.state.select(Some(nav_idx));
+                            }
+                        }
+                        self.pending_load = Some(PendingLoad::ResourceDetail { name, namespace });
+                    } else if let Some(key) = command {
+                        self.palette = None;
+                        self.execute_palette_command(key).await;
                     }
                 }
             },
             | KeyCode::Tab => {
                 // Toggle between local and global search
-                let was_global = self.palette_global;
-                self.palette_global = !was_global;
-                if self.palette_global && self.palette_all_resources.is_empty() {
-                    for (_, types) in ResourceType::all_by_category() {
-                        for rt in types {
-                            if rt == ResourceType::Event {
-                                continue;
-                            }
-                            if let Ok(entries) = self.kube.list_resources(rt).await {
-                                if !entries.is_empty() {
-                                    self.palette_all_resources.push((rt, entries));
+                if let Some(p) = &mut self.palette {
+                    let was_global = p.global;
+                    p.global = !was_global;
+                    if p.global && p.all_resources.is_empty() {
+                        for (_, types) in ResourceType::all_by_category() {
+                            for rt in types {
+                                if rt == ResourceType::Event {
+                                    continue;
+                                }
+                                if let Ok(entries) = self.kube.list_resources(rt).await {
+                                    if !entries.is_empty() {
+                                        p.all_resources.push((rt, entries));
+                                    }
                                 }
                             }
                         }
                     }
+                    p.cursor = 0;
                 }
-                self.palette_cursor = 0;
                 self.update_palette_results();
             },
             | KeyCode::Up => {
-                if self.palette_cursor > 0 {
-                    self.palette_cursor -= 1;
+                if let Some(p) = &mut self.palette {
+                    if p.cursor > 0 {
+                        p.cursor -= 1;
+                    }
                 }
             },
             | KeyCode::Down => {
-                if !self.palette_results.is_empty() && self.palette_cursor < self.palette_results.len() - 1 {
-                    self.palette_cursor += 1;
+                if let Some(p) = &mut self.palette {
+                    if !p.results.is_empty() && p.cursor < p.results.len() - 1 {
+                        p.cursor += 1;
+                    }
                 }
             },
             | KeyCode::PageUp => {
-                self.palette_cursor = self.palette_cursor.saturating_sub(10);
+                if let Some(p) = &mut self.palette {
+                    p.cursor = p.cursor.saturating_sub(10);
+                }
             },
             | KeyCode::PageDown => {
-                if !self.palette_results.is_empty() {
-                    self.palette_cursor = (self.palette_cursor + 10).min(self.palette_results.len().saturating_sub(1));
+                if let Some(p) = &mut self.palette {
+                    if !p.results.is_empty() {
+                        p.cursor = (p.cursor + 10).min(p.results.len().saturating_sub(1));
+                    }
                 }
             },
             | KeyCode::Backspace => {
-                self.palette_buf.pop();
-                self.palette_cursor = 0;
+                if let Some(p) = &mut self.palette {
+                    p.buf.pop();
+                    p.cursor = 0;
+                }
                 self.update_palette_results();
             },
             | KeyCode::Char(c) => {
-                self.palette_buf.push(c);
-                self.palette_cursor = 0;
+                if let Some(p) = &mut self.palette {
+                    p.buf.push(c);
+                    p.cursor = 0;
+                }
                 self.update_palette_results();
             },
             | _ => {},
@@ -4261,8 +4241,9 @@ impl App {
             | "O" => {
                 let default = self
                     .kube
-                    .kubeconfig_path()
-                    .map(|s| s.to_string())
+                    .kubeconfig
+                    .path
+                    .clone()
                     .or_else(|| std::env::var("KUBECONFIG").ok())
                     .unwrap_or_else(|| "~/.kube/config".to_string());
                 self.popup = Some(Popup::KubeconfigInput { buf: default });
@@ -4277,12 +4258,16 @@ impl App {
 
     pub fn filtered_help_entries(&self) -> Vec<&'static super::command::Cmd> {
         let flags = self.cmd_flags();
-        let entries = if self.help_context_only {
+        let h = match &self.help {
+            | Some(h) => h,
+            | None => return Vec::new(),
+        };
+        let entries = if h.context_only {
             super::command::help_entries_for_context(self.current_context(), &flags)
         } else {
             super::command::help_entries(&flags)
         };
-        let query = self.help_buf.to_lowercase();
+        let query = h.buf.to_lowercase();
         if query.is_empty() {
             return entries;
         }
@@ -4305,42 +4290,56 @@ impl App {
     fn handle_help_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Esc => {
-                self.help_open = false;
+                self.help = None;
             },
             | KeyCode::Up | KeyCode::Char('k') => {
-                if self.help_cursor > 0 {
-                    self.help_cursor -= 1;
+                if let Some(h) = &mut self.help {
+                    if h.cursor > 0 {
+                        h.cursor -= 1;
+                    }
                 }
             },
             | KeyCode::Down | KeyCode::Char('j') => {
                 let count = self.filtered_help_entries().len();
-                if count > 0 && self.help_cursor < count.saturating_sub(1) {
-                    self.help_cursor += 1;
+                if let Some(h) = &mut self.help {
+                    if count > 0 && h.cursor < count.saturating_sub(1) {
+                        h.cursor += 1;
+                    }
                 }
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.help_cursor = self.help_cursor.saturating_sub(10);
+                if let Some(h) = &mut self.help {
+                    h.cursor = h.cursor.saturating_sub(10);
+                }
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let count = self.filtered_help_entries().len();
-                if count > 0 {
-                    self.help_cursor = (self.help_cursor + 10).min(count.saturating_sub(1));
+                if let Some(h) = &mut self.help {
+                    if count > 0 {
+                        h.cursor = (h.cursor + 10).min(count.saturating_sub(1));
+                    }
                 }
             },
             | KeyCode::Tab => {
-                self.help_context_only = !self.help_context_only;
-                self.help_cursor = 0;
-                self.help_scroll = 0;
+                if let Some(h) = &mut self.help {
+                    h.context_only = !h.context_only;
+                    h.cursor = 0;
+                    h.scroll = 0;
+                }
             },
             | KeyCode::Backspace => {
-                self.help_buf.pop();
-                self.help_cursor = 0;
-                self.help_scroll = 0;
+                if let Some(h) = &mut self.help {
+                    h.buf.pop();
+                    h.cursor = 0;
+                    h.scroll = 0;
+                }
             },
             | KeyCode::Char(c) => {
-                self.help_buf.push(c);
-                self.help_cursor = 0;
-                self.help_scroll = 0;
+                if let Some(h) = &mut self.help {
+                    h.buf.push(c);
+                    h.cursor = 0;
+                    h.scroll = 0;
+                }
             },
             | _ => {},
         }
@@ -4352,7 +4351,8 @@ impl App {
 
     fn open_confirm_quit(&mut self) {
         let pf_count = self
-            .pf_manager
+            .pf
+            .manager
             .entries()
             .iter()
             .filter(|e| e.status.is_running())
@@ -4384,11 +4384,12 @@ impl App {
         };
         let visible = self.visible_resource_indices();
         let vis_pos = self
-            .resource_state
+            .resources
+            .state
             .selected()
             .and_then(|sel| visible.iter().position(|&i| i == sel))
             .unwrap_or(0);
-        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.entries.get(i)) {
             | Some(e) => e,
             | None => return,
         };
@@ -4404,12 +4405,12 @@ impl App {
             | Some(rt) => rt,
             | None => return,
         };
-        if self.detail_name.is_empty() {
+        if self.detail.name.is_empty() {
             return;
         }
         self.popup = Some(Popup::ConfirmDelete {
-            name: self.detail_name.clone(),
-            namespace: self.detail_namespace.clone(),
+            name: self.detail.name.clone(),
+            namespace: self.detail.namespace.clone(),
             resource_type: rt,
         });
     }
@@ -4490,11 +4491,12 @@ impl App {
         };
         let visible = self.visible_resource_indices();
         let vis_pos = self
-            .resource_state
+            .resources
+            .state
             .selected()
             .and_then(|sel| visible.iter().position(|&i| i == sel))
             .unwrap_or(0);
-        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.entries.get(i)) {
             | Some(e) => e,
             | None => return,
         };
@@ -4522,18 +4524,19 @@ impl App {
             | Some(rt) if rt.supports_scale() => rt,
             | _ => return,
         };
-        if self.detail_name.is_empty() {
+        if self.detail.name.is_empty() {
             return;
         }
         let current = self
-            .detail_value
+            .detail
+            .value
             .get("spec")
             .and_then(|s| s.get("replicas"))
             .and_then(|r| r.as_u64())
             .unwrap_or(1) as u32;
         self.popup = Some(Popup::ScaleInput {
-            name: self.detail_name.clone(),
-            namespace: self.detail_namespace.clone(),
+            name: self.detail.name.clone(),
+            namespace: self.detail.namespace.clone(),
             resource_type: rt,
             current,
             buf: current.to_string(),
@@ -4624,26 +4627,26 @@ impl App {
                 };
                 match KubeClient::new(Some(expanded), None, None).await {
                     | Ok(new_client) => {
-                        self.pf_manager.cancel_all();
+                        self.pf.manager.cancel_all();
                         self.kube = new_client;
-                        self.config.active_profile_mut().kubeconfig =
-                            self.kube.kubeconfig_path().map(|s| s.to_string());
+                        self.config.active_profile_mut().kubeconfig = self.kube.kubeconfig.path.clone();
                         if let Err(e) = self.config.save() {
                             self.error = Some(format!("Failed to save config: {}", e));
                         }
                         self.panel = Panel::Overview;
-                        self.resource_counts.clear();
-                        self.cluster_stats_scroll = 0;
+                        self.resources.counts.clear();
+                        self.overview.scroll = 0;
                         self.pending_load = Some(PendingLoad::ClusterStats);
                         self.error = None;
                         self.push_status("Kubeconfig loaded");
                         // Re-select overview
                         let first = self
-                            .nav_items
+                            .nav
+                            .items
                             .iter()
                             .position(|item| Self::is_selectable_nav(&item.kind))
                             .unwrap_or(0);
-                        self.nav_state.select(Some(first));
+                        self.nav.state.select(Some(first));
                     },
                     | Err(e) => {
                         self.error = Some(format!("Failed to load kubeconfig: {}", e));
@@ -4678,15 +4681,16 @@ impl App {
         };
         // Resolve pod and containers
         let (name, namespace) = if self.view == View::Detail {
-            (self.detail_name.clone(), self.detail_namespace.clone())
+            (self.detail.name.clone(), self.detail.namespace.clone())
         } else {
             let visible = self.visible_resource_indices();
             let vis_pos = self
-                .resource_state
+                .resources
+                .state
                 .selected()
                 .and_then(|sel| visible.iter().position(|&i| i == sel))
                 .unwrap_or(0);
-            match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+            match visible.get(vis_pos).and_then(|&i| self.resources.entries.get(i)) {
                 | Some(e) => (e.name.clone(), e.namespace.clone()),
                 | None => return,
             }
@@ -4835,11 +4839,12 @@ impl App {
         // Resolve the selected resource
         let visible = self.visible_resource_indices();
         let vis_pos = self
-            .resource_state
+            .resources
+            .state
             .selected()
             .and_then(|sel| visible.iter().position(|&i| i == sel))
             .unwrap_or(0);
-        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.get(i)) {
+        let entry = match visible.get(vis_pos).and_then(|&i| self.resources.entries.get(i)) {
             | Some(e) => e,
             | None => return,
         };
@@ -4872,9 +4877,9 @@ impl App {
         };
         self.pending_edit = Some(PendingEdit {
             resource_type: rt,
-            name: self.detail_name.clone(),
-            namespace: self.detail_namespace.clone(),
-            yaml: self.detail_yaml.clone(),
+            name: self.detail.name.clone(),
+            namespace: self.detail.namespace.clone(),
+            yaml: self.detail.yaml.clone(),
             original_yaml: None,
         });
     }
@@ -4926,7 +4931,7 @@ impl App {
             | KeyCode::Esc | KeyCode::Char('q') => {
                 self.edit_ctx = None;
                 // Return to previous view
-                if self.detail_name.is_empty() {
+                if self.detail.name.is_empty() {
                     self.return_to_main();
                 } else {
                     self.view = View::Detail;
@@ -4995,10 +5000,10 @@ impl App {
                 self.push_status(format!("Applied changes to {}/{}", rt.display_name(), name));
                 self.error = None;
                 // Refresh the detail view with updated data
-                self.detail_yaml = serde_yaml::to_string(&value).unwrap_or_default();
-                self.detail_value = value;
-                self.detail_name = name;
-                self.detail_namespace = ns;
+                self.detail.yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                self.detail.value = value;
+                self.detail.name = name;
+                self.detail.namespace = ns;
                 self.edit_ctx = None;
                 self.view = View::Detail;
             },
@@ -5028,7 +5033,7 @@ impl App {
                     self.error = Some("Invalid duration. Use e.g. 30m, 2h, 1h30m".into());
                     return;
                 }
-                if let Some(state) = &mut self.log_state {
+                if let Some(state) = &mut self.log {
                     state.since_seconds = Some(seconds);
                 }
                 self.pending_load = Some(PendingLoad::ReloadLogs);
@@ -5066,7 +5071,8 @@ impl App {
         };
         // Serialize the labels/annotations map as YAML for editing in $EDITOR
         let map = self
-            .detail_value
+            .detail
+            .value
             .get("metadata")
             .and_then(|m| m.get(field))
             .cloned()
@@ -5076,13 +5082,13 @@ impl App {
             "# Edit {} for {}/{}\n# Save and close to apply. Empty keys are removed.\n#\n",
             field,
             rt.display_name(),
-            self.detail_name
+            self.detail.name
         );
         self.pending_metadata_edit = Some(PendingMetadataEdit {
             kind,
             resource_type: rt,
-            name: self.detail_name.clone(),
-            namespace: self.detail_namespace.clone(),
+            name: self.detail.name.clone(),
+            namespace: self.detail.namespace.clone(),
             yaml: format!("{}{}", header, yaml),
         });
     }
@@ -5108,7 +5114,8 @@ impl App {
             | MetadataEditKind::Annotations => "annotations",
         };
         let original: serde_json::Map<String, Value> = self
-            .detail_value
+            .detail
+            .value
             .get("metadata")
             .and_then(|m| m.get(field))
             .and_then(|v| v.as_object())
