@@ -394,6 +394,11 @@ pub struct RelatedEvent {
 // Cluster stats
 // ---------------------------------------------------------------------------
 
+pub struct ResourceCapacity {
+    pub capacity: String,
+    pub allocatable: String,
+}
+
 pub struct NodeStats {
     pub name: String,
     pub status: String,
@@ -401,33 +406,38 @@ pub struct NodeStats {
     pub roles: String,
     pub version: String,
     pub os_arch: String,
-    pub cpu_capacity: String,
-    pub cpu_allocatable: String,
-    pub mem_capacity: String,
-    pub mem_allocatable: String,
-    pub pods_capacity: String,
-    pub pods_allocatable: String,
+    pub cpu: ResourceCapacity,
+    pub mem: ResourceCapacity,
+    pub pods: ResourceCapacity,
     pub age: String,
+}
+
+pub struct NodeCounts {
+    pub total: usize,
+    pub ready: usize,
+    pub not_ready: usize,
+    pub cordoned: usize,
+    pub with_pressure: usize,
+}
+
+pub struct PodCounts {
+    pub total: usize,
+    pub running: usize,
+    pub pending: usize,
+    pub failed: usize,
+    pub crash_loop: usize,
+    pub error: usize,
 }
 
 pub struct ClusterStatsData {
     pub server_version: String,
-    pub node_count: usize,
-    pub nodes_ready: usize,
-    pub nodes_not_ready: usize,
-    pub nodes_cordoned: usize,
+    pub nodes: NodeCounts,
+    pub node_list: Vec<NodeStats>,
     pub namespace_count: usize,
-    pub pod_count: usize,
-    pub pods_running: usize,
-    pub pods_pending: usize,
-    pub pods_failed: usize,
+    pub pods: PodCounts,
     pub deployment_count: usize,
     pub service_count: usize,
-    pub pods_crash_loop: usize,
-    pub pods_error: usize,
     pub recent_warnings: usize,
-    pub nodes_with_pressure: usize,
-    pub nodes: Vec<NodeStats>,
 }
 
 // ---------------------------------------------------------------------------
@@ -607,12 +617,18 @@ impl KubeClient {
                 os_arch: info
                     .map(|i| format!("{}/{}", i.operating_system, i.architecture))
                     .unwrap_or_default(),
-                cpu_capacity: get_res(capacity, "cpu"),
-                cpu_allocatable: get_res(allocatable, "cpu"),
-                mem_capacity: format_memory_gb(&get_res(capacity, "memory")),
-                mem_allocatable: format_memory_gb(&get_res(allocatable, "memory")),
-                pods_capacity: get_res(capacity, "pods"),
-                pods_allocatable: get_res(allocatable, "pods"),
+                cpu: ResourceCapacity {
+                    capacity: get_res(capacity, "cpu"),
+                    allocatable: get_res(allocatable, "cpu"),
+                },
+                mem: ResourceCapacity {
+                    capacity: format_memory_gb(&get_res(capacity, "memory")),
+                    allocatable: format_memory_gb(&get_res(allocatable, "memory")),
+                },
+                pods: ResourceCapacity {
+                    capacity: get_res(capacity, "pods"),
+                    allocatable: get_res(allocatable, "pods"),
+                },
                 age: format_age(n.metadata.creation_timestamp.as_ref()),
             });
         }
@@ -699,22 +715,26 @@ impl KubeClient {
 
         Ok(ClusterStatsData {
             server_version,
-            node_count: node_list.items.len(),
-            nodes_ready,
-            nodes_not_ready,
-            nodes_cordoned,
+            nodes: NodeCounts {
+                total: node_list.items.len(),
+                ready: nodes_ready,
+                not_ready: nodes_not_ready,
+                cordoned: nodes_cordoned,
+                with_pressure: nodes_with_pressure,
+            },
+            node_list: node_stats,
             namespace_count: ns_count,
-            pod_count,
-            pods_running,
-            pods_pending,
-            pods_failed,
+            pods: PodCounts {
+                total: pod_count,
+                running: pods_running,
+                pending: pods_pending,
+                failed: pods_failed,
+                crash_loop: pods_crash_loop,
+                error: pods_error,
+            },
             deployment_count,
             service_count,
-            pods_crash_loop,
-            pods_error,
             recent_warnings,
-            nodes_with_pressure,
-            nodes: node_stats,
         })
     }
 

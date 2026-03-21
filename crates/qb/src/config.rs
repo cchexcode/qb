@@ -46,15 +46,35 @@ pub struct FavoriteEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SavedPortForward {
-    pub resource_type: String,
-    pub resource_name: String,
-    pub namespace: String,
-    pub context: String,
+pub struct SavedPfResource {
+    #[serde(rename = "resource_type")]
+    pub r#type: String,
+    #[serde(rename = "resource_name")]
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedPfPorts {
     pub local_port: u16,
     pub remote_port: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedPfTarget {
     pub target_type: String,
     pub selector: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedPortForward {
+    #[serde(flatten)]
+    pub resource: SavedPfResource,
+    pub namespace: String,
+    pub context: String,
+    #[serde(flatten)]
+    pub port: SavedPfPorts,
+    #[serde(flatten)]
+    pub target: SavedPfTarget,
     #[serde(default)]
     pub paused: bool,
 }
@@ -231,11 +251,11 @@ impl Profile {
     pub fn add_port_forward(&mut self, pf: SavedPortForward) {
         // Don't duplicate
         if !self.port_forwards.iter().any(|existing| {
-            existing.resource_name == pf.resource_name
+            existing.resource.name == pf.resource.name
                 && existing.namespace == pf.namespace
                 && existing.context == pf.context
-                && existing.local_port == pf.local_port
-                && existing.remote_port == pf.remote_port
+                && existing.port.local_port == pf.port.local_port
+                && existing.port.remote_port == pf.port.remote_port
         }) {
             self.port_forwards.push(pf);
         }
@@ -244,10 +264,10 @@ impl Profile {
     /// Remove a saved port forward by matching key fields.
     pub fn remove_port_forward(&mut self, resource_name: &str, namespace: &str, context: &str, local_port: u16) {
         self.port_forwards.retain(|pf| {
-            !(pf.resource_name == resource_name
+            !(pf.resource.name == resource_name
                 && pf.namespace == namespace
                 && pf.context == context
-                && pf.local_port == local_port)
+                && pf.port.local_port == local_port)
         });
     }
 }

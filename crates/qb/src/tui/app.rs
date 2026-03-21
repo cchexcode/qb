@@ -278,6 +278,13 @@ pub enum NavItemKind {
 /// Sentinel label used as the first entry in the namespace popup.
 pub const ALL_NAMESPACES_LABEL: &str = "All Namespaces";
 
+/// An item in a grouped display list — either a category header or a
+/// reference (by original index) into the underlying Vec.
+pub enum DisplayItem {
+    Header(String),
+    Entry(usize),
+}
+
 // ---------------------------------------------------------------------------
 // Sub-state structs
 // ---------------------------------------------------------------------------
@@ -523,15 +530,15 @@ impl App {
     fn restore_saved_port_forwards(&mut self) {
         let saved: Vec<_> = self.config.active_profile().port_forwards.clone();
         for spf in &saved {
-            let target = match spf.target_type.as_str() {
+            let target = match spf.target.target_type.as_str() {
                 | "direct_pod" => {
                     PfTarget::DirectPod {
-                        pod_name: spf.selector.clone(),
+                        pod_name: spf.target.selector.clone(),
                     }
                 },
                 | _ => {
                     PfTarget::LabelSelector {
-                        selector: spf.selector.clone(),
+                        selector: spf.target.selector.clone(),
                     }
                 },
             };
@@ -539,11 +546,11 @@ impl App {
                 | PfTarget::DirectPod { pod_name } => pod_name.clone(),
                 | PfTarget::LabelSelector { .. } => "(resolving)".to_string(),
             };
-            let rt = crate::k8s::ResourceType::from_singular_name(&spf.resource_type);
+            let rt = crate::k8s::ResourceType::from_singular_name(&spf.resource.r#type);
             let resource_label = format!(
                 "{}/{}",
-                rt.map(|r| r.display_name()).unwrap_or(&spf.resource_type),
-                spf.resource_name
+                rt.map(|r| r.display_name()).unwrap_or(&spf.resource.r#type),
+                spf.resource.name
             );
 
             if spf.paused {
@@ -552,9 +559,10 @@ impl App {
                     spf.namespace.clone(),
                     pod_name,
                     spf.context.clone(),
+                    spf.resource.r#type.clone(),
                     resource_label,
-                    spf.local_port,
-                    spf.remote_port,
+                    spf.port.local_port,
+                    spf.port.remote_port,
                     target,
                 );
             } else {
@@ -565,9 +573,10 @@ impl App {
                     spf.namespace.clone(),
                     pod_name,
                     spf.context.clone(),
+                    spf.resource.r#type.clone(),
                     resource_label,
-                    spf.local_port,
-                    spf.remote_port,
+                    spf.port.local_port,
+                    spf.port.remote_port,
                     target,
                 );
             }
@@ -740,10 +749,8 @@ impl App {
         match &self.panel {
             | Panel::ResourceList(rt) => Some(*rt),
             | Panel::Favorites => {
-                self.config
-                    .active_profile()
-                    .favorites
-                    .get(self.favorites.cursor)
+                self.favorites_entry_at_cursor()
+                    .and_then(|idx| self.config.active_profile().favorites.get(idx))
                     .and_then(|fav| ResourceType::from_singular_name(&fav.resource_type))
             },
             | _ => None,
@@ -1996,7 +2003,7 @@ impl App {
     fn handle_log_key(&mut self, key: KeyEvent) {
         // Filter editing mode captures all input
         if let Some(state) = &self.log {
-            if state.filter_editing {
+            if state.filter.editing {
                 self.handle_log_filter_key(key);
                 return;
             }
@@ -2176,10 +2183,10 @@ impl App {
             | KeyCode::Enter => state.apply_filter(),
             | KeyCode::Esc => state.cancel_filter_edit(),
             | KeyCode::Backspace => {
-                state.filter_buf.pop();
+                state.filter.buf.pop();
             },
             | KeyCode::Char(c) => {
-                state.filter_buf.push(c);
+                state.filter.buf.push(c);
             },
             | _ => {},
         }
@@ -2381,8 +2388,8 @@ impl App {
                     | Some(Popup::PodSelect { state, .. }) => {
                         if let Some(idx) = state.selected() {
                             if let Some(log_state) = &mut self.log {
-                                log_state.selected_pod = if idx == 0 { None } else { Some(idx - 1) };
-                                log_state.selected_container = None;
+                                log_state.selection.pod = if idx == 0 { None } else { Some(idx - 1) };
+                                log_state.selection.container = None;
                             }
                             Some(PendingLoad::ReloadLogs)
                         } else {
@@ -2392,7 +2399,7 @@ impl App {
                     | Some(Popup::ContainerSelect { state, .. }) => {
                         if let Some(idx) = state.selected() {
                             if let Some(log_state) = &mut self.log {
-                                log_state.selected_container = if idx == 0 { None } else { Some(idx - 1) };
+                                log_state.selection.container = if idx == 0 { None } else { Some(idx - 1) };
                             }
                             Some(PendingLoad::ReloadLogs)
                         } else {
@@ -2463,7 +2470,7 @@ impl App {
         items.extend(log_state.pods.iter().map(|p| p.name.clone()));
         let mut state = ListState::default();
         // Current selection: None → "All" (0), Some(i) → i+1
-        let sel = log_state.selected_pod.map(|i| i + 1).unwrap_or(0);
+        let sel = log_state.selection.pod.map(|i| i + 1).unwrap_or(0);
         state.select(Some(sel));
         self.popup = Some(Popup::PodSelect { items, state });
     }
@@ -2480,7 +2487,7 @@ impl App {
         let mut items = vec!["All".to_string()];
         items.extend(containers);
         let mut state = ListState::default();
-        let sel = log_state.selected_container.map(|i| i + 1).unwrap_or(0);
+        let sel = log_state.selection.container.map(|i| i + 1).unwrap_or(0);
         state.select(Some(sel));
         self.popup = Some(Popup::ContainerSelect { items, state });
     }
@@ -2489,37 +2496,125 @@ impl App {
     // Port forwards
     // -----------------------------------------------------------------------
 
+    /// Build a sorted, grouped display list for the port forwards panel.
+    pub fn pf_display_items(&self) -> Vec<DisplayItem> {
+        let entries = self.pf.manager.entries();
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        let categories = ResourceType::all_by_category();
+        let mut type_order: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new();
+        for (ci, (_cat, types)) in categories.iter().enumerate() {
+            for (ti, rt) in types.iter().enumerate() {
+                type_order.insert(rt.singular_name(), (ci, ti));
+            }
+        }
+        let mut indexed: Vec<(usize, &portforward::PortForwardEntry)> = entries.iter().enumerate().collect();
+        indexed.sort_by(|a, b| {
+            let oa = type_order
+                .get(a.1.resource.r#type.as_str())
+                .copied()
+                .unwrap_or((999, 999));
+            let ob = type_order
+                .get(b.1.resource.r#type.as_str())
+                .copied()
+                .unwrap_or((999, 999));
+            oa.cmp(&ob).then(a.1.resource.label.cmp(&b.1.resource.label))
+        });
+        let mut items = Vec::new();
+        let mut current_cat: Option<usize> = None;
+        for (idx, entry) in &indexed {
+            let (ci, _) = type_order
+                .get(entry.resource.r#type.as_str())
+                .copied()
+                .unwrap_or((999, 999));
+            if current_cat != Some(ci) {
+                current_cat = Some(ci);
+                let label = categories
+                    .get(ci)
+                    .map(|(cat, _)| cat.display_name().to_string())
+                    .unwrap_or_else(|| "Other".to_string());
+                items.push(DisplayItem::Header(label));
+            }
+            items.push(DisplayItem::Entry(*idx));
+        }
+        items
+    }
+
+    fn pf_entry_at_cursor(&self) -> Option<usize> {
+        match self.pf_display_items().get(self.pf.cursor) {
+            | Some(DisplayItem::Entry(idx)) => Some(*idx),
+            | _ => None,
+        }
+    }
+
+    fn snap_pf_cursor_to_entry(&mut self) {
+        let display = self.pf_display_items();
+        if display.is_empty() {
+            self.pf.cursor = 0;
+            return;
+        }
+        let len = display.len();
+        for i in self.pf.cursor..len {
+            if matches!(display[i], DisplayItem::Entry(_)) {
+                self.pf.cursor = i;
+                return;
+            }
+        }
+        for i in (0..self.pf.cursor).rev() {
+            if matches!(display[i], DisplayItem::Entry(_)) {
+                self.pf.cursor = i;
+                return;
+            }
+        }
+    }
+
+    fn pf_cursor_up(&mut self) {
+        let display = self.pf_display_items();
+        for i in (0..self.pf.cursor).rev() {
+            if matches!(display[i], DisplayItem::Entry(_)) {
+                self.pf.cursor = i;
+                return;
+            }
+        }
+    }
+
+    fn pf_cursor_down(&mut self) {
+        let display = self.pf_display_items();
+        for i in (self.pf.cursor + 1)..display.len() {
+            if matches!(display[i], DisplayItem::Entry(_)) {
+                self.pf.cursor = i;
+                return;
+            }
+        }
+    }
+
     fn handle_port_forwards_key(&mut self, key: KeyEvent) {
-        let count = self.pf.manager.entries().len();
+        let display_len = self.pf_display_items().len();
         match key.code {
             | KeyCode::Up | KeyCode::Char('k') => {
-                if self.pf.cursor > 0 {
-                    self.pf.cursor -= 1;
-                    self.pf.table_state.select(Some(self.pf.cursor));
-                }
+                self.pf_cursor_up();
             },
             | KeyCode::Down | KeyCode::Char('j') => {
-                if count > 0 && self.pf.cursor < count.saturating_sub(1) {
-                    self.pf.cursor += 1;
-                    self.pf.table_state.select(Some(self.pf.cursor));
-                }
+                self.pf_cursor_down();
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.pf.cursor = self.pf.cursor.saturating_sub(10);
-                self.pf.table_state.select(Some(self.pf.cursor));
+                self.snap_pf_cursor_to_entry();
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if count > 0 {
-                    self.pf.cursor = (self.pf.cursor + 10).min(count.saturating_sub(1));
-                    self.pf.table_state.select(Some(self.pf.cursor));
+                if display_len > 0 {
+                    self.pf.cursor = (self.pf.cursor + 10).min(display_len.saturating_sub(1));
+                    self.snap_pf_cursor_to_entry();
                 }
             },
             // [p] Toggle: running→pause, paused→activate, error→pause
             | KeyCode::Char('p') => {
-                if let Some(entry) = self.pf.manager.entries().get(self.pf.cursor) {
+                if let Some(idx) = self.pf_entry_at_cursor() {
+                    let entry = &self.pf.manager.entries()[idx];
                     let id = entry.id;
-                    let local_port = entry.local_port;
-                    let resource_name = entry.resource_label.split('/').nth(1).unwrap_or("").to_string();
+                    let local_port = entry.port.local;
+                    let resource_name = entry.resource.label.split('/').nth(1).unwrap_or("").to_string();
                     let namespace = entry.namespace.clone();
                     let context = entry.context.clone();
                     if matches!(entry.status, portforward::PortForwardStatus::Paused) {
@@ -2542,12 +2637,13 @@ impl App {
             },
             // [d] Cancel (delete) selected forward
             | KeyCode::Char('d') => {
-                if let Some(entry) = self.pf.manager.entries().get(self.pf.cursor) {
+                if let Some(idx) = self.pf_entry_at_cursor() {
+                    let entry = &self.pf.manager.entries()[idx];
                     let id = entry.id;
-                    let resource_name = entry.resource_label.split('/').nth(1).unwrap_or("").to_string();
+                    let resource_name = entry.resource.label.split('/').nth(1).unwrap_or("").to_string();
                     let namespace = entry.namespace.clone();
                     let context = entry.context.clone();
-                    let local_port = entry.local_port;
+                    let local_port = entry.port.local;
                     self.pf.manager.cancel(id);
                     self.pf.manager.remove_cancelled();
                     self.config.active_profile_mut().remove_port_forward(
@@ -2559,19 +2655,21 @@ impl App {
                     if let Err(e) = self.config.save() {
                         self.error = Some(format!("Failed to save config: {}", e));
                     }
-                    let new_count = self.pf.manager.entries().len();
-                    if new_count == 0 {
+                    let new_display_len = self.pf_display_items().len();
+                    if new_display_len == 0 {
                         self.pf.cursor = 0;
                     } else {
-                        self.pf.cursor = self.pf.cursor.min(new_count.saturating_sub(1));
+                        self.pf.cursor = self.pf.cursor.min(new_display_len.saturating_sub(1));
+                        self.snap_pf_cursor_to_entry();
                     }
                 }
             },
             // [e] Edit local port
             | KeyCode::Char('e') => {
-                if let Some(entry) = self.pf.manager.entries().get(self.pf.cursor) {
+                if let Some(idx) = self.pf_entry_at_cursor() {
+                    let entry = &self.pf.manager.entries()[idx];
                     let id = entry.id;
-                    let old_port = entry.local_port;
+                    let old_port = entry.port.local;
                     self.popup = Some(Popup::PortForwardEditPort {
                         pf_id: id,
                         old_port,
@@ -2627,14 +2725,15 @@ impl App {
             | None => return,
         };
 
-        let remote_port = entry.remote_port;
+        let remote_port = entry.port.remote;
         let namespace = entry.namespace.clone();
         let context = entry.context.clone();
-        let resource_label = entry.resource_label.clone();
+        let resource_type = entry.resource.r#type.clone();
+        let resource_label = entry.resource.label.clone();
         let pod_name = entry.pod_name.clone();
         let target = entry.target.clone();
         let was_paused = matches!(entry.status, portforward::PortForwardStatus::Paused);
-        let resource_name = entry.resource_label.split('/').nth(1).unwrap_or("").to_string();
+        let resource_name = entry.resource.label.split('/').nth(1).unwrap_or("").to_string();
 
         // Cancel old
         self.pf.manager.cancel(pf_id);
@@ -2668,14 +2767,17 @@ impl App {
             .unwrap_or_default();
 
         let saved = crate::config::SavedPortForward {
-            resource_type: rt_name,
-            resource_name: resource_name.clone(),
+            resource: crate::config::SavedPfResource {
+                r#type: rt_name,
+                name: resource_name.clone(),
+            },
             namespace: namespace.clone(),
             context: context.clone(),
-            local_port: new_port,
-            remote_port,
-            target_type,
-            selector,
+            port: crate::config::SavedPfPorts {
+                local_port: new_port,
+                remote_port,
+            },
+            target: crate::config::SavedPfTarget { target_type, selector },
             paused: was_paused,
         };
         self.config.active_profile_mut().add_port_forward(saved);
@@ -2686,9 +2788,16 @@ impl App {
         // Create new forward
         if was_paused {
             if let Some(t) = target {
-                self.pf
-                    .manager
-                    .create_paused(namespace, pod_name, context, resource_label, new_port, remote_port, t);
+                self.pf.manager.create_paused(
+                    namespace,
+                    pod_name,
+                    context,
+                    resource_type.clone(),
+                    resource_label,
+                    new_port,
+                    remote_port,
+                    t,
+                );
             }
         } else if let Some(t) = target {
             let client = self.kube.client.streaming.clone();
@@ -2697,6 +2806,7 @@ impl App {
                 namespace,
                 pod_name,
                 context,
+                resource_type,
                 resource_label,
                 new_port,
                 remote_port,
@@ -2717,10 +2827,10 @@ impl App {
         paused: bool,
     ) {
         if let Some(spf) = self.config.active_profile_mut().port_forwards.iter_mut().find(|pf| {
-            pf.resource_name == resource_name
+            pf.resource.name == resource_name
                 && pf.namespace == namespace
                 && pf.context == context
-                && pf.local_port == local_port
+                && pf.port.local_port == local_port
         }) {
             spf.paused = paused;
         }
@@ -2854,11 +2964,13 @@ impl App {
         let context = self.kube.context.name.as_str().to_string();
         let client = self.kube.client.streaming.clone();
 
+        let resource_type_name = dialog.resource_type.singular_name().to_string();
         self.pf.manager.create(
             client,
             namespace,
             pod_name,
             context,
+            resource_type_name,
             resource_label.clone(),
             local_port,
             remote_port,
@@ -2871,14 +2983,17 @@ impl App {
             | PfTarget::LabelSelector { selector } => ("label_selector".to_string(), selector.clone()),
         };
         let saved = SavedPortForward {
-            resource_type: dialog.resource_type.singular_name().to_string(),
-            resource_name: dialog.resource_name.clone(),
+            resource: crate::config::SavedPfResource {
+                r#type: dialog.resource_type.singular_name().to_string(),
+                name: dialog.resource_name.clone(),
+            },
             namespace: dialog.namespace.clone(),
             context: self.kube.context.name.as_str().to_string(),
-            local_port,
-            remote_port,
-            target_type,
-            selector,
+            port: crate::config::SavedPfPorts {
+                local_port,
+                remote_port,
+            },
+            target: crate::config::SavedPfTarget { target_type, selector },
             paused: false,
         };
         self.config.active_profile_mut().add_port_forward(saved);
@@ -3288,31 +3403,136 @@ impl App {
         }
     }
 
+    /// Build a sorted, grouped display list for the favorites panel.
+    /// Groups by category (matching sidebar order), then sorts by name within
+    /// each group.
+    pub fn favorites_display_items(&self) -> Vec<DisplayItem> {
+        let favorites = &self.config.active_profile().favorites;
+        if favorites.is_empty() {
+            return Vec::new();
+        }
+
+        // Build ordering: (category_idx, type_idx) for each ResourceType
+        let categories = ResourceType::all_by_category();
+        let mut type_order: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new();
+        for (ci, (_cat, types)) in categories.iter().enumerate() {
+            for (ti, rt) in types.iter().enumerate() {
+                type_order.insert(rt.singular_name(), (ci, ti));
+            }
+        }
+
+        let mut indexed: Vec<(usize, &crate::config::FavoriteEntry)> = favorites.iter().enumerate().collect();
+        indexed.sort_by(|a, b| {
+            let oa = type_order
+                .get(a.1.resource_type.as_str())
+                .copied()
+                .unwrap_or((999, 999));
+            let ob = type_order
+                .get(b.1.resource_type.as_str())
+                .copied()
+                .unwrap_or((999, 999));
+            oa.cmp(&ob).then(a.1.name.cmp(&b.1.name))
+        });
+
+        let mut items = Vec::new();
+        let mut current_cat: Option<usize> = None;
+        for (idx, fav) in &indexed {
+            let (ci, _) = type_order
+                .get(fav.resource_type.as_str())
+                .copied()
+                .unwrap_or((999, 999));
+            if current_cat != Some(ci) {
+                current_cat = Some(ci);
+                let label = categories
+                    .get(ci)
+                    .map(|(cat, _)| cat.display_name().to_string())
+                    .unwrap_or_else(|| "Other".to_string());
+                items.push(DisplayItem::Header(label));
+            }
+            items.push(DisplayItem::Entry(*idx));
+        }
+        items
+    }
+
+    /// Resolve the original favorite index for the current display cursor.
+    fn favorites_entry_at_cursor(&self) -> Option<usize> {
+        match self.favorites_display_items().get(self.favorites.cursor) {
+            | Some(DisplayItem::Entry(idx)) => Some(*idx),
+            | _ => None,
+        }
+    }
+
+    /// If the favorites cursor is on a header, snap it to the nearest entry.
+    fn snap_favorites_cursor_to_entry(&mut self) {
+        let display = self.favorites_display_items();
+        if display.is_empty() {
+            self.favorites.cursor = 0;
+            return;
+        }
+        let len = display.len();
+        for i in self.favorites.cursor..len {
+            if matches!(display[i], DisplayItem::Entry(_)) {
+                self.favorites.cursor = i;
+                return;
+            }
+        }
+        for i in (0..self.favorites.cursor).rev() {
+            if matches!(display[i], DisplayItem::Entry(_)) {
+                self.favorites.cursor = i;
+                return;
+            }
+        }
+    }
+
+    /// Move the favorites cursor up, skipping headers.
+    fn favorites_cursor_up(&mut self) {
+        let display = self.favorites_display_items();
+        for i in (0..self.favorites.cursor).rev() {
+            if matches!(display[i], DisplayItem::Entry(_)) {
+                self.favorites.cursor = i;
+                return;
+            }
+        }
+    }
+
+    /// Move the favorites cursor down, skipping headers.
+    fn favorites_cursor_down(&mut self) {
+        let display = self.favorites_display_items();
+        for i in (self.favorites.cursor + 1)..display.len() {
+            if matches!(display[i], DisplayItem::Entry(_)) {
+                self.favorites.cursor = i;
+                return;
+            }
+        }
+    }
+
     /// Navigate to a favorite from the favorites view.
     fn open_favorite_at_cursor(&mut self) {
-        let favorites = self.config.active_profile().favorites.clone();
-        if let Some(fav) = favorites.get(self.favorites.cursor) {
-            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
-                self.return_panel = Some(self.panel.clone());
-                self.panel = Panel::ResourceList(rt);
-                self.pending_load = Some(PendingLoad::ResourceDetail {
-                    name: fav.name.clone(),
-                    namespace: fav.namespace.clone(),
-                });
+        if let Some(idx) = self.favorites_entry_at_cursor() {
+            let favorites = self.config.active_profile().favorites.clone();
+            if let Some(fav) = favorites.get(idx) {
+                if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                    self.return_panel = Some(self.panel.clone());
+                    self.panel = Panel::ResourceList(rt);
+                    self.pending_load = Some(PendingLoad::ResourceDetail {
+                        name: fav.name.clone(),
+                        namespace: fav.namespace.clone(),
+                    });
+                }
             }
         }
     }
 
     /// Remove a favorite from the favorites view.
     fn remove_favorite_at_cursor(&mut self) {
-        let favorites = self.config.active_profile().favorites.clone();
-        if let Some(fav) = favorites.get(self.favorites.cursor) {
-            let fav = fav.clone();
+        if let Some(idx) = self.favorites_entry_at_cursor() {
+            let fav = self.config.active_profile().favorites[idx].clone();
             self.config.active_profile_mut().favorites.retain(|f| f != &fav);
-            let count = self.config.active_profile().favorites.len();
-            if self.favorites.cursor >= count && count > 0 {
-                self.favorites.cursor = count - 1;
+            let display_len = self.favorites_display_items().len();
+            if self.favorites.cursor >= display_len {
+                self.favorites.cursor = display_len.saturating_sub(1);
             }
+            self.snap_favorites_cursor_to_entry();
             self.push_status(format!("Removed '{}' from favorites", fav.name));
             if let Err(e) = self.config.save() {
                 self.error = Some(format!("Failed to save config: {}", e));
@@ -3323,7 +3543,8 @@ impl App {
     /// Resolve the favorite at the cursor, setting the panel to ResourceList
     /// for downstream commands. Returns (rt, name, namespace) if valid.
     fn resolve_favorite_at_cursor(&self) -> Option<(ResourceType, String, String)> {
-        let fav = self.config.active_profile().favorites.get(self.favorites.cursor)?;
+        let idx = self.favorites_entry_at_cursor()?;
+        let fav = self.config.active_profile().favorites.get(idx)?;
         let rt = ResourceType::from_singular_name(&fav.resource_type)?;
         Some((rt, fav.name.clone(), fav.namespace.clone()))
     }
@@ -3331,30 +3552,30 @@ impl App {
     /// Handle keys in the favorites view.
     /// Supports all standard resource list commands plus `*` to de-favorite.
     async fn handle_favorites_key(&mut self, key: KeyEvent) {
-        let count = self.config.active_profile().favorites.len();
+        let display_len = self.favorites_display_items().len();
         match key.code {
             | KeyCode::Up | KeyCode::Char('k') => {
-                if self.favorites.cursor > 0 {
-                    self.favorites.cursor -= 1;
-                }
+                self.favorites_cursor_up();
             },
             | KeyCode::Down | KeyCode::Char('j') => {
-                if count > 0 && self.favorites.cursor + 1 < count {
-                    self.favorites.cursor += 1;
-                }
+                self.favorites_cursor_down();
             },
             | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.favorites.cursor = self.favorites.cursor.saturating_sub(20);
+                self.snap_favorites_cursor_to_entry();
             },
             | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.favorites.cursor = (self.favorites.cursor + 20).min(count.saturating_sub(1));
+                self.favorites.cursor = (self.favorites.cursor + 20).min(display_len.saturating_sub(1));
+                self.snap_favorites_cursor_to_entry();
             },
             | KeyCode::Home | KeyCode::Char('g') => {
                 self.favorites.cursor = 0;
+                self.snap_favorites_cursor_to_entry();
             },
             | KeyCode::End | KeyCode::Char('G') => {
-                if count > 0 {
-                    self.favorites.cursor = count - 1;
+                if display_len > 0 {
+                    self.favorites.cursor = display_len - 1;
+                    self.snap_favorites_cursor_to_entry();
                 }
             },
             // [Enter] Open detail view for this favorite
@@ -3375,8 +3596,8 @@ impl App {
             },
             // [y] Copy resource name
             | KeyCode::Char('y') => {
-                if let Some(fav) = self.config.active_profile().favorites.get(self.favorites.cursor) {
-                    let name = fav.name.clone();
+                if let Some(idx) = self.favorites_entry_at_cursor() {
+                    let name = self.config.active_profile().favorites[idx].name.clone();
                     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&name)) {
                         | Ok(()) => {
                             self.push_status(format!("Copied '{}'", name));
@@ -3533,16 +3754,18 @@ impl App {
 
     /// Open logs for the favorite at cursor.
     fn open_favorite_logs(&mut self) {
-        let favorites = self.config.active_profile().favorites.clone();
-        if let Some(fav) = favorites.get(self.favorites.cursor) {
-            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
-                if rt.supports_logs() {
-                    self.return_panel = Some(self.panel.clone());
-                    self.panel = Panel::ResourceList(rt);
-                    self.pending_load = Some(PendingLoad::Logs {
-                        name: fav.name.clone(),
-                        namespace: fav.namespace.clone(),
-                    });
+        if let Some(idx) = self.favorites_entry_at_cursor() {
+            let favorites = self.config.active_profile().favorites.clone();
+            if let Some(fav) = favorites.get(idx) {
+                if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                    if rt.supports_logs() {
+                        self.return_panel = Some(self.panel.clone());
+                        self.panel = Panel::ResourceList(rt);
+                        self.pending_load = Some(PendingLoad::Logs {
+                            name: fav.name.clone(),
+                            namespace: fav.namespace.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -3550,26 +3773,28 @@ impl App {
 
     /// Edit the resource at the favorites cursor.
     async fn edit_favorite_at_cursor(&mut self) {
-        let favorites = self.config.active_profile().favorites.clone();
-        if let Some(fav) = favorites.get(self.favorites.cursor) {
-            if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
-                // Fetch the resource YAML
-                match self.kube.get_resource(rt, &fav.namespace, &fav.name).await {
-                    | Ok(value) => {
-                        let yaml = serde_yaml::to_string(&value).unwrap_or_default();
-                        self.return_panel = Some(self.panel.clone());
-                        self.panel = Panel::ResourceList(rt);
-                        self.pending_edit = Some(PendingEdit {
-                            resource_type: rt,
-                            name: fav.name.clone(),
-                            namespace: fav.namespace.clone(),
-                            yaml,
-                            original_yaml: None,
-                        });
-                    },
-                    | Err(e) => {
-                        self.error = Some(format!("Failed to fetch resource: {}", e));
-                    },
+        if let Some(idx) = self.favorites_entry_at_cursor() {
+            let favorites = self.config.active_profile().favorites.clone();
+            if let Some(fav) = favorites.get(idx) {
+                if let Some(rt) = ResourceType::from_singular_name(&fav.resource_type) {
+                    // Fetch the resource YAML
+                    match self.kube.get_resource(rt, &fav.namespace, &fav.name).await {
+                        | Ok(value) => {
+                            let yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                            self.return_panel = Some(self.panel.clone());
+                            self.panel = Panel::ResourceList(rt);
+                            self.pending_edit = Some(PendingEdit {
+                                resource_type: rt,
+                                name: fav.name.clone(),
+                                namespace: fav.namespace.clone(),
+                                yaml,
+                                original_yaml: None,
+                            });
+                        },
+                        | Err(e) => {
+                            self.error = Some(format!("Failed to fetch resource: {}", e));
+                        },
+                    }
                 }
             }
         }

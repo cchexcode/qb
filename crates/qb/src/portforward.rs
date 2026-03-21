@@ -69,14 +69,23 @@ pub struct PortInfo {
 }
 
 #[allow(dead_code)]
+pub struct PfResource {
+    pub r#type: String,
+    pub label: String,
+}
+
+pub struct PfPorts {
+    pub local: u16,
+    pub remote: u16,
+}
+
 pub struct PortForwardEntry {
     pub id: usize,
-    pub local_port: u16,
-    pub remote_port: u16,
+    pub port: PfPorts,
     pub pod_name: String,
     pub namespace: String,
     pub context: String,
-    pub resource_label: String,
+    pub resource: PfResource,
     pub status: PortForwardStatus,
     pub connections: usize,
     pub target: Option<PfTarget>,
@@ -127,6 +136,7 @@ impl PortForwardManager {
         namespace: String,
         pod_name: String,
         context: String,
+        resource_type: String,
         resource_label: String,
         local_port: u16,
         remote_port: u16,
@@ -140,12 +150,17 @@ impl PortForwardManager {
 
         let entry = PortForwardEntry {
             id,
-            local_port,
-            remote_port,
+            port: PfPorts {
+                local: local_port,
+                remote: remote_port,
+            },
             pod_name: pod_name.clone(),
             namespace: namespace.clone(),
             context,
-            resource_label,
+            resource: PfResource {
+                r#type: resource_type,
+                label: resource_label,
+            },
             status: PortForwardStatus::Starting,
             connections: 0,
             target: Some(target.clone()),
@@ -179,6 +194,7 @@ impl PortForwardManager {
         namespace: String,
         pod_name: String,
         context: String,
+        resource_type: String,
         resource_label: String,
         local_port: u16,
         remote_port: u16,
@@ -192,12 +208,17 @@ impl PortForwardManager {
 
         let entry = PortForwardEntry {
             id,
-            local_port,
-            remote_port,
+            port: PfPorts {
+                local: local_port,
+                remote: remote_port,
+            },
             pod_name,
             namespace,
             context,
-            resource_label,
+            resource: PfResource {
+                r#type: resource_type,
+                label: resource_label,
+            },
             status: PortForwardStatus::Paused,
             connections: 0,
             target: Some(target),
@@ -221,8 +242,8 @@ impl PortForwardManager {
             | None => return false,
         };
 
-        let local_port = entry.local_port;
-        let remote_port = entry.remote_port;
+        let local_port = entry.port.local;
+        let remote_port = entry.port.remote;
         let namespace = entry.namespace.clone();
 
         // Replace channels so the new task gets fresh ones

@@ -15,15 +15,21 @@ use {
 
 /// Tracks which pod/container subset to show.
 /// `None` means "all".
-pub struct LogViewState {
-    // Content — each line is already prefixed with [pod/container]
-    pub lines: Vec<String>,
+pub struct LogFilter {
+    pub text: String,
+    pub regex: Option<Regex>,
+    pub editing: bool,
+    pub buf: String,
+}
 
-    // Filter (regex on content)
-    pub filter_text: String,
-    pub filter_regex: Option<Regex>,
-    pub filter_editing: bool,
-    pub filter_buf: String,
+pub struct LogSelection {
+    pub pod: Option<usize>,       // None = all pods
+    pub container: Option<usize>, // None = all containers (scoped to selected pod)
+}
+
+pub struct LogViewState {
+    pub lines: Vec<String>,
+    pub filter: LogFilter,
 
     // Follow
     pub following: bool,
@@ -37,10 +43,9 @@ pub struct LogViewState {
     pub selection_anchor: Option<usize>,
     pub wrap: bool,
 
-    // Pod / container selection
+    // Pod / container
     pub pods: Vec<PodInfo>,
-    pub selected_pod: Option<usize>,       // None = all pods
-    pub selected_container: Option<usize>, // None = all containers (scoped to selected_pod if set)
+    pub selection: LogSelection,
     pub namespace: String,
 
     // Time-based filter (only fetch logs from last N seconds)
@@ -51,10 +56,12 @@ impl LogViewState {
     pub fn new(pods: Vec<PodInfo>, namespace: String, initial_lines: Vec<String>) -> Self {
         Self {
             lines: initial_lines,
-            filter_text: String::new(),
-            filter_regex: None,
-            filter_editing: false,
-            filter_buf: String::new(),
+            filter: LogFilter {
+                text: String::new(),
+                regex: None,
+                editing: false,
+                buf: String::new(),
+            },
             following: false,
             receivers: Vec::new(),
             stream_handles: Vec::new(),
@@ -64,8 +71,10 @@ impl LogViewState {
             selection_anchor: None,
             wrap: false,
             pods,
-            selected_pod: None,
-            selected_container: None,
+            selection: LogSelection {
+                pod: None,
+                container: None,
+            },
             namespace,
             since_seconds: None,
         }
@@ -76,14 +85,14 @@ impl LogViewState {
     // -----------------------------------------------------------------------
 
     pub fn pod_label(&self) -> String {
-        match self.selected_pod {
+        match self.selection.pod {
             | None => format!("All ({})", self.pods.len()),
             | Some(i) => self.pods.get(i).map(|p| p.name.clone()).unwrap_or_else(|| "?".into()),
         }
     }
 
     pub fn container_label(&self) -> String {
-        match self.selected_container {
+        match self.selection.container {
             | None => {
                 let count = self.active_containers().len();
                 format!("All ({})", count)
@@ -94,7 +103,7 @@ impl LogViewState {
 
     /// Containers available given the current pod selection.
     pub fn active_containers(&self) -> Vec<String> {
-        match self.selected_pod {
+        match self.selection.pod {
             | Some(i) => self.pods.get(i).map(|p| p.containers.clone()).unwrap_or_default(),
             | None => {
                 let mut all: Vec<String> = self.pods.iter().flat_map(|p| p.containers.clone()).collect();
@@ -108,12 +117,12 @@ impl LogViewState {
     /// Returns the list of (pod_name, container_name) pairs to fetch logs from.
     pub fn active_streams(&self) -> Vec<(String, String)> {
         let mut pairs = Vec::new();
-        let pod_iter: Vec<&PodInfo> = match self.selected_pod {
+        let pod_iter: Vec<&PodInfo> = match self.selection.pod {
             | Some(i) => self.pods.get(i).into_iter().collect(),
             | None => self.pods.iter().collect(),
         };
         for pod in pod_iter {
-            let containers: Vec<&String> = match self.selected_container {
+            let containers: Vec<&String> = match self.selection.container {
                 | Some(ci) => {
                     let active = self.active_containers();
                     let name = active.get(ci);
@@ -136,9 +145,9 @@ impl LogViewState {
     // -----------------------------------------------------------------------
 
     pub fn visible_lines(&self) -> Vec<&str> {
-        if self.filter_text.is_empty() {
+        if self.filter.text.is_empty() {
             self.lines.iter().map(|s| s.as_str()).collect()
-        } else if let Some(re) = &self.filter_regex {
+        } else if let Some(re) = &self.filter.regex {
             self.lines
                 .iter()
                 .filter(|l| re.is_match(l))
@@ -147,7 +156,7 @@ impl LogViewState {
         } else {
             self.lines
                 .iter()
-                .filter(|l| l.contains(&self.filter_text))
+                .filter(|l| l.contains(&self.filter.text))
                 .map(|s| s.as_str())
                 .collect()
         }
@@ -200,30 +209,30 @@ impl LogViewState {
     // -----------------------------------------------------------------------
 
     pub fn begin_filter_edit(&mut self) {
-        self.filter_editing = true;
-        self.filter_buf = self.filter_text.clone();
+        self.filter.editing = true;
+        self.filter.buf = self.filter.text.clone();
     }
 
     pub fn apply_filter(&mut self) {
-        self.filter_text = self.filter_buf.clone();
-        self.filter_regex = if self.filter_text.is_empty() {
+        self.filter.text = self.filter.buf.clone();
+        self.filter.regex = if self.filter.text.is_empty() {
             None
         } else {
-            Regex::new(&self.filter_text).ok()
+            Regex::new(&self.filter.text).ok()
         };
-        self.filter_editing = false;
+        self.filter.editing = false;
         self.scroll = 0;
     }
 
     pub fn cancel_filter_edit(&mut self) {
-        self.filter_editing = false;
-        self.filter_buf = self.filter_text.clone();
+        self.filter.editing = false;
+        self.filter.buf = self.filter.text.clone();
     }
 
     pub fn clear_filter(&mut self) {
-        self.filter_text.clear();
-        self.filter_regex = None;
-        self.filter_buf.clear();
+        self.filter.text.clear();
+        self.filter.regex = None;
+        self.filter.buf.clear();
         self.scroll = 0;
     }
 

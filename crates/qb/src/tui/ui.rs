@@ -630,7 +630,7 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
         Span::styled(
             format!(
                 "{:<w$}",
-                format!("{} / {}", node.cpu_allocatable, node.cpu_capacity),
+                format!("{} / {}", node.cpu.allocatable, node.cpu.capacity),
                 w = res_val_w
             ),
             val,
@@ -643,7 +643,7 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
         Span::styled(
             format!(
                 "{:<w$}",
-                format!("{} / {}", node.mem_allocatable, node.mem_capacity),
+                format!("{} / {}", node.mem.allocatable, node.mem.capacity),
                 w = res_val_w
             ),
             val,
@@ -656,7 +656,7 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
         Span::styled(
             format!(
                 "{:<w$}",
-                format!("{} / {}", node.pods_allocatable, node.pods_capacity),
+                format!("{} / {}", node.pods.allocatable, node.pods.capacity),
                 w = res_val_w
             ),
             val,
@@ -705,20 +705,20 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ── Top stat cards row ──────────────────────────────────
     let card_w = 20;
-    let node_style = if stats.nodes_not_ready > 0 {
+    let node_style = if stats.nodes.not_ready > 0 {
         bad
-    } else if stats.nodes_cordoned > 0 {
+    } else if stats.nodes.cordoned > 0 {
         Style::default().fg(Color::Yellow)
     } else {
         good
     };
-    let node_value = if stats.nodes_cordoned > 0 {
+    let node_value = if stats.nodes.cordoned > 0 {
         format!(
             "{} ready, {} cordoned / {}",
-            stats.nodes_ready, stats.nodes_cordoned, stats.node_count
+            stats.nodes.ready, stats.nodes.cordoned, stats.nodes.total
         )
     } else {
-        format!("{} ready / {}", stats.nodes_ready, stats.node_count)
+        format!("{} ready / {}", stats.nodes.ready, stats.nodes.total)
     };
     let cards: Vec<Vec<Line>> = vec![
         stat_card("K8s", &stats.server_version, value, card_w),
@@ -745,27 +745,27 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
     // ── Health warnings ─────────────────────────────────────
     {
         let mut warnings: Vec<Line> = Vec::new();
-        if stats.pods_crash_loop > 0 {
+        if stats.pods.crash_loop > 0 {
             warnings.push(Line::from(Span::styled(
-                format!("  ⚠ {} pod(s) in CrashLoopBackOff", stats.pods_crash_loop),
+                format!("  ⚠ {} pod(s) in CrashLoopBackOff", stats.pods.crash_loop),
                 Style::default().fg(Color::Red),
             )));
         }
-        if stats.pods_error > 0 {
+        if stats.pods.error > 0 {
             warnings.push(Line::from(Span::styled(
-                format!("  ⚠ {} pod(s) in error state", stats.pods_error),
+                format!("  ⚠ {} pod(s) in error state", stats.pods.error),
                 Style::default().fg(Color::Red),
             )));
         }
-        if stats.nodes_cordoned > 0 {
+        if stats.nodes.cordoned > 0 {
             warnings.push(Line::from(Span::styled(
-                format!("  ⊘ {} node(s) cordoned (scheduling disabled)", stats.nodes_cordoned),
+                format!("  ⊘ {} node(s) cordoned (scheduling disabled)", stats.nodes.cordoned),
                 Style::default().fg(Color::Yellow),
             )));
         }
-        if stats.nodes_with_pressure > 0 {
+        if stats.nodes.with_pressure > 0 {
             warnings.push(Line::from(Span::styled(
-                format!("  ⚠ {} node(s) with resource pressure", stats.nodes_with_pressure),
+                format!("  ⚠ {} node(s) with resource pressure", stats.nodes.with_pressure),
                 Style::default().fg(Color::Red),
             )));
         }
@@ -792,7 +792,7 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ── Pod breakdown with gauge bar ────────────────────────
     lines.push(Line::from(Span::styled(
-        format!(" Pods ({})", stats.pod_count),
+        format!(" Pods ({})", stats.pods.total),
         heading,
     )));
     lines.push(Line::from(Span::styled(
@@ -800,31 +800,31 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
         dim,
     )));
 
-    if stats.pod_count > 0 {
+    if stats.pods.total > 0 {
         let bar_width = 30;
 
         // Running
         let mut running_spans = vec![Span::styled(format!("  {:<12}", "Running"), label)];
-        running_spans.extend(gauge_bar(stats.pods_running, stats.pod_count, bar_width));
+        running_spans.extend(gauge_bar(stats.pods.running, stats.pods.total, bar_width));
         running_spans.push(Span::styled(
-            format!("  {}/{}", stats.pods_running, stats.pod_count),
+            format!("  {}/{}", stats.pods.running, stats.pods.total),
             dim,
         ));
         lines.push(Line::from(running_spans));
 
         // Pending
-        if stats.pods_pending > 0 {
+        if stats.pods.pending > 0 {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:<12}", "Pending"), label),
-                Span::styled(format!("{}", stats.pods_pending), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{}", stats.pods.pending), Style::default().fg(Color::Yellow)),
             ]));
         }
 
         // Failed
-        if stats.pods_failed > 0 {
+        if stats.pods.failed > 0 {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:<12}", "Failed"), label),
-                Span::styled(format!("{}", stats.pods_failed), bad),
+                Span::styled(format!("{}", stats.pods.failed), bad),
             ]));
         }
     } else {
@@ -833,9 +833,9 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::from(""));
 
     // ── Node grid ─────────────────────────────────────────
-    if !stats.nodes.is_empty() {
+    if !stats.node_list.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!(" Nodes ({})", stats.nodes.len()),
+            format!(" Nodes ({})", stats.node_list.len()),
             heading,
         )));
         lines.push(Line::from(Span::styled(
@@ -849,7 +849,7 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
         let avail_w = area.width.saturating_sub(3) as usize; // inner width minus border + pad
         let cols = ((avail_w + gap) / (node_card_w + gap)).max(1);
         let node_cards: Vec<Vec<Vec<Span>>> = stats
-            .nodes
+            .node_list
             .iter()
             .map(|node| build_node_card(node, node_card_w))
             .collect();
@@ -1449,7 +1449,7 @@ fn render_logs(f: &mut Frame, app: &mut App) {
     };
 
     // Layout: breadcrumb + log status + log content + filter bar + hotkey bar
-    let has_filter_bar = state.filter_editing || !state.filter_text.is_empty();
+    let has_filter_bar = state.filter.editing || !state.filter.text.is_empty();
     let filter_height = if has_filter_bar { 1 } else { 0 };
 
     let outer = Layout::default()
@@ -1563,7 +1563,7 @@ fn render_logs(f: &mut Frame, app: &mut App) {
             };
             // Highlight filter matches
             if !is_cursor && !is_in_selection {
-                if let Some(re) = &state.filter_regex {
+                if let Some(re) = &state.filter.regex {
                     if let Some(m) = re.find(l) {
                         return Line::from(vec![
                             Span::styled(&l[..m.start()], Style::default().fg(Color::White)),
@@ -1601,12 +1601,12 @@ fn render_logs(f: &mut Frame, app: &mut App) {
 
     // Filter bar
     if has_filter_bar {
-        let filter_display = if state.filter_editing {
-            format!(" /{}▏", state.filter_buf)
+        let filter_display = if state.filter.editing {
+            format!(" /{}▏", state.filter.buf)
         } else {
-            format!(" /{}/", state.filter_text)
+            format!(" /{}/", state.filter.text)
         };
-        let filter_style = if state.filter_editing {
+        let filter_style = if state.filter.editing {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)
@@ -1854,79 +1854,79 @@ fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    use crate::tui::app::DisplayItem;
+
+    let display = app.favorites_display_items();
+
     // Sync table state with cursor
-    app.favorites.table_state.select(if favorites.is_empty() {
+    app.favorites.table_state.select(if display.is_empty() {
         None
     } else {
         Some(app.favorites.cursor)
     });
 
-    let header = Row::new(vec!["TYPE", "NAME", "NAMESPACE", "CONTEXT"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-        .bottom_margin(0);
-
     let current_context = app.kube.context.name.as_str().to_string();
     let available_contexts = app.kube.contexts();
 
-    let rows: Vec<Row> = favorites
+    let rows: Vec<Row> = display
         .iter()
-        .map(|fav| {
-            let missing = !available_contexts.iter().any(|c| c == &fav.context);
-            let is_diff_marked = app
-                .diff_mark
-                .as_ref()
-                .map(|(n, ns, _)| n == &fav.name && ns == &fav.namespace)
-                .unwrap_or(false);
+        .map(|item| {
+            match item {
+                | DisplayItem::Header(label) => {
+                    Row::new(vec![Cell::from(Span::styled(
+                        format!("  {}", label),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                    ))])
+                },
+                | DisplayItem::Entry(idx) => {
+                    let fav = &favorites[*idx];
+                    let missing = !available_contexts.iter().any(|c| c == &fav.context);
+                    let is_diff_marked = app
+                        .diff_mark
+                        .as_ref()
+                        .map(|(n, ns, _)| n == &fav.name && ns == &fav.namespace)
+                        .unwrap_or(false);
 
-            let type_label = crate::k8s::ResourceType::from_singular_name(&fav.resource_type)
-                .map(|rt| rt.display_name())
-                .unwrap_or(&fav.resource_type);
+                    let name_cell = if is_diff_marked {
+                        Cell::from(Span::styled(
+                            format!("* {}", fav.name),
+                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                        ))
+                    } else {
+                        let name_style = if missing {
+                            Style::default().fg(Color::DarkGray)
+                        } else if fav.context == current_context {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default()
+                        };
+                        let name_prefix = if missing { "⚠ " } else { "★ " };
+                        Cell::from(Span::styled(format!("{}{}", name_prefix, fav.name), name_style))
+                    };
 
-            let name_cell = if is_diff_marked {
-                Cell::from(Span::styled(
-                    format!("* {}", fav.name),
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                let name_style = if missing {
-                    Style::default().fg(Color::DarkGray)
-                } else if fav.context == current_context {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default()
-                };
-                let name_prefix = if missing { "⚠ " } else { "★ " };
-                Cell::from(Span::styled(format!("{}{}", name_prefix, fav.name), name_style))
-            };
-
-            Row::new(vec![
-                Cell::from(type_label),
-                name_cell,
-                Cell::from(fav.namespace.as_str()),
-                Cell::from(if missing {
-                    Span::styled(format!("{} (missing)", fav.context), Style::default().fg(Color::Red))
-                } else {
-                    Span::raw(fav.context.as_str())
-                }),
-            ])
+                    Row::new(vec![
+                        name_cell,
+                        Cell::from(fav.namespace.as_str()),
+                        Cell::from(if missing {
+                            Span::styled(format!("{} (missing)", fav.context), Style::default().fg(Color::Red))
+                        } else {
+                            Span::raw(fav.context.as_str())
+                        }),
+                    ])
+                },
+            }
         })
         .collect();
 
-    let table = Table::new(rows, [
-        Constraint::Length(18),
-        Constraint::Min(20),
-        Constraint::Length(18),
-        Constraint::Min(14),
-    ])
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-            .title(format!(" ★ Favorites ({}) ", favorites.len())),
-    )
-    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Yellow))
-    .highlight_symbol("▶ ");
+    let table = Table::new(rows, [Constraint::Min(20), Constraint::Length(18), Constraint::Min(14)])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(format!(" ★ Favorites ({}) ", favorites.len())),
+        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Yellow))
+        .highlight_symbol("▶ ");
 
     f.render_stateful_widget(table, area, &mut app.favorites.table_state);
 }
@@ -1959,43 +1959,51 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    use crate::tui::app::DisplayItem;
+
+    let display = app.pf_display_items();
+
     // Sync table state with cursor
     app.pf
         .table_state
-        .select(if entries.is_empty() { None } else { Some(app.pf.cursor) });
+        .select(if display.is_empty() { None } else { Some(app.pf.cursor) });
 
-    // Build table rows
-    let header = Row::new(vec!["STATUS", "LOCAL", "REMOTE", "CLUSTER", "RESOURCE", "POD", "CONNS"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-        .bottom_margin(0);
-
-    let rows: Vec<Row> = entries
+    let rows: Vec<Row> = display
         .iter()
-        .map(|entry| {
-            let status_style = match &entry.status {
-                | PortForwardStatus::Active => Style::default().fg(Color::Green),
-                | PortForwardStatus::Paused => Style::default().fg(Color::Yellow),
-                | PortForwardStatus::Reconnecting { .. } => Style::default().fg(Color::Yellow),
-                | PortForwardStatus::Error(_) => Style::default().fg(Color::Red),
-                | PortForwardStatus::Starting => Style::default().fg(Color::Cyan),
-                | PortForwardStatus::Cancelled => Style::default().fg(Color::DarkGray),
-            };
-
-            let status_text = match &entry.status {
-                | PortForwardStatus::Reconnecting { attempt } => format!("Retry({})", attempt),
-                | PortForwardStatus::Error(msg) => msg.clone(),
-                | other => other.display().to_string(),
-            };
-
-            Row::new(vec![
-                Cell::from(Span::styled(status_text, status_style)),
-                Cell::from(format!(":{}", entry.local_port)),
-                Cell::from(format!(":{}", entry.remote_port)),
-                Cell::from(entry.context.as_str()),
-                Cell::from(entry.resource_label.as_str()),
-                Cell::from(entry.pod_name.as_str()),
-                Cell::from(entry.connections.to_string()),
-            ])
+        .map(|item| {
+            match item {
+                | DisplayItem::Header(label) => {
+                    Row::new(vec![Cell::from(Span::styled(
+                        format!("  {}", label),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                    ))])
+                },
+                | DisplayItem::Entry(idx) => {
+                    let entry = &entries[*idx];
+                    let status_style = match &entry.status {
+                        | PortForwardStatus::Active => Style::default().fg(Color::Green),
+                        | PortForwardStatus::Paused => Style::default().fg(Color::Yellow),
+                        | PortForwardStatus::Reconnecting { .. } => Style::default().fg(Color::Yellow),
+                        | PortForwardStatus::Error(_) => Style::default().fg(Color::Red),
+                        | PortForwardStatus::Starting => Style::default().fg(Color::Cyan),
+                        | PortForwardStatus::Cancelled => Style::default().fg(Color::DarkGray),
+                    };
+                    let status_text = match &entry.status {
+                        | PortForwardStatus::Reconnecting { attempt } => format!("Retry({})", attempt),
+                        | PortForwardStatus::Error(msg) => msg.clone(),
+                        | other => other.display().to_string(),
+                    };
+                    Row::new(vec![
+                        Cell::from(Span::styled(status_text, status_style)),
+                        Cell::from(format!(":{}", entry.port.local)),
+                        Cell::from(format!(":{}", entry.port.remote)),
+                        Cell::from(entry.context.as_str()),
+                        Cell::from(entry.resource.label.as_str()),
+                        Cell::from(entry.pod_name.as_str()),
+                        Cell::from(entry.connections.to_string()),
+                    ])
+                },
+            }
         })
         .collect();
 
@@ -2008,7 +2016,6 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Min(18),
         Constraint::Length(6),
     ])
-    .header(header)
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
     .block(
         Block::default()
