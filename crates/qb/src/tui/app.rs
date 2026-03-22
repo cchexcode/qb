@@ -4197,6 +4197,10 @@ impl App {
             }
         }
 
+        // Re-discover CRDs for the (potentially different) cluster
+        self.discovered_crds.clear();
+        self.pending_load = Some(PendingLoad::DiscoverCrds);
+
         // Restore port forwards from the new profile
         self.restore_saved_port_forwards();
 
@@ -5114,7 +5118,8 @@ impl App {
                         self.panel = Panel::Overview;
                         self.resources.counts.clear();
                         self.overview.scroll = 0;
-                        self.pending_load = Some(PendingLoad::ClusterStats);
+                        self.discovered_crds.clear();
+                        self.pending_load = Some(PendingLoad::DiscoverCrds);
                         self.error = None;
                         self.push_status("Kubeconfig loaded");
                         // Re-select overview
