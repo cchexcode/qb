@@ -10,6 +10,7 @@ use {
         },
         k8s::{
             ClusterStatsData,
+            CrdInfo,
             KubeClient,
             RelatedEvent,
             ResourceEntry,
@@ -61,6 +62,7 @@ pub enum Panel {
     PortForwards,
     Profiles,
     ResourceList(ResourceType),
+    CustomResourceList(CrdInfo),
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +84,7 @@ pub enum DiffMode {
 
 pub struct EditContext {
     pub resource_type: ResourceType,
+    pub crd_info: Option<CrdInfo>,
     pub name: String,
     pub namespace: String,
     #[allow(dead_code)]
@@ -97,6 +100,7 @@ pub struct EditContext {
 /// $EDITOR.
 pub struct PendingEdit {
     pub resource_type: ResourceType,
+    pub crd_info: Option<CrdInfo>,
     pub name: String,
     pub namespace: String,
     pub yaml: String,
@@ -109,6 +113,7 @@ pub struct PendingEdit {
 pub struct PendingMetadataEdit {
     pub kind: MetadataEditKind,
     pub resource_type: ResourceType,
+    pub crd_info: Option<CrdInfo>,
     pub name: String,
     pub namespace: String,
     pub yaml: String,
@@ -178,6 +183,7 @@ pub enum Popup {
         name: String,
         namespace: String,
         resource_type: ResourceType,
+        crd_info: Option<CrdInfo>,
     },
     ConfirmDrain {
         node_name: String,
@@ -245,12 +251,15 @@ pub struct PfCreateDialog {
 
 pub enum PendingLoad {
     Resources,
+    CustomResources,
     Namespaces,
     SwitchContext(String),
     ResourceDetail { name: String, namespace: String },
+    CustomResourceDetail { name: String, namespace: String },
     Logs { name: String, namespace: String },
     ReloadLogs,
     ClusterStats,
+    DiscoverCrds,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +273,9 @@ pub struct NavItem {
 
 pub enum NavItemKind {
     Category,
+    SubCategory,
     Resource(ResourceType),
+    CustomResource(CrdInfo),
     ClusterStats,
     PortForwards,
     Favorites,
@@ -419,11 +430,13 @@ pub struct App {
     pub config: QbConfig,
     pub favorites: FavoritesView,
     pub profiles: ProfilesView,
+    pub discovered_crds: Vec<CrdInfo>,
+    pub nav_width: u16,
 }
 
 impl App {
     pub fn new(kube: KubeClient, experimental: bool, config: QbConfig) -> Self {
-        let nav_items = Self::build_nav_items();
+        let nav_items = Self::build_nav_items(&[]);
         let mut nav_state = ListState::default();
         // Select first selectable item (skip Category headers)
         let first_selectable = nav_items
@@ -499,7 +512,7 @@ impl App {
             status: String::new(),
             status_history: Vec::new(),
             error: None,
-            pending_load: Some(PendingLoad::ClusterStats),
+            pending_load: Some(PendingLoad::DiscoverCrds),
             last_refresh: std::time::Instant::now(),
             diff_mark: None,
             palette: None,
@@ -518,6 +531,8 @@ impl App {
                 cursor: 0,
                 table_state: TableState::default(),
             },
+            discovered_crds: Vec::new(),
+            nav_width: 26,
         };
         app.config.active_profile_mut().kubeconfig = app.kube.kubeconfig.path.clone();
         let _ = app.config.save();
@@ -598,7 +613,7 @@ impl App {
                     | Panel::PortForwards => Ctx::PortForwards,
                     | Panel::Profiles => Ctx::Profiles,
                     | Panel::ResourceList(rt) if *rt == ResourceType::Event => Ctx::Events,
-                    | Panel::ResourceList(_) => Ctx::Resources,
+                    | Panel::ResourceList(_) | Panel::CustomResourceList(_) => Ctx::Resources,
                 }
             },
         }
@@ -664,7 +679,7 @@ impl App {
         }
     }
 
-    fn build_nav_items() -> Vec<NavItem> {
+    fn build_nav_items(crds: &[CrdInfo]) -> Vec<NavItem> {
         let mut items = Vec::new();
 
         // Global items at the top
@@ -699,7 +714,57 @@ impl App {
             }
         }
 
+        // Custom Resources (discovered CRDs), grouped by API group domain
+        if !crds.is_empty() {
+            items.push(NavItem {
+                label: "CUSTOM RESOURCES".to_string(),
+                kind: NavItemKind::Category,
+            });
+            let mut by_group: std::collections::BTreeMap<&str, Vec<&CrdInfo>> = std::collections::BTreeMap::new();
+            for crd in crds {
+                by_group.entry(crd.group.as_str()).or_default().push(crd);
+            }
+            for (group, group_crds) in &by_group {
+                items.push(NavItem {
+                    label: format!("  {}", group),
+                    kind: NavItemKind::SubCategory,
+                });
+                for crd in group_crds {
+                    items.push(NavItem {
+                        label: format!("   {}", crd.display_name),
+                        kind: NavItemKind::CustomResource((*crd).clone()),
+                    });
+                }
+            }
+        }
+
         items
+    }
+
+    fn rebuild_nav(&mut self) {
+        // Preserve current selection across rebuild
+        let prev_label = self
+            .nav
+            .state
+            .selected()
+            .and_then(|i| self.nav.items.get(i))
+            .map(|item| item.label.clone());
+        self.nav.items = Self::build_nav_items(&self.discovered_crds);
+        // Try to restore selection by label
+        if let Some(label) = prev_label {
+            if let Some(pos) = self.nav.items.iter().position(|item| item.label == label) {
+                self.nav.state.select(Some(pos));
+                return;
+            }
+        }
+        // Fallback: select first selectable
+        let first = self
+            .nav
+            .items
+            .iter()
+            .position(|item| Self::is_selectable_nav(&item.kind))
+            .unwrap_or(0);
+        self.nav.state.select(Some(first));
     }
 
     fn update_status(&mut self) {
@@ -707,8 +772,9 @@ impl App {
         let ns = self.kube.context.namespace.as_deref().unwrap_or("All Namespaces");
         let rt_name = self
             .selected_resource_type()
-            .map(|r| r.display_name())
-            .unwrap_or("None");
+            .map(|r| r.display_name().to_string())
+            .or_else(|| self.selected_crd_info().map(|c| c.display_name.clone()))
+            .unwrap_or_else(|| "None".to_string());
         let count = self.resources.entries.len();
         self.status = format!("ctx: {} | ns: {} | {}: {}", ctx, ns, rt_name, count);
     }
@@ -741,6 +807,13 @@ impl App {
     pub fn selected_resource_type(&self) -> Option<ResourceType> {
         match &self.panel {
             | Panel::ResourceList(rt) => Some(*rt),
+            | _ => None,
+        }
+    }
+
+    pub fn selected_crd_info(&self) -> Option<&CrdInfo> {
+        match &self.panel {
+            | Panel::CustomResourceList(crd) => Some(crd),
             | _ => None,
         }
     }
@@ -842,12 +915,17 @@ impl App {
         if let Some(load) = self.pending_load.take() {
             match load {
                 | PendingLoad::Resources => self.load_resources().await,
+                | PendingLoad::CustomResources => self.load_custom_resources().await,
                 | PendingLoad::Namespaces => self.load_namespaces().await,
                 | PendingLoad::SwitchContext(ctx) => self.do_switch_context(&ctx).await,
                 | PendingLoad::ResourceDetail { name, namespace } => self.load_resource_detail(&namespace, &name).await,
+                | PendingLoad::CustomResourceDetail { name, namespace } => {
+                    self.load_custom_resource_detail(&namespace, &name).await
+                },
                 | PendingLoad::Logs { name, namespace } => self.load_logs(&namespace, &name).await,
                 | PendingLoad::ReloadLogs => self.reload_logs().await,
                 | PendingLoad::ClusterStats => self.load_cluster_stats().await,
+                | PendingLoad::DiscoverCrds => self.discover_crds().await,
             }
         }
     }
@@ -919,6 +997,105 @@ impl App {
         }
     }
 
+    async fn discover_crds(&mut self) {
+        match self.kube.discover_crds().await {
+            | Ok(crds) => {
+                self.discovered_crds = crds;
+                self.rebuild_nav();
+            },
+            | Err(_) => {
+                // Non-critical — user may lack permission to list CRDs
+            },
+        }
+        // Chain to load the current panel after discovery
+        match &self.panel {
+            | Panel::Overview => {
+                self.pending_load = Some(PendingLoad::ClusterStats);
+            },
+            | Panel::ResourceList(_) => {
+                self.pending_load = Some(PendingLoad::Resources);
+            },
+            | Panel::CustomResourceList(_) => {
+                self.pending_load = Some(PendingLoad::CustomResources);
+            },
+            | _ => {},
+        }
+    }
+
+    async fn load_custom_resources(&mut self) {
+        let crd = match &self.panel {
+            | Panel::CustomResourceList(crd) => crd.clone(),
+            | _ => return,
+        };
+        let prev_selected = self
+            .resources
+            .state
+            .selected()
+            .and_then(|idx| self.resources.entries.get(idx))
+            .map(|e| (e.name.clone(), e.namespace.clone()));
+
+        match self.kube.list_custom_resources(&crd).await {
+            | Ok(entries) => {
+                self.resources.entries = entries;
+                let new_idx = prev_selected
+                    .and_then(|(name, ns)| {
+                        self.resources
+                            .entries
+                            .iter()
+                            .position(|e| e.name == name && e.namespace == ns)
+                    })
+                    .or_else(|| {
+                        if self.resources.entries.is_empty() {
+                            None
+                        } else {
+                            let prev_idx = self.resources.state.selected().unwrap_or(0);
+                            Some(prev_idx.min(self.resources.entries.len() - 1))
+                        }
+                    });
+                self.resources.state.select(new_idx);
+                self.error = None;
+            },
+            | Err(e) => {
+                self.resources.entries.clear();
+                self.resources.state.select(None);
+                self.error = Some(format!("Failed to load {}: {}", crd.display_name, e));
+            },
+        }
+        self.last_refresh = std::time::Instant::now();
+    }
+
+    async fn load_custom_resource_detail(&mut self, ns: &str, name: &str) {
+        let crd = match &self.panel {
+            | Panel::CustomResourceList(crd) => crd.clone(),
+            | _ => return,
+        };
+        match self.kube.get_custom_resource(&crd, ns, name).await {
+            | Ok(value) => {
+                self.detail.yaml = serde_yaml::to_string(&value).unwrap_or_default();
+                let is_same_resource = self.detail.name == name && self.detail.namespace == ns;
+                self.detail.secret = None;
+                self.detail.value = value;
+                self.detail.name = name.to_string();
+                self.detail.namespace = ns.to_string();
+                if !self.detail.auto_refresh || !is_same_resource {
+                    self.detail.scroll = 0;
+                    self.detail.mode = DetailMode::Smart;
+                    self.detail.dict.expanded_keys.clear();
+                    self.detail.dict.entries.clear();
+                    self.detail.dict.cursor = None;
+                    self.detail.dict.line_offsets.clear();
+                }
+                self.view = View::Detail;
+                self.error = None;
+                self.detail.related.events = self.kube.fetch_related_events(ns, name).await.unwrap_or_default();
+                self.detail.related.resources.clear();
+            },
+            | Err(e) => {
+                self.error = Some(format!("Failed to load {}: {}", name, e));
+            },
+        }
+    }
+
     pub fn maybe_auto_refresh(&mut self) {
         if self.paused {
             return;
@@ -935,6 +1112,9 @@ impl App {
                 | Panel::ResourceList(_) => {
                     self.pending_load = Some(PendingLoad::Resources);
                 },
+                | Panel::CustomResourceList(_) => {
+                    self.pending_load = Some(PendingLoad::CustomResources);
+                },
                 | _ => {},
             }
         }
@@ -946,10 +1126,17 @@ impl App {
             && self.last_refresh.elapsed() >= std::time::Duration::from_secs(2)
         {
             if !self.detail.name.is_empty() {
-                self.pending_load = Some(PendingLoad::ResourceDetail {
-                    name: self.detail.name.clone(),
-                    namespace: self.detail.namespace.clone(),
-                });
+                if self.selected_crd_info().is_some() {
+                    self.pending_load = Some(PendingLoad::CustomResourceDetail {
+                        name: self.detail.name.clone(),
+                        namespace: self.detail.namespace.clone(),
+                    });
+                } else {
+                    self.pending_load = Some(PendingLoad::ResourceDetail {
+                        name: self.detail.name.clone(),
+                        namespace: self.detail.namespace.clone(),
+                    });
+                }
                 self.last_refresh = std::time::Instant::now();
             }
         }
@@ -984,7 +1171,8 @@ impl App {
         match self.kube.switch_context(ctx).await {
             | Ok(()) => {
                 self.clear_cached_state();
-                self.pending_load = Some(PendingLoad::Resources);
+                self.discovered_crds.clear();
+                self.pending_load = Some(PendingLoad::DiscoverCrds);
                 self.error = None;
                 // Persist selected context
                 self.config.active_profile_mut().context = Some(ctx.to_string());
@@ -1219,6 +1407,19 @@ impl App {
             return;
         }
 
+        // Sidebar width: < shrink, > grow
+        match key.code {
+            | KeyCode::Char('<') => {
+                self.nav_width = self.nav_width.saturating_sub(2).max(16);
+                return;
+            },
+            | KeyCode::Char('>') => {
+                self.nav_width = (self.nav_width + 2).min(60);
+                return;
+            },
+            | _ => {},
+        }
+
         match key.code {
             | KeyCode::Char('q') => {
                 self.open_confirm_quit();
@@ -1360,7 +1561,16 @@ impl App {
                     self.pending_load = Some(PendingLoad::Resources);
                 }
             },
-            | NavItemKind::Category => {},
+            | NavItemKind::CustomResource(crd) => {
+                let crd = crd.clone();
+                if !matches!(&self.panel, Panel::CustomResourceList(c) if *c == crd) {
+                    self.panel = Panel::CustomResourceList(crd);
+                    self.resources.table_state = TableState::default();
+                    self.clear_resource_filter();
+                    self.pending_load = Some(PendingLoad::CustomResources);
+                }
+            },
+            | NavItemKind::Category | NavItemKind::SubCategory => {},
         }
     }
 
@@ -1368,6 +1578,7 @@ impl App {
         matches!(
             kind,
             NavItemKind::Resource(_)
+                | NavItemKind::CustomResource(_)
                 | NavItemKind::ClusterStats
                 | NavItemKind::PortForwards
                 | NavItemKind::Favorites
@@ -1450,7 +1661,7 @@ impl App {
                 self.handle_events_key(key);
                 return;
             },
-            | Panel::ResourceList(_) => {
+            | Panel::ResourceList(_) | Panel::CustomResourceList(_) => {
                 // fall through to normal resource handling below
             },
         }
@@ -1479,10 +1690,17 @@ impl App {
                 if let Some(&real_idx) = visible.get(vis_pos) {
                     if let Some(entry) = self.resources.entries.get(real_idx) {
                         self.resources.state.select(Some(real_idx));
-                        self.pending_load = Some(PendingLoad::ResourceDetail {
-                            name: entry.name.clone(),
-                            namespace: entry.namespace.clone(),
-                        });
+                        if self.selected_crd_info().is_some() {
+                            self.pending_load = Some(PendingLoad::CustomResourceDetail {
+                                name: entry.name.clone(),
+                                namespace: entry.namespace.clone(),
+                            });
+                        } else {
+                            self.pending_load = Some(PendingLoad::ResourceDetail {
+                                name: entry.name.clone(),
+                                namespace: entry.namespace.clone(),
+                            });
+                        }
                     }
                 }
             },
@@ -3346,28 +3564,28 @@ impl App {
 
     /// Toggle favorite for the currently selected resource.
     fn toggle_favorite_selected(&mut self) {
-        let rt = match self.selected_resource_type() {
-            | Some(rt) => rt,
-            | None => return,
+        let type_key = if let Some(rt) = self.selected_resource_type() {
+            rt.singular_name().to_string()
+        } else if let Some(crd) = self.selected_crd_info() {
+            format!("cr:{}/{}", crd.group, crd.plural)
+        } else {
+            return;
         };
         let (name, namespace) = self.selected_resource_name_ns();
         if name.is_empty() {
             return;
         }
         let context = self.kube.context.name.as_str().to_string();
-        let added = self.config.active_profile_mut().toggle_favorite(
-            rt.singular_name().to_string(),
-            name.clone(),
-            namespace,
-            context,
-        );
+        let added = self
+            .config
+            .active_profile_mut()
+            .toggle_favorite(type_key, name.clone(), namespace, context);
 
         if added {
             self.push_status(format!("★ Favorited '{}'", name));
         } else {
             self.push_status(format!("☆ Unfavorited '{}'", name));
         }
-        // Auto-save
         if let Err(e) = self.config.save() {
             self.error = Some(format!("Failed to save config: {}", e));
         }
@@ -3375,9 +3593,12 @@ impl App {
 
     /// Toggle favorite for the resource in detail view.
     fn toggle_favorite_detail(&mut self) {
-        let rt = match self.selected_resource_type() {
-            | Some(rt) => rt,
-            | None => return,
+        let type_key = if let Some(rt) = self.selected_resource_type() {
+            rt.singular_name().to_string()
+        } else if let Some(crd) = self.selected_crd_info() {
+            format!("cr:{}/{}", crd.group, crd.plural)
+        } else {
+            return;
         };
         let name = self.detail.name.clone();
         let namespace = self.detail.namespace.clone();
@@ -3385,19 +3606,16 @@ impl App {
             return;
         }
         let context = self.kube.context.name.as_str().to_string();
-        let added = self.config.active_profile_mut().toggle_favorite(
-            rt.singular_name().to_string(),
-            name.clone(),
-            namespace,
-            context,
-        );
+        let added = self
+            .config
+            .active_profile_mut()
+            .toggle_favorite(type_key, name.clone(), namespace, context);
 
         if added {
             self.push_status(format!("★ Favorited '{}'", name));
         } else {
             self.push_status(format!("☆ Unfavorited '{}'", name));
         }
-        // Auto-save
         if let Err(e) = self.config.save() {
             self.error = Some(format!("Failed to save config: {}", e));
         }
@@ -3654,6 +3872,7 @@ impl App {
                         name,
                         namespace,
                         resource_type: rt,
+                        crd_info: None,
                     });
                 }
             },
@@ -3713,6 +3932,7 @@ impl App {
                                 let diff_lines = compute_diff(&mark_yaml, &yaml);
                                 self.edit_ctx = Some(EditContext {
                                     resource_type: rt,
+                                    crd_info: None,
                                     name: format!("{} vs {}", mark_name, name),
                                     namespace: namespace.clone(),
                                     original_yaml: mark_yaml,
@@ -3785,6 +4005,7 @@ impl App {
                             self.panel = Panel::ResourceList(rt);
                             self.pending_edit = Some(PendingEdit {
                                 resource_type: rt,
+                                crd_info: None,
                                 name: fav.name.clone(),
                                 namespace: fav.namespace.clone(),
                                 yaml,
@@ -4101,9 +4322,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     async fn handle_diff_mark(&mut self) {
-        let rt = match self.selected_resource_type() {
-            | Some(rt) => rt,
-            | None => return,
+        let (rt, crd) = if let Some(rt) = self.selected_resource_type() {
+            (rt, None)
+        } else if let Some(crd) = self.selected_crd_info() {
+            (ResourceType::CustomResourceDefinition, Some(crd.clone()))
+        } else {
+            return;
         };
         let visible = self.visible_resource_indices();
         let vis_pos = self
@@ -4119,14 +4343,21 @@ impl App {
         let name = entry.name.clone();
         let namespace = entry.namespace.clone();
 
+        let fetch_result = if let Some(crd) = &crd {
+            self.kube.get_custom_resource(crd, &namespace, &name).await
+        } else {
+            self.kube.get_resource(rt, &namespace, &name).await
+        };
+
         if let Some((mark_name, _mark_ns, mark_yaml)) = self.diff_mark.take() {
             // Second resource selected - fetch its YAML and show diff
-            match self.kube.get_resource(rt, &namespace, &name).await {
+            match fetch_result {
                 | Ok(value) => {
                     let yaml = serde_yaml::to_string(&value).unwrap_or_default();
                     let diff_lines = compute_diff(&mark_yaml, &yaml);
                     self.edit_ctx = Some(EditContext {
                         resource_type: rt,
+                        crd_info: crd,
                         name: format!("{} vs {}", mark_name, name),
                         namespace: namespace.clone(),
                         original_yaml: mark_yaml,
@@ -4145,7 +4376,7 @@ impl App {
             }
         } else {
             // First resource - mark it
-            match self.kube.get_resource(rt, &namespace, &name).await {
+            match fetch_result {
                 | Ok(value) => {
                     let yaml = serde_yaml::to_string(&value).unwrap_or_default();
                     self.diff_mark = Some((name.clone(), namespace, yaml));
@@ -4603,9 +4834,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn open_delete_confirm(&mut self) {
-        let rt = match self.selected_resource_type() {
-            | Some(rt) => rt,
-            | None => return,
+        let (rt, crd) = if let Some(rt) = self.selected_resource_type() {
+            (rt, None)
+        } else if let Some(crd) = self.selected_crd_info() {
+            (ResourceType::CustomResourceDefinition, Some(crd.clone()))
+        } else {
+            return;
         };
         let visible = self.visible_resource_indices();
         let vis_pos = self
@@ -4622,13 +4856,17 @@ impl App {
             name: entry.name.clone(),
             namespace: entry.namespace.clone(),
             resource_type: rt,
+            crd_info: crd,
         });
     }
 
     fn open_delete_confirm_detail(&mut self) {
-        let rt = match self.selected_resource_type() {
-            | Some(rt) => rt,
-            | None => return,
+        let (rt, crd) = if let Some(rt) = self.selected_resource_type() {
+            (rt, None)
+        } else if let Some(crd) = self.selected_crd_info() {
+            (ResourceType::CustomResourceDefinition, Some(crd.clone()))
+        } else {
+            return;
         };
         if self.detail.name.is_empty() {
             return;
@@ -4637,30 +4875,45 @@ impl App {
             name: self.detail.name.clone(),
             namespace: self.detail.namespace.clone(),
             resource_type: rt,
+            crd_info: crd,
         });
     }
 
     async fn handle_confirm_delete_key(&mut self, key: KeyEvent) {
         match key.code {
             | KeyCode::Enter | KeyCode::Char('y') => {
-                let (name, namespace, rt) = match &self.popup {
+                let (name, namespace, rt, crd) = match &self.popup {
                     | Some(Popup::ConfirmDelete {
                         name,
                         namespace,
                         resource_type,
-                    }) => (name.clone(), namespace.clone(), *resource_type),
+                        crd_info,
+                    }) => (name.clone(), namespace.clone(), *resource_type, crd_info.clone()),
                     | _ => return,
                 };
                 self.popup = None;
-                match self.kube.delete_resource(rt, &namespace, &name).await {
+                let result = if let Some(crd) = &crd {
+                    self.kube.delete_custom_resource(crd, &namespace, &name).await
+                } else {
+                    self.kube.delete_resource(rt, &namespace, &name).await
+                };
+                let display = crd
+                    .as_ref()
+                    .map(|c| c.kind.as_str())
+                    .unwrap_or_else(|| rt.display_name());
+                match result {
                     | Ok(()) => {
-                        self.push_status(format!("Deleted {}/{}", rt.display_name(), name));
+                        self.push_status(format!("Deleted {}/{}", display, name));
                         self.error = None;
                         if self.view == View::Detail {
                             self.return_to_main();
                         }
                         if !matches!(self.panel, Panel::Favorites) {
-                            self.pending_load = Some(PendingLoad::Resources);
+                            if crd.is_some() {
+                                self.pending_load = Some(PendingLoad::CustomResources);
+                            } else {
+                                self.pending_load = Some(PendingLoad::Resources);
+                            }
                         }
                     },
                     | Err(e) => {
@@ -5057,9 +5310,12 @@ impl App {
     /// Start edit from the resource list view: fetch YAML for the selected
     /// resource.
     async fn start_edit_from_list(&mut self) {
-        let rt = match self.selected_resource_type() {
-            | Some(rt) => rt,
-            | None => return,
+        let (rt, crd) = if let Some(rt) = self.selected_resource_type() {
+            (rt, None)
+        } else if let Some(crd) = self.selected_crd_info() {
+            (ResourceType::CustomResourceDefinition, Some(crd.clone()))
+        } else {
+            return;
         };
         // Resolve the selected resource
         let visible = self.visible_resource_indices();
@@ -5077,11 +5333,17 @@ impl App {
         let namespace = entry.namespace.clone();
 
         // Fetch the resource YAML
-        match self.kube.get_resource(rt, &namespace, &name).await {
+        let result = if let Some(crd) = &crd {
+            self.kube.get_custom_resource(crd, &namespace, &name).await
+        } else {
+            self.kube.get_resource(rt, &namespace, &name).await
+        };
+        match result {
             | Ok(value) => {
                 let yaml = serde_yaml::to_string(&value).unwrap_or_default();
                 self.pending_edit = Some(PendingEdit {
                     resource_type: rt,
+                    crd_info: crd,
                     name,
                     namespace,
                     yaml,
@@ -5096,12 +5358,16 @@ impl App {
 
     /// Start edit from the detail view: use the already-loaded YAML.
     fn start_edit_from_detail(&mut self) {
-        let rt = match self.selected_resource_type() {
-            | Some(rt) => rt,
-            | None => return,
+        let (rt, crd) = if let Some(rt) = self.selected_resource_type() {
+            (rt, None)
+        } else if let Some(crd) = self.selected_crd_info() {
+            (ResourceType::CustomResourceDefinition, Some(crd.clone()))
+        } else {
+            return;
         };
         self.pending_edit = Some(PendingEdit {
             resource_type: rt,
+            crd_info: crd,
             name: self.detail.name.clone(),
             namespace: self.detail.namespace.clone(),
             yaml: self.detail.yaml.clone(),
@@ -5117,6 +5383,7 @@ impl App {
                 let diff_lines = compute_diff(&original_yaml, &edited_yaml);
                 self.edit_ctx = Some(EditContext {
                     resource_type: edit.resource_type,
+                    crd_info: edit.crd_info,
                     name: edit.name,
                     namespace: edit.namespace,
                     original_yaml,
@@ -5138,6 +5405,7 @@ impl App {
 
         self.edit_ctx = Some(EditContext {
             resource_type: edit.resource_type,
+            crd_info: edit.crd_info,
             name: edit.name,
             namespace: edit.namespace,
             original_yaml,
@@ -5179,6 +5447,7 @@ impl App {
                 if let Some(ctx) = self.edit_ctx.take() {
                     self.pending_edit = Some(PendingEdit {
                         resource_type: ctx.resource_type,
+                        crd_info: ctx.crd_info,
                         name: ctx.name,
                         namespace: ctx.namespace,
                         yaml: ctx.edited_yaml,
@@ -5216,15 +5485,24 @@ impl App {
             | None => return,
         };
         let rt = ctx.resource_type;
+        let crd = ctx.crd_info.clone();
         let ns = ctx.namespace.clone();
         let name = ctx.name.clone();
         let yaml = ctx.edited_yaml.clone();
 
-        match self.kube.replace_resource_yaml(rt, &ns, &name, &yaml).await {
+        let result = if let Some(crd) = &crd {
+            self.kube.replace_custom_resource(crd, &ns, &name, &yaml).await
+        } else {
+            self.kube.replace_resource_yaml(rt, &ns, &name, &yaml).await
+        };
+        let display = crd
+            .as_ref()
+            .map(|c| c.kind.as_str())
+            .unwrap_or_else(|| rt.display_name());
+        match result {
             | Ok(value) => {
-                self.push_status(format!("Applied changes to {}/{}", rt.display_name(), name));
+                self.push_status(format!("Applied changes to {}/{}", display, name));
                 self.error = None;
-                // Refresh the detail view with updated data
                 self.detail.yaml = serde_yaml::to_string(&value).unwrap_or_default();
                 self.detail.value = value;
                 self.detail.name = name;
@@ -5233,7 +5511,6 @@ impl App {
                 self.view = View::Detail;
             },
             | Err(e) => {
-                // Stay on diff view, show error, allow re-edit
                 if let Some(ctx) = &mut self.edit_ctx {
                     ctx.error = Some(format!("{}", e));
                 }
@@ -5286,15 +5563,17 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn open_metadata_edit(&mut self, kind: MetadataEditKind) {
-        let rt = match self.selected_resource_type() {
-            | Some(rt) => rt,
-            | None => return,
+        let (rt, crd) = if let Some(rt) = self.selected_resource_type() {
+            (rt, None)
+        } else if let Some(crd) = self.selected_crd_info() {
+            (ResourceType::CustomResourceDefinition, Some(crd.clone()))
+        } else {
+            return;
         };
         let field = match kind {
             | MetadataEditKind::Labels => "labels",
             | MetadataEditKind::Annotations => "annotations",
         };
-        // Serialize the labels/annotations map as YAML for editing in $EDITOR
         let map = self
             .detail
             .value
@@ -5303,15 +5582,18 @@ impl App {
             .cloned()
             .unwrap_or(Value::Object(serde_json::Map::new()));
         let yaml = serde_yaml::to_string(&map).unwrap_or_else(|_| "{}\n".to_string());
+        let display = crd
+            .as_ref()
+            .map(|c| c.kind.as_str())
+            .unwrap_or_else(|| rt.display_name());
         let header = format!(
             "# Edit {} for {}/{}\n# Save and close to apply. Empty keys are removed.\n#\n",
-            field,
-            rt.display_name(),
-            self.detail.name
+            field, display, self.detail.name
         );
         self.pending_metadata_edit = Some(PendingMetadataEdit {
             kind,
             resource_type: rt,
+            crd_info: crd,
             name: self.detail.name.clone(),
             namespace: self.detail.namespace.clone(),
             yaml: format!("{}{}", header, yaml),
@@ -5365,26 +5647,48 @@ impl App {
             return;
         }
 
-        let result = match edit.kind {
-            | MetadataEditKind::Labels => {
-                self.kube
-                    .patch_metadata(edit.resource_type, &edit.namespace, &edit.name, Some(&patch), None)
-                    .await
-            },
-            | MetadataEditKind::Annotations => {
-                self.kube
-                    .patch_metadata(edit.resource_type, &edit.namespace, &edit.name, None, Some(&patch))
-                    .await
-            },
+        let result = if let Some(crd) = &edit.crd_info {
+            match edit.kind {
+                | MetadataEditKind::Labels => {
+                    self.kube
+                        .patch_custom_resource_metadata(crd, &edit.namespace, &edit.name, Some(&patch), None)
+                        .await
+                },
+                | MetadataEditKind::Annotations => {
+                    self.kube
+                        .patch_custom_resource_metadata(crd, &edit.namespace, &edit.name, None, Some(&patch))
+                        .await
+                },
+            }
+        } else {
+            match edit.kind {
+                | MetadataEditKind::Labels => {
+                    self.kube
+                        .patch_metadata(edit.resource_type, &edit.namespace, &edit.name, Some(&patch), None)
+                        .await
+                },
+                | MetadataEditKind::Annotations => {
+                    self.kube
+                        .patch_metadata(edit.resource_type, &edit.namespace, &edit.name, None, Some(&patch))
+                        .await
+                },
+            }
         };
         match result {
             | Ok(_) => {
                 self.push_status(format!("Updated {} on {}", field, edit.name));
                 self.error = None;
-                self.pending_load = Some(PendingLoad::ResourceDetail {
-                    name: edit.name,
-                    namespace: edit.namespace,
-                });
+                if edit.crd_info.is_some() {
+                    self.pending_load = Some(PendingLoad::CustomResourceDetail {
+                        name: edit.name,
+                        namespace: edit.namespace,
+                    });
+                } else {
+                    self.pending_load = Some(PendingLoad::ResourceDetail {
+                        name: edit.name,
+                        namespace: edit.namespace,
+                    });
+                }
             },
             | Err(e) => {
                 self.error = Some(format!("Patch failed: {}", e));

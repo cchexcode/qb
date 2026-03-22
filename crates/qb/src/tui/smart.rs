@@ -1,5 +1,8 @@
 use {
-    crate::k8s::ResourceType,
+    crate::k8s::{
+        CrdInfo,
+        ResourceType,
+    },
     base64::{
         engine::general_purpose::STANDARD,
         Engine,
@@ -156,6 +159,7 @@ pub fn render(
         | ResourceType::Node => render_node(v, ds),
         | ResourceType::Namespace => render_namespace(v, ds),
         | ResourceType::Event => render_event(v, ds),
+        | ResourceType::CustomResourceDefinition => render_crd(v, ds),
     }
 }
 
@@ -1237,6 +1241,153 @@ fn render_event(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
     }
 
     l
+}
+
+// ---------------------------------------------------------------------------
+// CRD renderer
+// ---------------------------------------------------------------------------
+
+fn render_crd(v: &Value, ds: &mut DictState) -> Vec<Line<'static>> {
+    let mut l = metadata_lines(v, "CustomResourceDefinition", ds);
+
+    field(&mut l, "Group", &js(v, "spec.group"));
+    field(&mut l, "Scope", &js(v, "spec.scope"));
+    field(&mut l, "Kind", &js(v, "spec.names.kind"));
+    field(&mut l, "Plural", &js(v, "spec.names.plural"));
+
+    let singular = js(v, "spec.names.singular");
+    if !singular.is_empty() {
+        field(&mut l, "Singular", &singular);
+    }
+    let short_names = jget(v, "spec.names.shortNames")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    if !short_names.is_empty() {
+        field(&mut l, "Short Names", &short_names);
+    }
+
+    // Versions
+    if let Some(versions) = jget(v, "spec.versions").and_then(|v| v.as_array()) {
+        section(&mut l, "Versions");
+        for ver in versions {
+            let name = ver.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let served = ver.get("served").and_then(|v| v.as_bool()).unwrap_or(false);
+            let storage = ver.get("storage").and_then(|v| v.as_bool()).unwrap_or(false);
+            let flags = format!("served={}, storage={}", served, storage);
+            field(&mut l, name, &flags);
+        }
+    }
+
+    conditions_section(&mut l, v);
+    l
+}
+
+// ---------------------------------------------------------------------------
+// Generic custom resource renderer
+// ---------------------------------------------------------------------------
+
+pub fn render_custom_resource(v: &Value, crd: &CrdInfo, ds: &mut DictState) -> Vec<Line<'static>> {
+    ds.entries.clear();
+    ds.line_offsets.clear();
+    let mut l = metadata_lines(v, &crd.kind, ds);
+
+    field(&mut l, "API Version", &format!("{}/{}", crd.group, crd.version));
+
+    // Render spec as key-value pairs
+    if let Some(spec) = v.get("spec") {
+        if let Some(obj) = spec.as_object() {
+            if !obj.is_empty() {
+                section(&mut l, "Spec");
+                render_value_tree(&mut l, spec, 1);
+            }
+        }
+    }
+
+    // Render status as key-value pairs
+    if let Some(status) = v.get("status") {
+        if let Some(obj) = status.as_object() {
+            if !obj.is_empty() {
+                section(&mut l, "Status");
+                render_value_tree(&mut l, status, 1);
+            }
+        }
+    }
+
+    conditions_section(&mut l, v);
+    l
+}
+
+/// Render an arbitrary JSON value as indented key-value lines.
+fn render_value_tree(l: &mut Vec<Line<'static>>, v: &Value, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let key_style = Style::default().fg(Color::Cyan);
+    let val_style = Style::default().fg(Color::White);
+
+    match v {
+        | Value::Object(map) => {
+            for (k, val) in map {
+                if k == "conditions" {
+                    // Conditions are rendered separately
+                    continue;
+                }
+                match val {
+                    | Value::Object(inner) if !inner.is_empty() => {
+                        l.push(Line::from(vec![
+                            Span::raw(indent.clone()),
+                            Span::styled(format!("{}:", k), key_style),
+                        ]));
+                        render_value_tree(l, val, depth + 1);
+                    },
+                    | Value::Array(arr) if !arr.is_empty() => {
+                        l.push(Line::from(vec![
+                            Span::raw(indent.clone()),
+                            Span::styled(format!("{}:", k), key_style),
+                        ]));
+                        for item in arr {
+                            match item {
+                                | Value::Object(_) => {
+                                    l.push(Line::from(vec![Span::raw(format!("{}  - ", indent))]));
+                                    render_value_tree(l, item, depth + 2);
+                                },
+                                | _ => {
+                                    let s = value_to_string(item);
+                                    l.push(Line::from(vec![
+                                        Span::raw(format!("{}  - ", indent)),
+                                        Span::styled(s, val_style),
+                                    ]));
+                                },
+                            }
+                        }
+                    },
+                    | _ => {
+                        let s = value_to_string(val);
+                        if !s.is_empty() {
+                            l.push(Line::from(vec![
+                                Span::raw(indent.clone()),
+                                Span::styled(format!("{}: ", k), key_style),
+                                Span::styled(s, val_style),
+                            ]));
+                        }
+                    },
+                }
+            }
+        },
+        | _ => {
+            let s = value_to_string(v);
+            l.push(Line::from(vec![Span::raw(indent), Span::styled(s, val_style)]));
+        },
+    }
+}
+
+fn value_to_string(v: &Value) -> String {
+    match v {
+        | Value::String(s) => s.clone(),
+        | Value::Number(n) => n.to_string(),
+        | Value::Bool(b) => b.to_string(),
+        | Value::Null => String::new(),
+        | other => serde_json::to_string(other).unwrap_or_default(),
+    }
 }
 
 // ---------------------------------------------------------------------------

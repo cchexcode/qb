@@ -350,6 +350,22 @@ static COMMANDS: &[Cmd] = &[
     },
     // ── Main view: sidebar ──────────────────────────────────────────────
     Cmd {
+        key: "</>/<<",
+        label: "Width",
+        description: "Grow/shrink sidebar width",
+        contexts: &[
+            Ctx::Nav,
+            Ctx::Resources,
+            Ctx::Events,
+            Ctx::ClusterStats,
+            Ctx::PortForwards,
+            Ctx::Profiles,
+        ],
+        hotkey: false,
+        palette: false,
+        available: None,
+    },
+    Cmd {
         key: "r",
         label: "Resources",
         description: "Focus the resource table",

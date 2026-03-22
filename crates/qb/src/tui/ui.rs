@@ -78,13 +78,14 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
     spans.push(Span::styled(ns, seg));
 
     // Resource type
-    if let Some(rt) = app.selected_resource_type() {
+    let type_label = app
+        .selected_resource_type()
+        .map(|rt| rt.display_name().to_string())
+        .or_else(|| app.selected_crd_info().map(|c| c.display_name.clone()));
+    if let Some(type_name) = type_label {
         spans.push(sep.clone());
         let is_last = app.view == View::Main;
-        spans.push(Span::styled(
-            rt.display_name().to_string(),
-            if is_last { active } else { seg },
-        ));
+        spans.push(Span::styled(type_name, if is_last { active } else { seg }));
 
         // Resource name (detail/logs)
         if app.view == View::Detail || app.view == View::Logs {
@@ -98,11 +99,13 @@ fn render_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
             spans.push(sep.clone());
             let is_detail = app.view == View::Detail;
             // Star indicator for favorites
-            if app.is_favorite(rt, &app.detail.name, &app.detail.namespace) {
-                spans.push(Span::styled(
-                    "★ ",
-                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-                ));
+            if let Some(rt) = app.selected_resource_type() {
+                if app.is_favorite(rt, &app.detail.name, &app.detail.namespace) {
+                    spans.push(Span::styled(
+                        "★ ",
+                        Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+                    ));
+                }
             }
             spans.push(Span::styled(name, if is_detail { active } else { seg }));
         }
@@ -191,7 +194,7 @@ fn render_main(f: &mut Frame, app: &mut App) {
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(26), Constraint::Min(40)])
+        .constraints([Constraint::Length(app.nav_width), Constraint::Min(40)])
         .split(outer[1]);
 
     render_nav(f, app, cols[0]);
@@ -221,10 +224,12 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
                 | (NavItemKind::PortForwards, Panel::PortForwards) => true,
                 | (NavItemKind::Profiles, Panel::Profiles) => true,
                 | (NavItemKind::Resource(rt), Panel::ResourceList(prt)) => rt == prt,
+                | (NavItemKind::CustomResource(crd), Panel::CustomResourceList(pcrd)) => crd == pcrd,
                 | _ => false,
             };
             let style = match &item.kind {
                 | NavItemKind::Category => Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                | NavItemKind::SubCategory => Style::default().fg(Color::DarkGray),
                 | NavItemKind::Favorites if is_active => Style::default().fg(Color::Yellow),
                 | _ if is_active => Style::default().fg(Color::Green),
                 | _ => Style::default().fg(Color::White),
@@ -303,22 +308,27 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
             render_cluster_stats(f, app, area);
             return;
         },
-        | Panel::ResourceList(_) => {},
+        | Panel::ResourceList(_) | Panel::CustomResourceList(_) => {},
     }
 
-    let rt = match app.selected_resource_type() {
-        | Some(rt) => rt,
-        | None => {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Select a resource type ");
-            f.render_widget(block, area);
-            return;
-        },
+    // Determine column headers: either from a built-in ResourceType or a CrdInfo
+    let (base_headers_owned, is_event) = if let Some(rt) = app.selected_resource_type() {
+        (
+            rt.column_headers().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            rt == ResourceType::Event,
+        )
+    } else if let Some(crd) = app.selected_crd_info() {
+        (crd.column_headers(), false)
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" Select a resource type ");
+        f.render_widget(block, area);
+        return;
     };
 
-    if rt == ResourceType::Event {
+    if is_event {
         render_events_log(f, app, area);
         return;
     }
@@ -326,20 +336,19 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let visible_indices = app.visible_resource_indices();
 
     let all_ns = app.kube.context.namespace.is_none();
-    let base_headers = rt.column_headers();
 
     // Build logical columns: [NAME, (NAMESPACE)?, col1, col2, ...]
-    let mut col_headers: Vec<&str> = vec![base_headers[0]];
+    let mut col_headers: Vec<String> = vec![base_headers_owned[0].clone()];
     if all_ns {
-        col_headers.push("NAMESPACE");
+        col_headers.push("NAMESPACE".to_string());
     }
-    col_headers.extend(&base_headers[1..]);
+    col_headers.extend(base_headers_owned[1..].iter().cloned());
 
     let header_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
     let header = Row::new(
         col_headers
             .iter()
-            .map(|h| Cell::from(*h).style(header_style))
+            .map(|h| Cell::from(h.as_str()).style(header_style))
             .collect::<Vec<_>>(),
     )
     .height(1);
@@ -359,6 +368,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
         std::collections::HashSet::new()
     };
 
+    let opt_rt = app.selected_resource_type();
     let rows: Vec<Row> = visible_indices
         .iter()
         .map(|&idx| {
@@ -392,7 +402,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
             for col in &entry.columns {
                 cells.push(Cell::from(col.as_str()));
             }
-            let row = if rt == ResourceType::Pod {
+            let row = if opt_rt == Some(ResourceType::Pod) {
                 let status = entry.columns.get(1).map(|s| s.as_str()).unwrap_or("");
                 let style = match status {
                     | "Running" => Style::default().fg(Color::Green),
@@ -409,7 +419,7 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
                     | _ => Style::default(),
                 };
                 Row::new(cells).style(style)
-            } else if rt == ResourceType::Node {
+            } else if opt_rt == Some(ResourceType::Node) {
                 let status = entry.columns.first().map(|s| s.as_str()).unwrap_or("");
                 let style = if status.contains("SchedulingDisabled") {
                     Style::default().fg(Color::Yellow)
@@ -459,7 +469,11 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
 
     let focused = app.focus == Focus::Resources;
     let border_color = if focused { Color::Cyan } else { Color::DarkGray };
-    let title = format!(" {} ", rt.display_name());
+    let title = app
+        .selected_resource_type()
+        .map(|rt| format!(" {} ", rt.display_name()))
+        .or_else(|| app.selected_crd_info().map(|c| format!(" {} ", c.display_name)))
+        .unwrap_or_else(|| " Resources ".to_string());
 
     // Map real selection index to filtered row position for highlight.
     // Preserve the table offset across renders for smooth edge-scrolling.
@@ -1280,17 +1294,19 @@ fn render_edit_diff(f: &mut Frame, app: &mut App) {
 }
 
 fn render_smart_lines(app: &mut App) -> Vec<Line<'static>> {
-    let rt = match app.selected_resource_type() {
-        | Some(rt) => rt,
-        | None => return vec![],
-    };
     let mut ds = smart::DictState {
         entries: Vec::new(),
         line_offsets: Vec::new(),
         cursor: app.detail.dict.cursor,
         expanded: app.detail.dict.expanded_keys.clone(),
     };
-    let lines = smart::render(rt, &app.detail.value, app.detail.secret.as_mut(), &mut ds);
+    let lines = if let Some(rt) = app.selected_resource_type() {
+        smart::render(rt, &app.detail.value, app.detail.secret.as_mut(), &mut ds)
+    } else if let Some(crd) = app.selected_crd_info().cloned() {
+        smart::render_custom_resource(&app.detail.value, &crd, &mut ds)
+    } else {
+        return vec![];
+    };
     // Sync state back to App
     app.detail.dict.entries = ds.entries;
     app.detail.dict.line_offsets = ds.line_offsets;
@@ -2387,12 +2403,19 @@ fn render_popup(f: &mut Frame, app: &mut App) {
             f.render_widget(paragraph, area);
         },
         | Popup::ConfirmDelete {
-            name, resource_type, ..
+            name,
+            resource_type,
+            crd_info,
+            ..
         } => {
+            let display = crd_info
+                .as_ref()
+                .map(|c| c.kind.as_str())
+                .unwrap_or_else(|| resource_type.display_name());
             let mut lines: Vec<Line> = Vec::new();
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                format!("  Delete {}/{}?", resource_type.display_name(), name),
+                format!("  Delete {}/{}?", display, name),
                 Style::default().fg(Color::Red),
             )));
             lines.push(Line::from(""));

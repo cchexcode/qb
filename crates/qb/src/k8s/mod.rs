@@ -42,6 +42,7 @@ use {
             },
             storage::v1::StorageClass,
         },
+        apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
         apimachinery::pkg::apis::meta::v1::Time,
     },
     kube::{
@@ -65,6 +66,63 @@ fn apply_timeouts(config: &mut kube::Config) {
     config.connect_timeout = Some(REQUEST_TIMEOUT);
     config.read_timeout = Some(REQUEST_TIMEOUT);
     config.write_timeout = Some(REQUEST_TIMEOUT);
+}
+
+// ---------------------------------------------------------------------------
+// Custom Resource Definition info (for dynamic CR support)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CrdInfo {
+    pub group: String,
+    pub version: String,
+    pub kind: String,
+    pub plural: String,
+    pub scope: CrdScope,
+    pub display_name: String,
+    pub columns: Vec<CrdColumn>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CrdScope {
+    Namespaced,
+    Cluster,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CrdColumn {
+    pub name: String,
+    pub json_path: String,
+    pub type_: String,
+}
+
+impl CrdInfo {
+    pub fn api_resource(&self) -> kube::api::ApiResource {
+        kube::api::ApiResource {
+            group: self.group.clone(),
+            version: self.version.clone(),
+            api_version: if self.group.is_empty() {
+                self.version.clone()
+            } else {
+                format!("{}/{}", self.group, self.version)
+            },
+            kind: self.kind.clone(),
+            plural: self.plural.clone(),
+        }
+    }
+
+    pub fn is_cluster_scoped(&self) -> bool {
+        self.scope == CrdScope::Cluster
+    }
+
+    pub fn column_headers(&self) -> Vec<String> {
+        let mut headers = vec!["NAME".to_string()];
+        for col in &self.columns {
+            headers.push(col.name.to_uppercase());
+        }
+        headers.push("AGE".to_string());
+        headers
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +162,7 @@ pub enum ResourceType {
     Node,
     Namespace,
     Event,
+    CustomResourceDefinition,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +203,7 @@ impl ResourceType {
             | Self::Node => "Nodes",
             | Self::Namespace => "Namespaces",
             | Self::Event => "Events",
+            | Self::CustomResourceDefinition => "CRDs",
         }
     }
 
@@ -174,6 +234,7 @@ impl ResourceType {
             | Self::Node => "node",
             | Self::Namespace => "namespace",
             | Self::Event => "event",
+            | Self::CustomResourceDefinition => "crd",
         }
     }
 
@@ -204,6 +265,7 @@ impl ResourceType {
             | "node" => Some(Self::Node),
             | "namespace" => Some(Self::Namespace),
             | "event" => Some(Self::Event),
+            | "crd" | "customresourcedefinition" => Some(Self::CustomResourceDefinition),
             | _ => None,
         }
     }
@@ -235,6 +297,7 @@ impl ResourceType {
             | Self::Node => vec!["NAME", "STATUS", "ROLES", "VERSION", "AGE"],
             | Self::Namespace => vec!["NAME", "STATUS", "AGE"],
             | Self::Event => vec!["NAME", "TYPE", "REASON", "OBJECT", "AGE"],
+            | Self::CustomResourceDefinition => vec!["NAME", "GROUP", "VERSIONS", "SCOPE", "AGE"],
         }
     }
 
@@ -268,6 +331,7 @@ impl ResourceType {
                 | Self::StorageClass
                 | Self::ClusterRole
                 | Self::ClusterRoleBinding
+                | Self::CustomResourceDefinition
         )
     }
 
@@ -300,6 +364,7 @@ impl ResourceType {
             | Self::Node => ApiResource::erase::<Node>(&()),
             | Self::Namespace => ApiResource::erase::<Namespace>(&()),
             | Self::Event => ApiResource::erase::<Event>(&()),
+            | Self::CustomResourceDefinition => ApiResource::erase::<CustomResourceDefinition>(&()),
         }
     }
 
@@ -334,7 +399,12 @@ impl ResourceType {
                 Self::ClusterRole,
                 Self::ClusterRoleBinding,
             ]),
-            (Category::Cluster, vec![Self::Node, Self::Namespace, Self::Event]),
+            (Category::Cluster, vec![
+                Self::Node,
+                Self::Namespace,
+                Self::Event,
+                Self::CustomResourceDefinition,
+            ]),
         ]
     }
 }
@@ -768,6 +838,9 @@ impl KubeClient {
             | ResourceType::Node => self.list_cluster::<Node>(Self::map_node).await,
             | ResourceType::Namespace => self.list_cluster::<Namespace>(Self::map_namespace).await,
             | ResourceType::Event => self.list_typed::<Event>(Self::map_event).await,
+            | ResourceType::CustomResourceDefinition => {
+                self.list_cluster::<CustomResourceDefinition>(Self::map_crd).await
+            },
         }
     }
 
@@ -800,6 +873,7 @@ impl KubeClient {
             | ResourceType::Role => self.get_value::<Role>(ns, name).await,
             | ResourceType::RoleBinding => self.get_value::<RoleBinding>(ns, name).await,
             | ResourceType::Event => self.get_value::<Event>(ns, name).await,
+            | ResourceType::CustomResourceDefinition => self.get_value_cluster::<CustomResourceDefinition>(name).await,
         }
     }
 
@@ -2856,11 +2930,247 @@ impl KubeClient {
             sort_key: Some(sort_ts),
         }
     }
+
+    fn map_crd(c: &CustomResourceDefinition) -> ResourceEntry {
+        let group = c.spec.group.clone();
+        let versions = c
+            .spec
+            .versions
+            .iter()
+            .filter(|v| v.served)
+            .map(|v| v.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let scope = c.spec.scope.clone();
+        ResourceEntry {
+            name: meta_name(&c.metadata),
+            namespace: String::new(),
+            columns: vec![
+                group,
+                versions,
+                scope,
+                format_age(c.metadata.creation_timestamp.as_ref()),
+            ],
+            sort_key: None,
+        }
+    }
+
+    // -- CRD discovery and dynamic CR operations --------------------------------
+
+    /// Discover all CRDs in the cluster and return metadata for each.
+    pub async fn discover_crds(&self) -> Result<Vec<CrdInfo>> {
+        let api: Api<CustomResourceDefinition> = Api::all(self.client.default.clone());
+        let list = api.list(&ListParams::default()).await?;
+        let mut crds = Vec::new();
+        for crd in &list.items {
+            let spec = &crd.spec;
+            // Find the served+storage version, or fall back to first served
+            let version = spec
+                .versions
+                .iter()
+                .find(|v| v.served && v.storage)
+                .or_else(|| spec.versions.iter().find(|v| v.served));
+            let version = match version {
+                | Some(v) => v,
+                | None => continue,
+            };
+            let columns: Vec<CrdColumn> = version
+                .additional_printer_columns
+                .as_ref()
+                .map(|cols| {
+                    cols.iter()
+                        .filter(|c| c.json_path != ".metadata.creationTimestamp")
+                        .map(|c| {
+                            CrdColumn {
+                                name: c.name.clone(),
+                                json_path: c.json_path.clone(),
+                                type_: c.type_.clone(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let scope = if spec.scope == "Namespaced" {
+                CrdScope::Namespaced
+            } else {
+                CrdScope::Cluster
+            };
+
+            crds.push(CrdInfo {
+                group: spec.group.clone(),
+                version: version.name.clone(),
+                kind: spec.names.kind.clone(),
+                plural: spec.names.plural.clone(),
+                scope,
+                display_name: spec.names.kind.clone(),
+                columns,
+            });
+        }
+        crds.sort_by(|a, b| {
+            let fqdn_a = format!("{}.{}", a.plural, a.group);
+            let fqdn_b = format!("{}.{}", b.plural, b.group);
+            fqdn_a.cmp(&fqdn_b)
+        });
+        Ok(crds)
+    }
+
+    /// List custom resource instances for a given CRD.
+    pub async fn list_custom_resources(&self, crd: &CrdInfo) -> Result<Vec<ResourceEntry>> {
+        let ar = crd.api_resource();
+        let lp = ListParams::default();
+        let api: Api<kube::api::DynamicObject> = if crd.is_cluster_scoped() {
+            Api::all_with(self.client.default.clone(), &ar)
+        } else {
+            match &self.context.namespace {
+                | Some(ns) => Api::namespaced_with(self.client.default.clone(), ns, &ar),
+                | None => Api::all_with(self.client.default.clone(), &ar),
+            }
+        };
+        let list = api.list(&lp).await?;
+        Ok(list
+            .items
+            .iter()
+            .map(|obj| {
+                let data = serde_json::to_value(obj).unwrap_or_default();
+                let name = obj.metadata.name.clone().unwrap_or_default();
+                let namespace = obj.metadata.namespace.clone().unwrap_or_default();
+                let mut columns: Vec<String> = crd
+                    .columns
+                    .iter()
+                    .map(|col| resolve_json_path(&data, &col.json_path))
+                    .collect();
+                let age = obj
+                    .metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .map(|t| format_age(Some(&Time(t.0))))
+                    .unwrap_or_default();
+                columns.push(age);
+                ResourceEntry {
+                    name,
+                    namespace,
+                    columns,
+                    sort_key: None,
+                }
+            })
+            .collect())
+    }
+
+    /// Get a single custom resource as a JSON Value.
+    pub async fn get_custom_resource(&self, crd: &CrdInfo, ns: &str, name: &str) -> Result<Value> {
+        let ar = crd.api_resource();
+        let api: Api<kube::api::DynamicObject> = if crd.is_cluster_scoped() {
+            Api::all_with(self.client.default.clone(), &ar)
+        } else {
+            Api::namespaced_with(self.client.default.clone(), ns, &ar)
+        };
+        let obj = api.get(name).await?;
+        let val = serde_json::to_value(&obj)?;
+        strip_managed_fields(val)
+    }
+
+    /// Replace a custom resource with edited YAML.
+    pub async fn replace_custom_resource(&self, crd: &CrdInfo, ns: &str, name: &str, yaml: &str) -> Result<Value> {
+        let obj: kube::api::DynamicObject = serde_yaml::from_str(yaml).context("Invalid YAML")?;
+        let ar = crd.api_resource();
+        let api: Api<kube::api::DynamicObject> = if crd.is_cluster_scoped() {
+            Api::all_with(self.client.default.clone(), &ar)
+        } else {
+            Api::namespaced_with(self.client.default.clone(), ns, &ar)
+        };
+        let pp = kube::api::PostParams::default();
+        let result = api.replace(name, &pp, &obj).await.context("Failed to apply resource")?;
+        Ok(serde_json::to_value(&result)?)
+    }
+
+    /// Delete a custom resource.
+    pub async fn delete_custom_resource(&self, crd: &CrdInfo, ns: &str, name: &str) -> Result<()> {
+        let ar = crd.api_resource();
+        let api: Api<kube::api::DynamicObject> = if crd.is_cluster_scoped() {
+            Api::all_with(self.client.default.clone(), &ar)
+        } else {
+            Api::namespaced_with(self.client.default.clone(), ns, &ar)
+        };
+        let dp = kube::api::DeleteParams::default();
+        api.delete(name, &dp).await.context("Failed to delete resource")?;
+        Ok(())
+    }
+
+    /// Patch metadata (labels/annotations) on a custom resource.
+    pub async fn patch_custom_resource_metadata(
+        &self,
+        crd: &CrdInfo,
+        ns: &str,
+        name: &str,
+        labels: Option<&serde_json::Map<String, Value>>,
+        annotations: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<Value> {
+        let ar = crd.api_resource();
+        let api: Api<kube::api::DynamicObject> = if crd.is_cluster_scoped() {
+            Api::all_with(self.client.default.clone(), &ar)
+        } else {
+            Api::namespaced_with(self.client.default.clone(), ns, &ar)
+        };
+        let mut metadata = serde_json::Map::new();
+        if let Some(l) = labels {
+            metadata.insert("labels".into(), Value::Object(l.clone()));
+        }
+        if let Some(a) = annotations {
+            metadata.insert("annotations".into(), Value::Object(a.clone()));
+        }
+        let patch = serde_json::json!({ "metadata": metadata });
+        let pp = kube::api::PatchParams::default();
+        let result = api
+            .patch(name, &pp, &kube::api::Patch::Merge(&patch))
+            .await
+            .context("Failed to patch metadata")?;
+        Ok(serde_json::to_value(&result)?)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve a simple JSON path (dot-separated, starting with ".") against a
+/// serde_json::Value. Supports basic dot notation like ".spec.replicas" and
+/// simple array indexing like ".status.conditions[0].type".
+fn resolve_json_path(data: &Value, path: &str) -> String {
+    let path = path.strip_prefix('.').unwrap_or(path);
+    let mut current = data;
+    for segment in path.split('.') {
+        // Handle array index: e.g., "conditions[0]"
+        if let Some(idx_start) = segment.find('[') {
+            let key = &segment[..idx_start];
+            let idx_str = &segment[idx_start + 1..segment.len().saturating_sub(1)];
+            if !key.is_empty() {
+                current = match current.get(key) {
+                    | Some(v) => v,
+                    | None => return String::new(),
+                };
+            }
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                current = match current.get(idx) {
+                    | Some(v) => v,
+                    | None => return String::new(),
+                };
+            }
+        } else {
+            current = match current.get(segment) {
+                | Some(v) => v,
+                | None => return String::new(),
+            };
+        }
+    }
+    match current {
+        | Value::String(s) => s.clone(),
+        | Value::Number(n) => n.to_string(),
+        | Value::Bool(b) => b.to_string(),
+        | Value::Null => String::new(),
+        | other => other.to_string(),
+    }
+}
 
 fn meta_name(meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) -> String {
     meta.name.clone().unwrap_or_default()

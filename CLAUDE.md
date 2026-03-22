@@ -194,13 +194,15 @@ Overview is always the first item and the default landing screen.
 6. **CONFIG** — ConfigMaps, Secrets
 7. **STORAGE** — PVCs, PVs, StorageClasses
 8. **RBAC** — ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
-9. **CLUSTER** — Nodes, Namespaces, Events
+9. **CLUSTER** — Nodes, Namespaces, Events, CRDs
+10. **CUSTOM RESOURCES** — Dynamically discovered from CRDs in the cluster (appears only if CRDs exist)
 
 Categories are non-selectable headers (`NavItemKind::Category`). Navigation with j/k
 skips over them.
 
-Cluster-scoped resources (Node, Namespace, PV, StorageClass, ClusterRole, ClusterRoleBinding)
-use `list_cluster`/`get_value_cluster` helpers instead of the namespaced variants.
+Cluster-scoped resources (Node, Namespace, PV, StorageClass, ClusterRole, ClusterRoleBinding,
+CustomResourceDefinition) use `list_cluster`/`get_value_cluster` helpers instead of the
+namespaced variants.
 
 ## Special Views
 
@@ -348,6 +350,34 @@ Profiles group favorites and saved port forwards under a name. The default profi
 created on first run. `Ctrl+S` opens a save dialog, `P` opens the profile switcher. Profiles
 are stored in config and auto-saved on changes.
 
+### Custom Resource Definitions and Custom Resources
+
+CRDs are a built-in `ResourceType::CustomResourceDefinition` in the CLUSTER sidebar category.
+Custom Resources (instances of CRDs) are discovered dynamically on startup and context switch
+via `KubeClient::discover_crds()`, which lists all CRDs and extracts metadata into `CrdInfo`
+structs. Discovered CRs appear in the sidebar under a "CUSTOM RESOURCES" category.
+
+Architecture:
+- **`CrdInfo`** (`k8s/mod.rs`) — holds group, version, kind, plural, scope, display name,
+  and `additionalPrinterColumns` for dynamic API operations and table rendering.
+- **`Panel::CustomResourceList(CrdInfo)`** — panel variant for browsing CR instances.
+- **`NavItemKind::CustomResource(CrdInfo)`** — sidebar nav item for each discovered CRD.
+- **`PendingLoad::DiscoverCrds`** — async CRD discovery, chained on startup before ClusterStats.
+- **`PendingLoad::CustomResources`** / **`CustomResourceDetail`** — deferred loading for CRs.
+- Dynamic API methods: `list_custom_resources()`, `get_custom_resource()`,
+  `replace_custom_resource()`, `delete_custom_resource()`, `patch_custom_resource_metadata()`.
+- Generic smart renderer: `smart::render_custom_resource()` renders metadata, spec, status
+  as a key-value tree. CRD definitions use `smart::render_crd()`.
+- Table columns come from CRD `additionalPrinterColumns` via `CrdInfo::column_headers()`.
+  Column values are resolved from JSON paths via `resolve_json_path()`.
+
+Supported operations on CRs: Browse, Detail (Smart + YAML), Edit, Delete, Diff, Favorites.
+Not supported (correctly gated): Logs, Scale, Restart, Exec, Port Forward.
+
+Edit/delete flows carry `Option<CrdInfo>` alongside `ResourceType` in `PendingEdit`,
+`EditContext`, and `Popup::ConfirmDelete`. When `crd_info` is `Some`, dynamic API methods
+are used; otherwise, the standard `ResourceType`-based methods run.
+
 ## Coding Standards
 
 ### Object-oriented style
@@ -397,6 +427,11 @@ Resource types are a `ResourceType` enum. Adding a new type means:
 6. If it supports logs, add to `supports_logs()` match
 7. Add to `api_resource()` and `is_cluster_scoped()` match arms
 8. Add `sort_key: None` (or `Some(...)` for sortable types) to the `ResourceEntry` constructor
+
+Custom Resources bypass the `ResourceType` enum entirely — they use `CrdInfo` + `DynamicObject`
+for all API operations. `Panel::CustomResourceList(CrdInfo)` and `NavItemKind::CustomResource(CrdInfo)`
+are separate enum variants, not `ResourceType` variants. Edit/delete flows carry `Option<CrdInfo>`
+to select between static and dynamic API paths.
 
 Views (`View::Main | Detail | Logs | EditDiff`), detail modes (`DetailMode::Smart | Yaml`),
 diff modes (`DiffMode::Inline | SideBySide`), and pending loads (`PendingLoad`) all use enums
