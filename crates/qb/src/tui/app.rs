@@ -12,6 +12,7 @@ use {
             ClusterStatsData,
             CrdInfo,
             KubeClient,
+            MetricsData,
             RelatedEvent,
             ResourceEntry,
             ResourceType,
@@ -58,6 +59,7 @@ pub enum View {
 #[derive(Clone, PartialEq)]
 pub enum Panel {
     Overview,
+    ResourceMap,
     Favorites,
     PortForwards,
     Profiles,
@@ -278,6 +280,7 @@ pub enum NavItemKind {
     Resource(ResourceType),
     CustomResource(CrdInfo),
     ClusterStats,
+    ResourceMap,
     PortForwards,
     Favorites,
     Profiles,
@@ -326,6 +329,21 @@ pub struct ClusterOverview {
     pub scroll: u16,
     /// Background fetch — polled each tick, never blocks the event loop.
     pub pending_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<ClusterStatsData>>>,
+    /// Live metrics from metrics-server (fetched in background).
+    pub metrics: Option<MetricsData>,
+    pub metrics_rx: Option<tokio::sync::oneshot::Receiver<MetricsData>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResourceMapSort {
+    Cpu,
+    Memory,
+}
+
+pub struct ResourceMapState {
+    pub scroll: u16,
+    pub sort: ResourceMapSort,
+    pub metrics: Option<MetricsData>,
 }
 
 pub struct RelatedState {
@@ -405,6 +423,7 @@ pub struct App {
     pub panel: Panel,
     pub return_panel: Option<Panel>,
     pub overview: ClusterOverview,
+    pub resource_map: ResourceMapState,
     pub detail: DetailState,
     pub log: Option<LogViewState>,
     pub log_detail_line: Option<String>,
@@ -472,6 +491,13 @@ impl App {
                 stats: None,
                 scroll: 0,
                 pending_rx: None,
+                metrics: None,
+                metrics_rx: None,
+            },
+            resource_map: ResourceMapState {
+                scroll: 0,
+                sort: ResourceMapSort::Cpu,
+                metrics: None,
             },
             detail: DetailState {
                 value: Value::Null,
@@ -619,6 +645,7 @@ impl App {
                     | Panel::Favorites => Ctx::Resources,
                     | Panel::PortForwards => Ctx::PortForwards,
                     | Panel::Profiles => Ctx::Profiles,
+                    | Panel::ResourceMap => Ctx::ClusterStats,
                     | Panel::ResourceList(rt) if *rt == ResourceType::Event => Ctx::Events,
                     | Panel::ResourceList(_) | Panel::CustomResourceList(_) => Ctx::Resources,
                 }
@@ -693,6 +720,10 @@ impl App {
         items.push(NavItem {
             label: " Overview".to_string(),
             kind: NavItemKind::ClusterStats,
+        });
+        items.push(NavItem {
+            label: " Resource Map".to_string(),
+            kind: NavItemKind::ResourceMap,
         });
         items.push(NavItem {
             label: " Favorites".to_string(),
@@ -792,6 +823,8 @@ impl App {
         self.resources.counts.clear();
         self.resources.entries.clear();
         self.overview.stats = None;
+        self.overview.metrics = None;
+        self.resource_map.metrics = None;
         self.detail.value = serde_json::Value::Null;
         self.detail.yaml.clear();
         self.detail.name.clear();
@@ -1128,6 +1161,10 @@ impl App {
                 | Panel::CustomResourceList(_) => {
                     self.pending_load = Some(PendingLoad::CustomResources);
                 },
+                | Panel::ResourceMap => {
+                    self.load_metrics();
+                    self.last_refresh = std::time::Instant::now();
+                },
                 | _ => {},
             }
         }
@@ -1377,6 +1414,8 @@ impl App {
             let result = crate::k8s::KubeClient::fetch_cluster_stats_with_client(&client).await;
             let _ = tx.send(result);
         });
+        // Also refresh metrics
+        self.load_metrics();
     }
 
     /// Poll background cluster stats fetch — called every event loop tick.
@@ -1402,6 +1441,52 @@ impl App {
             },
             | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                 self.overview.pending_rx = None;
+            },
+        }
+    }
+
+    /// Spawn a background metrics fetch (for overview and resource map).
+    fn load_metrics(&mut self) {
+        if self.overview.metrics_rx.is_some() {
+            return;
+        }
+        let client = self.kube.client.default.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.overview.metrics_rx = Some(rx);
+        tokio::spawn(async move {
+            let data = crate::k8s::KubeClient::fetch_metrics_with_client(&client).await;
+            let _ = tx.send(data);
+        });
+    }
+
+    /// Poll background metrics fetch — called every event loop tick.
+    pub fn poll_metrics(&mut self) {
+        let rx = match &mut self.overview.metrics_rx {
+            | Some(rx) => rx,
+            | None => return,
+        };
+        match rx.try_recv() {
+            | Ok(data) => {
+                // Merge node usage into node_list for overview rendering
+                if data.available {
+                    if let Some(stats) = &mut self.overview.stats {
+                        for node in &mut stats.node_list {
+                            if let Some(nm) = data.node_metrics.iter().find(|m| m.name == node.name) {
+                                node.usage = Some(crate::k8s::ResourceUsage {
+                                    cpu_cores: nm.cpu_cores,
+                                    memory_bytes: nm.memory_bytes,
+                                });
+                            }
+                        }
+                    }
+                }
+                self.resource_map.metrics = if data.available { Some(data.clone()) } else { None };
+                self.overview.metrics = if data.available { Some(data) } else { None };
+                self.overview.metrics_rx = None;
+            },
+            | Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {},
+            | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.overview.metrics_rx = None;
             },
         }
     }
@@ -1630,6 +1715,14 @@ impl App {
                     self.pending_load = Some(PendingLoad::ClusterStats);
                 }
             },
+            | NavItemKind::ResourceMap => {
+                if !matches!(self.panel, Panel::ResourceMap) {
+                    self.panel = Panel::ResourceMap;
+                    self.clear_resource_filter();
+                    self.resource_map.scroll = 0;
+                    self.load_metrics();
+                }
+            },
             | NavItemKind::Resource(rt) => {
                 let rt = *rt;
                 if self.selected_resource_type() != Some(rt) {
@@ -1661,6 +1754,7 @@ impl App {
             NavItemKind::Resource(_)
                 | NavItemKind::CustomResource(_)
                 | NavItemKind::ClusterStats
+                | NavItemKind::ResourceMap
                 | NavItemKind::PortForwards
                 | NavItemKind::Favorites
                 | NavItemKind::Profiles
@@ -1717,7 +1811,6 @@ impl App {
                 return;
             },
             | Panel::Overview => {
-                // Cluster stats: scroll only
                 match key.code {
                     | KeyCode::Up | KeyCode::Char('k') => {
                         self.overview.scroll = self.overview.scroll.saturating_sub(1);
@@ -1733,6 +1826,33 @@ impl App {
                     },
                     | KeyCode::Home => {
                         self.overview.scroll = 0;
+                    },
+                    | _ => {},
+                }
+                return;
+            },
+            | Panel::ResourceMap => {
+                match key.code {
+                    | KeyCode::Up | KeyCode::Char('k') => {
+                        self.resource_map.scroll = self.resource_map.scroll.saturating_sub(1);
+                    },
+                    | KeyCode::Down | KeyCode::Char('j') => {
+                        self.resource_map.scroll = self.resource_map.scroll.saturating_add(1);
+                    },
+                    | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.resource_map.scroll = self.resource_map.scroll.saturating_sub(20);
+                    },
+                    | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.resource_map.scroll = self.resource_map.scroll.saturating_add(20);
+                    },
+                    | KeyCode::Home => {
+                        self.resource_map.scroll = 0;
+                    },
+                    | KeyCode::Char('m') => {
+                        self.resource_map.sort = match self.resource_map.sort {
+                            | ResourceMapSort::Cpu => ResourceMapSort::Memory,
+                            | ResourceMapSort::Memory => ResourceMapSort::Cpu,
+                        };
                     },
                     | _ => {},
                 }

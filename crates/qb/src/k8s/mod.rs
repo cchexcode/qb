@@ -469,6 +469,11 @@ pub struct ResourceCapacity {
     pub allocatable: String,
 }
 
+pub struct ResourceUsage {
+    pub cpu_cores: f64,
+    pub memory_bytes: f64,
+}
+
 pub struct NodeStats {
     pub name: String,
     pub status: String,
@@ -480,6 +485,7 @@ pub struct NodeStats {
     pub mem: ResourceCapacity,
     pub pods: ResourceCapacity,
     pub age: String,
+    pub usage: Option<ResourceUsage>,
 }
 
 pub struct NodeCounts {
@@ -540,6 +546,63 @@ pub struct PressureDetail {
     pub disk_pressure: usize,
     pub memory_pressure: usize,
     pub pid_pressure: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Metrics-server data (metrics.k8s.io/v1beta1)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct NodeMetricsEntry {
+    pub name: String,
+    pub cpu_cores: f64,
+    pub memory_bytes: f64,
+}
+
+#[derive(Clone, Default)]
+pub struct PodResourceSpec {
+    pub cpu_request: f64,
+    pub cpu_limit: f64,
+    pub mem_request: f64,
+    pub mem_limit: f64,
+}
+
+#[derive(Clone)]
+pub struct PodMetricsEntry {
+    pub name: String,
+    pub namespace: String,
+    pub cpu_cores: f64,
+    pub memory_bytes: f64,
+    /// Aggregated from pod spec containers[].resources
+    pub spec: PodResourceSpec,
+    /// Top-level owner (Deployment, StatefulSet, DaemonSet, Job, etc.)
+    pub owner: String,
+    pub owner_kind: String,
+}
+
+#[derive(Clone)]
+pub struct WorkloadMetrics {
+    pub name: String,
+    pub namespace: String,
+    pub kind: String,
+    pub pod_count: usize,
+    pub cpu_usage: f64,
+    pub mem_usage: f64,
+    pub cpu_request: f64,
+    pub cpu_limit: f64,
+    pub mem_request: f64,
+    pub mem_limit: f64,
+}
+
+#[derive(Clone)]
+pub struct MetricsData {
+    pub available: bool,
+    pub node_metrics: Vec<NodeMetricsEntry>,
+    pub pod_metrics: Vec<PodMetricsEntry>,
+    pub workload_metrics: Vec<WorkloadMetrics>,
+    /// Aggregate cluster usage (sum of all nodes)
+    pub total_cpu_usage: f64,
+    pub total_memory_usage: f64,
 }
 
 pub struct ClusterStatsData {
@@ -865,6 +928,7 @@ impl KubeClient {
                     allocatable: pod_alloc_raw,
                 },
                 age: format_age(n.metadata.creation_timestamp.as_ref()),
+                usage: None, // Filled in by metrics fetch
             });
         }
 
@@ -1068,6 +1132,205 @@ impl KubeClient {
             warning_details,
             pressure,
         })
+    }
+
+    /// Fetch metrics from the metrics-server API (metrics.k8s.io/v1beta1).
+    /// Returns `MetricsData { available: false, .. }` if metrics-server is not
+    /// installed — never fails hard so the overview keeps working without it.
+    pub async fn fetch_metrics_with_client(c: &Client) -> MetricsData {
+        let empty = MetricsData {
+            available: false,
+            node_metrics: Vec::new(),
+            pod_metrics: Vec::new(),
+            workload_metrics: Vec::new(),
+            total_cpu_usage: 0.0,
+            total_memory_usage: 0.0,
+        };
+
+        let node_ar = kube::api::ApiResource {
+            group: "metrics.k8s.io".into(),
+            version: "v1beta1".into(),
+            api_version: "metrics.k8s.io/v1beta1".into(),
+            kind: "NodeMetrics".into(),
+            plural: "nodes".into(),
+        };
+        let pod_ar = kube::api::ApiResource {
+            group: "metrics.k8s.io".into(),
+            version: "v1beta1".into(),
+            api_version: "metrics.k8s.io/v1beta1".into(),
+            kind: "PodMetrics".into(),
+            plural: "pods".into(),
+        };
+
+        let node_api: Api<kube::api::DynamicObject> = Api::all_with(c.clone(), &node_ar);
+        let pod_metrics_api: Api<kube::api::DynamicObject> = Api::all_with(c.clone(), &pod_ar);
+        let pod_spec_api: Api<Pod> = Api::all(c.clone());
+
+        let lp = ListParams::default();
+        let (node_res, metrics_res, spec_res) =
+            tokio::join!(node_api.list(&lp), pod_metrics_api.list(&lp), pod_spec_api.list(&lp),);
+
+        let node_list = match node_res {
+            | Ok(list) => list,
+            | Err(_) => return empty,
+        };
+        let metrics_list = match metrics_res {
+            | Ok(list) => list,
+            | Err(_) => return empty,
+        };
+        let spec_list = spec_res.ok();
+
+        // Build pod spec lookup: name+ns → (requests, limits, owner)
+        let mut spec_map: std::collections::HashMap<(String, String), (PodResourceSpec, String, String)> =
+            std::collections::HashMap::new();
+        if let Some(pods) = &spec_list {
+            for p in &pods.items {
+                let name = meta_name(&p.metadata);
+                let ns = meta_ns(&p.metadata);
+                let mut spec = PodResourceSpec::default();
+
+                if let Some(pod_spec) = &p.spec {
+                    for container in &pod_spec.containers {
+                        if let Some(res) = &container.resources {
+                            if let Some(req) = &res.requests {
+                                if let Some(cpu) = req.get("cpu") {
+                                    spec.cpu_request += parse_cpu_cores(&cpu.0);
+                                }
+                                if let Some(mem) = req.get("memory") {
+                                    spec.mem_request += parse_memory_bytes(&mem.0);
+                                }
+                            }
+                            if let Some(lim) = &res.limits {
+                                if let Some(cpu) = lim.get("cpu") {
+                                    spec.cpu_limit += parse_cpu_cores(&cpu.0);
+                                }
+                                if let Some(mem) = lim.get("memory") {
+                                    spec.mem_limit += parse_memory_bytes(&mem.0);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Resolve owner — walk up: Pod → ReplicaSet → Deployment
+                let (owner_name, owner_kind) = resolve_top_owner(p);
+
+                spec_map.insert((name, ns), (spec, owner_name, owner_kind));
+            }
+        }
+
+        // Node metrics
+        let mut total_cpu = 0.0f64;
+        let mut total_mem = 0.0f64;
+
+        let node_metrics: Vec<NodeMetricsEntry> = node_list
+            .items
+            .iter()
+            .map(|obj| {
+                let name = obj.metadata.name.clone().unwrap_or_default();
+                let usage = obj.data.get("usage");
+                let cpu = usage
+                    .and_then(|u| u.get("cpu"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| parse_cpu_cores(s))
+                    .unwrap_or(0.0);
+                let mem = usage
+                    .and_then(|u| u.get("memory"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| parse_memory_bytes(s))
+                    .unwrap_or(0.0);
+                total_cpu += cpu;
+                total_mem += mem;
+                NodeMetricsEntry {
+                    name,
+                    cpu_cores: cpu,
+                    memory_bytes: mem,
+                }
+            })
+            .collect();
+
+        // Pod metrics + spec enrichment
+        let pod_metrics: Vec<PodMetricsEntry> = metrics_list
+            .items
+            .iter()
+            .map(|obj| {
+                let name = obj.metadata.name.clone().unwrap_or_default();
+                let namespace = obj.metadata.namespace.clone().unwrap_or_default();
+                let containers = obj.data.get("containers").and_then(|c| c.as_array());
+                let (mut cpu, mut mem) = (0.0f64, 0.0f64);
+                if let Some(cs) = containers {
+                    for c in cs {
+                        let usage = c.get("usage");
+                        cpu += usage
+                            .and_then(|u| u.get("cpu"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| parse_cpu_cores(s))
+                            .unwrap_or(0.0);
+                        mem += usage
+                            .and_then(|u| u.get("memory"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| parse_memory_bytes(s))
+                            .unwrap_or(0.0);
+                    }
+                }
+
+                let key = (name.clone(), namespace.clone());
+                let (spec, owner, owner_kind) = spec_map
+                    .remove(&key)
+                    .unwrap_or_else(|| (PodResourceSpec::default(), name.clone(), "Pod".into()));
+
+                PodMetricsEntry {
+                    name,
+                    namespace,
+                    cpu_cores: cpu,
+                    memory_bytes: mem,
+                    spec,
+                    owner,
+                    owner_kind,
+                }
+            })
+            .collect();
+
+        // Workload-level aggregation
+        let mut wl_map: std::collections::HashMap<(String, String, String), WorkloadMetrics> =
+            std::collections::HashMap::new();
+        for pm in &pod_metrics {
+            let key = (pm.owner.clone(), pm.namespace.clone(), pm.owner_kind.clone());
+            let wl = wl_map.entry(key).or_insert(WorkloadMetrics {
+                name: pm.owner.clone(),
+                namespace: pm.namespace.clone(),
+                kind: pm.owner_kind.clone(),
+                pod_count: 0,
+                cpu_usage: 0.0,
+                mem_usage: 0.0,
+                cpu_request: 0.0,
+                cpu_limit: 0.0,
+                mem_request: 0.0,
+                mem_limit: 0.0,
+            });
+            wl.pod_count += 1;
+            wl.cpu_usage += pm.cpu_cores;
+            wl.mem_usage += pm.memory_bytes;
+            wl.cpu_request += pm.spec.cpu_request;
+            wl.cpu_limit += pm.spec.cpu_limit;
+            wl.mem_request += pm.spec.mem_request;
+            wl.mem_limit += pm.spec.mem_limit;
+        }
+        let mut workload_metrics: Vec<WorkloadMetrics> = wl_map.into_values().collect();
+        workload_metrics.sort_by(|a, b| {
+            b.cpu_usage
+                .partial_cmp(&a.cpu_usage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        MetricsData {
+            available: true,
+            node_metrics,
+            pod_metrics,
+            workload_metrics,
+            total_cpu_usage: total_cpu,
+            total_memory_usage: total_mem,
+        }
     }
 
     pub async fn list_resources(&self, rt: ResourceType) -> Result<Vec<ResourceEntry>> {
@@ -3443,6 +3706,30 @@ fn meta_ns(meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta) ->
     meta.namespace.clone().unwrap_or_default()
 }
 
+/// Resolve the top-level owner of a pod (e.g. Deployment, not ReplicaSet).
+/// For ReplicaSet-owned pods, strips the hash suffix to infer the Deployment
+/// name.
+fn resolve_top_owner(pod: &Pod) -> (String, String) {
+    let owners = pod.metadata.owner_references.as_ref();
+    let owner = owners.and_then(|refs| refs.first());
+    match owner {
+        | Some(oref) => {
+            let kind = oref.kind.as_str();
+            let name = &oref.name;
+            match kind {
+                // ReplicaSets are owned by Deployments — infer Deployment name
+                | "ReplicaSet" => {
+                    // Deployment-created RS names follow: <deploy>-<hash>
+                    let deploy_name = name.rsplit_once('-').map(|(prefix, _)| prefix).unwrap_or(name);
+                    (deploy_name.to_string(), "Deployment".to_string())
+                },
+                | _ => (name.clone(), kind.to_string()),
+            }
+        },
+        | None => (meta_name(&pod.metadata), "Pod".to_string()),
+    }
+}
+
 fn format_age(timestamp: Option<&Time>) -> String {
     match timestamp {
         | Some(time) => {
@@ -3469,7 +3756,7 @@ fn format_duration(dur: jiff::SignedDuration) -> String {
     }
 }
 
-fn parse_memory_bytes(raw: &str) -> f64 {
+pub fn parse_memory_bytes(raw: &str) -> f64 {
     if raw == "-" || raw.is_empty() {
         return 0.0;
     }
@@ -3494,7 +3781,7 @@ fn parse_memory_bytes(raw: &str) -> f64 {
     }
 }
 
-fn parse_cpu_cores(raw: &str) -> f64 {
+pub fn parse_cpu_cores(raw: &str) -> f64 {
     if raw == "-" || raw.is_empty() {
         return 0.0;
     }

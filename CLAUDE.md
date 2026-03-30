@@ -191,7 +191,8 @@ Overview is always the first item and the default landing screen. Width is adjus
 with `<` / `>` (min 16, max 60 columns).
 
 1. **Overview** — Cluster stats, health, node grid (default on startup)
-2. **Favorites** — Starred resources across all types (`*` to toggle, shows count badge)
+2. **Resource Map** — Pod resource treemap / flamegraph (`m` to toggle CPU/Memory sort)
+3. **Favorites** — Starred resources across all types (`*` to toggle, shows count badge)
 3. **Port Forwards** — View, pause, resume, cancel; persisted to config
 4. **Profiles** — Named sets of favorites and port forwards
 5. **WORKLOADS** — Deployments, StatefulSets, DaemonSets, ReplicaSets, Pods, CronJobs, Jobs, HPAs
@@ -215,10 +216,27 @@ namespaced variants.
 
 ### Cluster Stats (Overview)
 
-Shown by default on startup. Displays stat cards (K8s version, nodes, namespaces, deployments,
-services), pod health gauge bar, and a responsive grid of node cards. Each node card shows
-status, role, version, cpu/memory/pods capacity, os/arch, and age. Grid auto-tiles based on
-terminal width.
+Shown by default on startup. Displays three rows of stat cards (K8s version, nodes, namespaces,
+pods; deployments, statefulsets, daemonsets, jobs, cronjobs; configmaps, secrets, services,
+ingresses, PVCs, HPAs), health warnings (pressure detail, workload health), workload health
+gauge bars, cluster resource utilization (live CPU/memory usage when metrics-server is available,
+falls back to allocatable/capacity), pod breakdown with container counts and restart totals,
+top restarting pods, recent warning event details, and a responsive grid of node cards.
+
+Node cards show live CPU/memory usage percentages when metrics-server is available, with color
+coding (green < 70%, yellow 70-90%, red > 90%).
+
+**Metrics integration**: The overview and resource map query the `metrics.k8s.io/v1beta1` API
+in background tasks (never blocks UI). If metrics-server is not installed, the overview
+gracefully falls back to showing allocatable/capacity ratios instead of live usage.
+
+### Resource Map
+
+Accessed from the sidebar below Overview. Shows pod resource consumption as a treemap/flamegraph.
+Pods are aggregated by namespace with proportional bars. `m` toggles between CPU and Memory
+sorting. Displays namespace breakdown with gauge bars, top 30 pods sorted by resource usage,
+and a proportional treemap visualization. Requires metrics-server — shows a message if
+unavailable. Auto-refreshes every 2 seconds.
 
 ### Events Log
 

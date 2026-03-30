@@ -220,6 +220,7 @@ fn render_nav(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|item| {
             let is_active = match (&item.kind, &app.panel) {
                 | (NavItemKind::ClusterStats, Panel::Overview) => true,
+                | (NavItemKind::ResourceMap, Panel::ResourceMap) => true,
                 | (NavItemKind::Favorites, Panel::Favorites) => true,
                 | (NavItemKind::PortForwards, Panel::PortForwards) => true,
                 | (NavItemKind::Profiles, Panel::Profiles) => true,
@@ -306,6 +307,10 @@ fn render_resources(f: &mut Frame, app: &mut App, area: Rect) {
         },
         | Panel::Overview => {
             render_cluster_stats(f, app, area);
+            return;
+        },
+        | Panel::ResourceMap => {
+            render_resource_map(f, app, area);
             return;
         },
         | Panel::ResourceList(_) | Panel::CustomResourceList(_) => {},
@@ -661,31 +666,83 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
         Span::styled(format!("{:<w$}", node.version, w = res_val_w), val),
     ]));
 
-    // CPU row
-    card.push(row(vec![
-        Span::styled(format!("{:<w$}", "cpu", w = res_lbl_w), lbl),
-        Span::styled(
-            format!(
-                "{:<w$}",
-                format!("{} / {}", node.cpu.allocatable, node.cpu.capacity),
-                w = res_val_w
+    // CPU row — show usage if available
+    if let Some(usage) = &node.usage {
+        let cap = crate::k8s::parse_cpu_cores(&node.cpu.capacity);
+        let pct = if cap > 0.0 {
+            (usage.cpu_cores / cap * 100.0) as usize
+        } else {
+            0
+        };
+        let color = usage_color(pct);
+        card.push(row(vec![
+            Span::styled(format!("{:<w$}", "cpu", w = res_lbl_w), lbl),
+            Span::styled(
+                format!(
+                    "{:<w$}",
+                    format!(
+                        "{} / {} ({}%)",
+                        crate::k8s::format_cpu_cores(usage.cpu_cores),
+                        node.cpu.capacity,
+                        pct
+                    ),
+                    w = res_val_w
+                ),
+                Style::default().fg(color),
             ),
-            val,
-        ),
-    ]));
+        ]));
+    } else {
+        card.push(row(vec![
+            Span::styled(format!("{:<w$}", "cpu", w = res_lbl_w), lbl),
+            Span::styled(
+                format!(
+                    "{:<w$}",
+                    format!("{} / {}", node.cpu.allocatable, node.cpu.capacity),
+                    w = res_val_w
+                ),
+                val,
+            ),
+        ]));
+    }
 
-    // Memory row
-    card.push(row(vec![
-        Span::styled(format!("{:<w$}", "memory", w = res_lbl_w), lbl),
-        Span::styled(
-            format!(
-                "{:<w$}",
-                format!("{} / {}", node.mem.allocatable, node.mem.capacity),
-                w = res_val_w
+    // Memory row — show usage if available
+    if let Some(usage) = &node.usage {
+        let cap = crate::k8s::parse_memory_bytes(&node.mem.capacity);
+        let pct = if cap > 0.0 {
+            (usage.memory_bytes / cap * 100.0) as usize
+        } else {
+            0
+        };
+        let color = usage_color(pct);
+        card.push(row(vec![
+            Span::styled(format!("{:<w$}", "memory", w = res_lbl_w), lbl),
+            Span::styled(
+                format!(
+                    "{:<w$}",
+                    format!(
+                        "{} / {} ({}%)",
+                        crate::k8s::format_memory_gb_from_bytes(usage.memory_bytes),
+                        node.mem.capacity,
+                        pct
+                    ),
+                    w = res_val_w
+                ),
+                Style::default().fg(color),
             ),
-            val,
-        ),
-    ]));
+        ]));
+    } else {
+        card.push(row(vec![
+            Span::styled(format!("{:<w$}", "memory", w = res_lbl_w), lbl),
+            Span::styled(
+                format!(
+                    "{:<w$}",
+                    format!("{} / {}", node.mem.allocatable, node.mem.capacity),
+                    w = res_val_w
+                ),
+                val,
+            ),
+        ]));
+    }
 
     // Pods row
     card.push(row(vec![
@@ -962,53 +1019,96 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
     // ── Cluster Resources ────────────────────────────────────
     {
         let cr = &stats.cluster_resources;
+        let m = &app.overview.metrics;
         if cr.cpu_capacity > 0.0 || cr.mem_capacity_bytes > 0.0 {
             lines.extend(section_heading("Cluster Resources", heading, dim));
             let bar_w = 30;
             let lbl_w = 16;
 
-            // CPU: allocatable / capacity
-            let cpu_alloc_pct = if cr.cpu_capacity > 0.0 {
-                (cr.cpu_allocatable / cr.cpu_capacity * 100.0) as usize
-            } else {
-                0
-            };
-            let mut spans = vec![Span::styled(format!("  {:<w$}", "CPU", w = lbl_w), label)];
-            spans.extend(gauge_bar_inv(cpu_alloc_pct, bar_w));
-            spans.push(Span::styled(
-                format!(
-                    "  {} / {} cores",
-                    crate::k8s::format_cpu_cores(cr.cpu_allocatable),
-                    crate::k8s::format_cpu_cores(cr.cpu_capacity)
-                ),
-                dim,
-            ));
-            lines.push(Line::from(spans));
-
-            // Memory: allocatable / capacity
-            let mem_alloc_pct = if cr.mem_capacity_bytes > 0.0 {
-                (cr.mem_allocatable_bytes / cr.mem_capacity_bytes * 100.0) as usize
-            } else {
-                0
-            };
-            let mut spans = vec![Span::styled(format!("  {:<w$}", "Memory", w = lbl_w), label)];
-            spans.extend(gauge_bar_inv(mem_alloc_pct, bar_w));
-            spans.push(Span::styled(
-                format!(
-                    "  {} / {}",
-                    crate::k8s::format_memory_gb_from_bytes(cr.mem_allocatable_bytes),
-                    crate::k8s::format_memory_gb_from_bytes(cr.mem_capacity_bytes)
-                ),
-                dim,
-            ));
-            lines.push(Line::from(spans));
-
-            // Pods: allocatable / capacity
-            if cr.pod_capacity > 0 {
-                let mut spans = vec![Span::styled(format!("  {:<w$}", "Pod Capacity", w = lbl_w), label)];
-                spans.extend(gauge_bar(cr.pod_allocatable, cr.pod_capacity, bar_w));
+            // CPU: show live usage if metrics available, otherwise allocatable/capacity
+            if let Some(metrics) = m.as_ref().filter(|m| m.available) {
+                let pct = if cr.cpu_capacity > 0.0 {
+                    (metrics.total_cpu_usage / cr.cpu_capacity * 100.0) as usize
+                } else {
+                    0
+                };
+                let mut spans = vec![Span::styled(format!("  {:<w$}", "CPU Usage", w = lbl_w), label)];
+                spans.extend(gauge_bar_usage(pct, bar_w));
                 spans.push(Span::styled(
-                    format!("  {} / {} slots", cr.pod_allocatable, cr.pod_capacity),
+                    format!(
+                        "  {} / {} cores",
+                        crate::k8s::format_cpu_cores(metrics.total_cpu_usage),
+                        crate::k8s::format_cpu_cores(cr.cpu_capacity)
+                    ),
+                    dim,
+                ));
+                lines.push(Line::from(spans));
+            } else {
+                let cpu_alloc_pct = if cr.cpu_capacity > 0.0 {
+                    (cr.cpu_allocatable / cr.cpu_capacity * 100.0) as usize
+                } else {
+                    0
+                };
+                let mut spans = vec![Span::styled(format!("  {:<w$}", "CPU", w = lbl_w), label)];
+                spans.extend(gauge_bar_inv(cpu_alloc_pct, bar_w));
+                spans.push(Span::styled(
+                    format!(
+                        "  {} / {} cores",
+                        crate::k8s::format_cpu_cores(cr.cpu_allocatable),
+                        crate::k8s::format_cpu_cores(cr.cpu_capacity)
+                    ),
+                    dim,
+                ));
+                lines.push(Line::from(spans));
+            }
+
+            // Memory: show live usage if metrics available
+            if let Some(metrics) = m.as_ref().filter(|m| m.available) {
+                let pct = if cr.mem_capacity_bytes > 0.0 {
+                    (metrics.total_memory_usage / cr.mem_capacity_bytes * 100.0) as usize
+                } else {
+                    0
+                };
+                let mut spans = vec![Span::styled(format!("  {:<w$}", "Mem Usage", w = lbl_w), label)];
+                spans.extend(gauge_bar_usage(pct, bar_w));
+                spans.push(Span::styled(
+                    format!(
+                        "  {} / {}",
+                        crate::k8s::format_memory_gb_from_bytes(metrics.total_memory_usage),
+                        crate::k8s::format_memory_gb_from_bytes(cr.mem_capacity_bytes)
+                    ),
+                    dim,
+                ));
+                lines.push(Line::from(spans));
+            } else {
+                let mem_alloc_pct = if cr.mem_capacity_bytes > 0.0 {
+                    (cr.mem_allocatable_bytes / cr.mem_capacity_bytes * 100.0) as usize
+                } else {
+                    0
+                };
+                let mut spans = vec![Span::styled(format!("  {:<w$}", "Memory", w = lbl_w), label)];
+                spans.extend(gauge_bar_inv(mem_alloc_pct, bar_w));
+                spans.push(Span::styled(
+                    format!(
+                        "  {} / {}",
+                        crate::k8s::format_memory_gb_from_bytes(cr.mem_allocatable_bytes),
+                        crate::k8s::format_memory_gb_from_bytes(cr.mem_capacity_bytes)
+                    ),
+                    dim,
+                ));
+                lines.push(Line::from(spans));
+            }
+
+            // Pods: used / capacity
+            if cr.pod_capacity > 0 {
+                let pods_used = stats.pods.running + stats.pods.pending;
+                let mut spans = vec![Span::styled(format!("  {:<w$}", "Pod Usage", w = lbl_w), label)];
+                spans.extend(gauge_bar_usage(
+                    (pods_used as f64 / cr.pod_capacity as f64 * 100.0) as usize,
+                    bar_w,
+                ));
+                spans.push(Span::styled(
+                    format!("  {} / {} slots", pods_used, cr.pod_capacity),
                     dim,
                 ));
                 lines.push(Line::from(spans));
@@ -1165,6 +1265,471 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
                 .title(" Cluster Overview "),
         )
         .scroll((app.overview.scroll, 0));
+    f.render_widget(paragraph, area);
+}
+
+fn usage_color(pct: usize) -> Color {
+    if pct >= 90 {
+        Color::Red
+    } else if pct >= 70 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// Render a usage gauge bar where higher = worse (red at top).
+fn gauge_bar_usage(pct: usize, width: usize) -> Vec<Span<'static>> {
+    let pct_f = (pct as f64 / 100.0).clamp(0.0, 1.0);
+    let filled_w = ((pct_f * width as f64) as usize).min(width);
+    let empty_w = width - filled_w;
+    let color = usage_color(pct);
+
+    vec![
+        Span::styled("[", Style::default().fg(Color::DarkGray)),
+        Span::styled("█".repeat(filled_w), Style::default().fg(color)),
+        Span::styled("░".repeat(empty_w), Style::default().fg(Color::DarkGray)),
+        Span::styled("] ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}%", pct), Style::default().fg(color)),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Resource Map (pod flamegraph / treemap)
+// ---------------------------------------------------------------------------
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    } else {
+        s.to_string()
+    }
+}
+
+fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
+    use super::app::ResourceMapSort;
+
+    let focused = app.focus == Focus::Resources;
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+
+    let metrics = match &app.resource_map.metrics {
+        | Some(m) if m.available => m,
+        | _ => {
+            let msg = if app.overview.metrics_rx.is_some() {
+                " Resource Map — Loading metrics... "
+            } else {
+                " Resource Map — metrics-server not available "
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(msg);
+            f.render_widget(block, area);
+            return;
+        },
+    };
+
+    let heading = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let label = Style::default().fg(Color::Cyan);
+    let value = Style::default().fg(Color::White);
+    let dim = Style::default().fg(Color::DarkGray);
+    let good = Style::default().fg(Color::Green);
+    let warn = Style::default().fg(Color::Yellow);
+    let bad = Style::default().fg(Color::Red);
+
+    // Filter by selected namespace
+    let ns_filter = app.kube.context.namespace.as_deref();
+    let filtered_pods: Vec<&crate::k8s::PodMetricsEntry> = metrics
+        .pod_metrics
+        .iter()
+        .filter(|p| ns_filter.is_none() || ns_filter == Some(p.namespace.as_str()))
+        .collect();
+    let filtered_workloads: Vec<&crate::k8s::WorkloadMetrics> = metrics
+        .workload_metrics
+        .iter()
+        .filter(|w| ns_filter.is_none() || ns_filter == Some(w.namespace.as_str()))
+        .collect();
+
+    // Totals for the filtered set
+    let total_cpu: f64 = filtered_pods.iter().map(|p| p.cpu_cores).sum::<f64>().max(0.001);
+    let total_mem: f64 = filtered_pods.iter().map(|p| p.memory_bytes).sum::<f64>().max(1.0);
+    let total_cpu_req: f64 = filtered_pods.iter().map(|p| p.spec.cpu_request).sum();
+    let total_cpu_lim: f64 = filtered_pods.iter().map(|p| p.spec.cpu_limit).sum();
+    let total_mem_req: f64 = filtered_pods.iter().map(|p| p.spec.mem_request).sum();
+    let total_mem_lim: f64 = filtered_pods.iter().map(|p| p.spec.mem_limit).sum();
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let sort = app.resource_map.sort;
+    let sort_label = match sort {
+        | ResourceMapSort::Cpu => "CPU",
+        | ResourceMapSort::Memory => "Memory",
+    };
+
+    let ns_label = ns_filter.unwrap_or("all namespaces");
+
+    // ── Header ───────────────────────────────────────────────
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {ns_label}"), heading),
+        Span::styled("  sorted by: ", dim),
+        Span::styled(sort_label, label),
+        Span::styled("  (", dim),
+        Span::styled("m", label),
+        Span::styled(" toggle  ", dim),
+        Span::styled("n", label),
+        Span::styled(" namespace)  ", dim),
+        Span::styled("!", bad),
+        Span::styled(" over limit  ", dim),
+        Span::styled("$", Style::default().fg(Color::Blue)),
+        Span::styled(" over-provisioned", dim),
+    ]));
+    lines.push(Line::from(""));
+
+    // ── Efficiency ─────────────────────────────────────────
+    let eff_title = if ns_filter.is_some() {
+        "Namespace Efficiency"
+    } else {
+        "Cluster Efficiency"
+    };
+    lines.extend(section_heading(eff_title, heading, dim));
+    {
+        let cpu_req = total_cpu_req;
+        let cpu_lim = total_cpu_lim;
+        let mem_req = total_mem_req;
+        let mem_lim = total_mem_lim;
+
+        // CPU: usage / request / limit
+        let mut cpu_spans = vec![Span::styled("  CPU      ", label)];
+        cpu_spans.push(Span::styled(
+            format!("used: {}  ", crate::k8s::format_cpu_cores(total_cpu)),
+            value,
+        ));
+        if cpu_req > 0.0 {
+            let pct = (total_cpu / cpu_req * 100.0) as usize;
+            cpu_spans.push(Span::styled(
+                format!("req: {} ({}% used)  ", crate::k8s::format_cpu_cores(cpu_req), pct),
+                if pct < 50 {
+                    Style::default().fg(Color::Blue)
+                } else {
+                    good
+                },
+            ));
+        }
+        if cpu_lim > 0.0 {
+            let pct = (total_cpu / cpu_lim * 100.0) as usize;
+            cpu_spans.push(Span::styled(
+                format!("lim: {} ({}% used)", crate::k8s::format_cpu_cores(cpu_lim), pct),
+                if pct > 90 { bad } else { dim },
+            ));
+        }
+        lines.push(Line::from(cpu_spans));
+
+        // Memory: usage / request / limit
+        let mut mem_spans = vec![Span::styled("  Memory   ", label)];
+        mem_spans.push(Span::styled(
+            format!("used: {}  ", crate::k8s::format_memory_gb_from_bytes(total_mem)),
+            value,
+        ));
+        if mem_req > 0.0 {
+            let pct = (total_mem / mem_req * 100.0) as usize;
+            mem_spans.push(Span::styled(
+                format!(
+                    "req: {} ({}% used)  ",
+                    crate::k8s::format_memory_gb_from_bytes(mem_req),
+                    pct
+                ),
+                if pct < 50 {
+                    Style::default().fg(Color::Blue)
+                } else {
+                    good
+                },
+            ));
+        }
+        if mem_lim > 0.0 {
+            let pct = (total_mem / mem_lim * 100.0) as usize;
+            mem_spans.push(Span::styled(
+                format!(
+                    "lim: {} ({}% used)",
+                    crate::k8s::format_memory_gb_from_bytes(mem_lim),
+                    pct
+                ),
+                if pct > 90 { bad } else { dim },
+            ));
+        }
+        lines.push(Line::from(mem_spans));
+    }
+    lines.push(Line::from(""));
+
+    // ── Workloads ────────────────────────────────────────────
+    if !filtered_workloads.is_empty() {
+        let mut wls = filtered_workloads.clone();
+        match sort {
+            | ResourceMapSort::Cpu => {
+                wls.sort_by(|a, b| {
+                    b.cpu_usage
+                        .partial_cmp(&a.cpu_usage)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            },
+            | ResourceMapSort::Memory => {
+                wls.sort_by(|a, b| {
+                    b.mem_usage
+                        .partial_cmp(&a.mem_usage)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            },
+        }
+        let top_n = 25.min(wls.len());
+        lines.extend(section_heading(
+            &format!("Workloads by {sort_label} ({top_n}/{} total)", wls.len()),
+            heading,
+            dim,
+        ));
+
+        // Header
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<30}", "WORKLOAD"), dim),
+            Span::styled(format!("{:<16}", "NAMESPACE"), dim),
+            Span::styled(format!("{:<5}", "KIND"), dim),
+            Span::styled(format!("{:>4}", "#"), dim),
+            Span::styled(format!("{:>16}", "CPU use/req"), dim),
+            Span::styled(format!("{:>16}", "MEM use/req"), dim),
+        ]));
+
+        for wl in wls.iter().take(top_n) {
+            let cpu_pct_str = if wl.cpu_request > 0.0 {
+                format!(
+                    "{}/{}",
+                    crate::k8s::format_cpu_cores(wl.cpu_usage),
+                    crate::k8s::format_cpu_cores(wl.cpu_request)
+                )
+            } else {
+                format!("{}/–", crate::k8s::format_cpu_cores(wl.cpu_usage))
+            };
+            let mem_pct_str = if wl.mem_request > 0.0 {
+                format!(
+                    "{}/{}",
+                    crate::k8s::format_memory_gb_from_bytes(wl.mem_usage),
+                    crate::k8s::format_memory_gb_from_bytes(wl.mem_request)
+                )
+            } else {
+                format!("{}/–", crate::k8s::format_memory_gb_from_bytes(wl.mem_usage))
+            };
+
+            let cpu_color = if wl.cpu_request > 0.0 {
+                let r = wl.cpu_usage / wl.cpu_request;
+                if r > 1.5 {
+                    Color::Red
+                } else if r < 0.2 {
+                    Color::Blue
+                } else {
+                    Color::Green
+                }
+            } else {
+                Color::White
+            };
+            let mem_color = if wl.mem_request > 0.0 {
+                let r = wl.mem_usage / wl.mem_request;
+                if r > 1.5 {
+                    Color::Red
+                } else if r < 0.2 {
+                    Color::Blue
+                } else {
+                    Color::Green
+                }
+            } else {
+                Color::White
+            };
+
+            let kind_short = match wl.kind.as_str() {
+                | "Deployment" => "Dply",
+                | "StatefulSet" => "SSet",
+                | "DaemonSet" => "DS",
+                | "Job" => "Job",
+                | "CronJob" => "CJob",
+                | "Pod" => "Pod",
+                | k => &k[..4.min(k.len())],
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<30}", truncate(&wl.name, 28)), value),
+                Span::styled(format!("{:<16}", truncate(&wl.namespace, 14)), dim),
+                Span::styled(format!("{:<5}", kind_short), dim),
+                Span::styled(format!("{:>4}", wl.pod_count), dim),
+                Span::styled(format!("{:>16}", cpu_pct_str), Style::default().fg(cpu_color)),
+                Span::styled(format!("{:>16}", mem_pct_str), Style::default().fg(mem_color)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // ── Optimization flags ───────────────────────────────────
+    {
+        let over_cpu: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.cpu_request > 0.0 && p.cpu_cores / p.spec.cpu_request < 0.1)
+            .collect();
+        let over_mem: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.mem_request > 0.0 && p.memory_bytes / p.spec.mem_request < 0.1)
+            .collect();
+        let no_requests: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.cpu_request == 0.0 && p.spec.mem_request == 0.0)
+            .collect();
+        let no_limits: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.cpu_limit == 0.0 && p.spec.mem_limit == 0.0)
+            .collect();
+        let over_limit_cpu: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.cpu_limit > 0.0 && p.cpu_cores > p.spec.cpu_limit)
+            .collect();
+        let over_limit_mem: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.mem_limit > 0.0 && p.memory_bytes > p.spec.mem_limit)
+            .collect();
+
+        let has_issues = !over_cpu.is_empty()
+            || !over_mem.is_empty()
+            || !no_requests.is_empty()
+            || !no_limits.is_empty()
+            || !over_limit_cpu.is_empty()
+            || !over_limit_mem.is_empty();
+
+        if has_issues {
+            lines.extend(section_heading("Optimization Opportunities", heading, dim));
+
+            if !over_limit_cpu.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ! {} pod(s) exceeding CPU limit (throttled)", over_limit_cpu.len()),
+                    bad,
+                )));
+            }
+            if !over_limit_mem.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  ! {} pod(s) exceeding memory limit (OOMKill risk)",
+                        over_limit_mem.len()
+                    ),
+                    bad,
+                )));
+            }
+            if !no_requests.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  ? {} pod(s) with no resource requests (BestEffort QoS)",
+                        no_requests.len()
+                    ),
+                    warn,
+                )));
+            }
+            if !no_limits.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ? {} pod(s) with no resource limits", no_limits.len()),
+                    warn,
+                )));
+            }
+            if !over_cpu.is_empty() {
+                // Sum wasted CPU
+                let wasted: f64 = over_cpu.iter().map(|p| p.spec.cpu_request - p.cpu_cores).sum();
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  $ {} pod(s) using <10% of CPU request ({} cores reclaimable)",
+                        over_cpu.len(),
+                        crate::k8s::format_cpu_cores(wasted)
+                    ),
+                    Style::default().fg(Color::Blue),
+                )));
+            }
+            if !over_mem.is_empty() {
+                let wasted: f64 = over_mem.iter().map(|p| p.spec.mem_request - p.memory_bytes).sum();
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  $ {} pod(s) using <10% of memory request ({} reclaimable)",
+                        over_mem.len(),
+                        crate::k8s::format_memory_gb_from_bytes(wasted)
+                    ),
+                    Style::default().fg(Color::Blue),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    // ── Namespace treemap ────────────────────────────────────
+    let mut ns_map: std::collections::BTreeMap<&str, (f64, f64, usize)> = std::collections::BTreeMap::new();
+    for pod in &filtered_pods {
+        let entry = ns_map.entry(pod.namespace.as_str()).or_insert((0.0, 0.0, 0));
+        entry.0 += pod.cpu_cores;
+        entry.1 += pod.memory_bytes;
+        entry.2 += 1;
+    }
+
+    let mut ns_list: Vec<(&str, f64, f64, usize)> = ns_map
+        .into_iter()
+        .map(|(ns, (cpu, mem, count))| (ns, cpu, mem, count))
+        .collect();
+
+    match sort {
+        | ResourceMapSort::Cpu => ns_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)),
+        | ResourceMapSort::Memory => ns_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)),
+    }
+
+    let inner_w = area.width.saturating_sub(4) as usize;
+    if inner_w > 10 && !ns_list.is_empty() {
+        lines.extend(section_heading(
+            &format!("Namespace {sort_label} Treemap"),
+            heading,
+            dim,
+        ));
+
+        let total_val = match sort {
+            | ResourceMapSort::Cpu => total_cpu,
+            | ResourceMapSort::Memory => total_mem,
+        };
+
+        for (ns, cpu, mem, count) in &ns_list {
+            let ns_val = match sort {
+                | ResourceMapSort::Cpu => *cpu,
+                | ResourceMapSort::Memory => *mem,
+            };
+            let pct = (ns_val / total_val * 100.0) as usize;
+            if pct == 0 {
+                continue;
+            }
+
+            let block_w = ((ns_val / total_val) * inner_w as f64).max(1.0) as usize;
+            let color = usage_color(pct.min(100));
+
+            lines.push(Line::from(vec![
+                Span::styled("  ", dim),
+                Span::styled("█".repeat(block_w.min(inner_w)), Style::default().fg(color)),
+                Span::styled(" ".repeat(inner_w.saturating_sub(block_w)), Style::default()),
+            ]));
+            let val_str = match sort {
+                | ResourceMapSort::Cpu => format!("{} cores", crate::k8s::format_cpu_cores(*cpu)),
+                | ResourceMapSort::Memory => crate::k8s::format_memory_gb_from_bytes(*mem),
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ", dim),
+                Span::styled(
+                    format!("{ns} — {pct}% — {val_str} ({count} pods)"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(" Resource Map "),
+        )
+        .scroll((app.resource_map.scroll, 0));
     f.render_widget(paragraph, area);
 }
 
