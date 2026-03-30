@@ -213,7 +213,7 @@ fn has_pf_entries(f: &CmdFlags) -> bool {
 static COMMANDS: &[Cmd] = &[
     // ── Global ──────────────────────────────────────────────────────────
     Cmd {
-        key: "Ctrl+C",
+        key: "Ctrl+c",
         label: "Quit",
         description: "Force quit immediately",
         contexts: &[Ctx::Global],
@@ -249,7 +249,7 @@ static COMMANDS: &[Cmd] = &[
         available: None,
     },
     Cmd {
-        key: "Ctrl+P",
+        key: "Ctrl+p",
         label: "Palette",
         description: "Open command palette (prefix > for commands)",
         contexts: &[Ctx::Global],
@@ -350,9 +350,9 @@ static COMMANDS: &[Cmd] = &[
     },
     // ── Main view: sidebar ──────────────────────────────────────────────
     Cmd {
-        key: "</>/<<",
+        key: "< / >",
         label: "Width",
-        description: "Grow/shrink sidebar width",
+        description: "Shrink/grow sidebar width",
         contexts: &[
             Ctx::Nav,
             Ctx::Resources,
@@ -378,7 +378,14 @@ static COMMANDS: &[Cmd] = &[
         key: "Tab",
         label: "Focus",
         description: "Toggle focus between sidebar and table",
-        contexts: &[Ctx::Nav, Ctx::Resources, Ctx::Events, Ctx::ClusterStats],
+        contexts: &[
+            Ctx::Nav,
+            Ctx::Resources,
+            Ctx::Events,
+            Ctx::ClusterStats,
+            Ctx::PortForwards,
+            Ctx::Profiles,
+        ],
         hotkey: false,
         palette: false,
         available: None,
@@ -397,7 +404,13 @@ static COMMANDS: &[Cmd] = &[
         key: "c",
         label: "Cluster",
         description: "Switch cluster context",
-        contexts: &[Ctx::Nav, Ctx::Resources, Ctx::ClusterStats],
+        contexts: &[
+            Ctx::Nav,
+            Ctx::Resources,
+            Ctx::Events,
+            Ctx::ClusterStats,
+            Ctx::PortForwards,
+        ],
         hotkey: true,
         palette: true,
         available: None,
@@ -406,7 +419,14 @@ static COMMANDS: &[Cmd] = &[
         key: "n",
         label: "Namespace",
         description: "Switch namespace",
-        contexts: &[Ctx::Nav, Ctx::Resources, Ctx::ClusterStats],
+        contexts: &[
+            Ctx::Nav,
+            Ctx::Resources,
+            Ctx::Events,
+            Ctx::ClusterStats,
+            Ctx::PortForwards,
+            Ctx::Profiles,
+        ],
         hotkey: true,
         palette: true,
         available: None,
@@ -415,7 +435,14 @@ static COMMANDS: &[Cmd] = &[
         key: "O",
         label: "Kubeconfig",
         description: "Open a kubeconfig file",
-        contexts: &[Ctx::Nav, Ctx::Resources, Ctx::ClusterStats],
+        contexts: &[
+            Ctx::Nav,
+            Ctx::Resources,
+            Ctx::Events,
+            Ctx::ClusterStats,
+            Ctx::PortForwards,
+            Ctx::Profiles,
+        ],
         hotkey: true,
         palette: true,
         available: None,
@@ -424,7 +451,14 @@ static COMMANDS: &[Cmd] = &[
         key: "p",
         label: "Pause",
         description: "Pause/resume auto-refresh",
-        contexts: &[Ctx::Nav, Ctx::Resources, Ctx::ClusterStats, Ctx::Detail],
+        contexts: &[
+            Ctx::Nav,
+            Ctx::Resources,
+            Ctx::Events,
+            Ctx::ClusterStats,
+            Ctx::Profiles,
+            Ctx::Detail,
+        ],
         hotkey: true,
         palette: false,
         available: None,
@@ -797,7 +831,7 @@ static COMMANDS: &[Cmd] = &[
     },
     // ── Profiles ──────────────────────────────────────────────────────
     Cmd {
-        key: "Ctrl+S",
+        key: "Ctrl+s",
         label: "Save Profile",
         description: "Save current profile",
         contexts: &[Ctx::Global],

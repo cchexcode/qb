@@ -1520,7 +1520,7 @@ fn render_logs(f: &mut Frame, app: &mut App) {
         visible
             .iter()
             .map(|l| {
-                let len = l.len();
+                let len = l.display_text().len();
                 if len == 0 {
                     1
                 } else {
@@ -1570,29 +1570,39 @@ fn render_logs(f: &mut Frame, app: &mut App) {
             let is_in_selection = sel_range
                 .map(|(start, end)| idx >= start && idx <= end)
                 .unwrap_or(false);
-            let base_style = if is_cursor {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED)
-            } else if is_in_selection {
-                Style::default().fg(Color::White).bg(Color::DarkGray)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            // Highlight filter matches
-            if !is_cursor && !is_in_selection {
-                if let Some(re) = &state.filter.regex {
-                    if let Some(m) = re.find(l) {
-                        return Line::from(vec![
-                            Span::styled(&l[..m.start()], Style::default().fg(Color::White)),
-                            Span::styled(
-                                l[m.start()..m.end()].to_string(),
-                                Style::default().fg(Color::Black).bg(Color::Yellow),
-                            ),
-                            Span::styled(&l[m.end()..], Style::default().fg(Color::White)),
-                        ]);
-                    }
+            let pod_color = state.color_for_pod(&l.pod);
+            if is_cursor {
+                let style = Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED);
+                return Line::from(vec![
+                    Span::styled(l.prefix(), style),
+                    Span::styled(l.message.as_str(), style),
+                ]);
+            }
+            if is_in_selection {
+                let style = Style::default().fg(Color::White).bg(Color::DarkGray);
+                return Line::from(vec![
+                    Span::styled(l.prefix(), style),
+                    Span::styled(l.message.as_str(), style),
+                ]);
+            }
+            // Highlight filter matches in the message portion
+            if let Some(re) = &state.filter.regex {
+                if let Some(m) = re.find(&l.message) {
+                    return Line::from(vec![
+                        Span::styled(l.prefix(), Style::default().fg(pod_color)),
+                        Span::styled(l.message[..m.start()].to_string(), Style::default().fg(Color::White)),
+                        Span::styled(
+                            l.message[m.start()..m.end()].to_string(),
+                            Style::default().fg(Color::Black).bg(Color::Yellow),
+                        ),
+                        Span::styled(l.message[m.end()..].to_string(), Style::default().fg(Color::White)),
+                    ]);
                 }
             }
-            Line::from(Span::styled(*l, base_style))
+            Line::from(vec![
+                Span::styled(l.prefix(), Style::default().fg(pod_color)),
+                Span::styled(l.message.as_str(), Style::default().fg(Color::White)),
+            ])
         })
         .collect();
 

@@ -18,8 +18,8 @@ crates/qb/src/
   args.rs          CLI argument parsing (clap derive)
   config.rs        Persistent config: profiles, favorites, saved port forwards, version checking.
                    Loads/saves ~/.config/qb/config.yaml.
-  k8s/mod.rs       K8s API client, resource types, pod resolution, log fetching, cluster stats,
-                   resource editing (replace via DynamicObject)
+  k8s/mod.rs       K8s API client, resource types, CRD discovery, pod resolution, log fetching,
+                   cluster stats, resource editing (replace via DynamicObject)
   portforward.rs   Port forward manager: background tasks, auto-restart, pod resolution,
                    port extraction helpers, pause/resume/cancel lifecycle
   tui/mod.rs       Terminal setup, event loop (render → load → poll logs → poll pf → poll input),
@@ -32,8 +32,8 @@ crates/qb/src/
   tui/ui.rs        Rendering: main view, detail view, log view, events log, cluster stats,
                    favorites view, port forwards view, edit diff view (inline + side-by-side),
                    popups, breadcrumb with refresh indicator, hotkey bars, node grid cards
-  tui/smart.rs     Per-resource-type structured renderers, SecretDetailState, DictState,
-                   selectable labels/annotations, structured resource requests/limits
+  tui/smart.rs     Per-resource-type structured renderers, generic CR renderer,
+                   SecretDetailState, DictState, selectable labels/annotations
   tui/logs.rs      LogViewState, follow-mode streaming, regex filter
 ```
 
@@ -51,8 +51,8 @@ crates/qb/src/
    Breadcrumb shows refresh timestamp right-aligned. `p` pauses/resumes globally.
 6. **Smart then YAML** — Detail views open in Smart mode (typed, structured rendering per resource
    type). `v` cycles between Smart and YAML views.
-7. **Keyboard-only** — Gitui-inspired hotkey bar at the bottom. All navigation uses vim-style
-   bindings (j/k, Ctrl+d/u, g/G). No mouse support.
+7. **Keyboard-driven** — Gitui-inspired hotkey bar at the bottom. All navigation uses vim-style
+   bindings (j/k, Ctrl+d/u, g/G).
 8. **Breadcrumb always visible** — Top bar shows `cluster > namespace > type > resource > logs` in
    every view, plus a right-aligned refresh indicator (`⟳ just now` / `⟳ Ns ago` / `⏸ paused`).
 9. **Cluster stats as default view** — App starts on the Overview panel showing cluster-wide
@@ -69,18 +69,18 @@ crates/qb/src/
 
 ## Key Bindings Summary
 
-Keyboard-only. All navigation uses vim-style bindings.
+Keyboard-driven. All navigation uses vim-style bindings.
 
 ### Global
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Force quit |
+| `Ctrl+c` | Force quit |
 | `q` | Quit / back |
 | `Esc` | Back / dismiss popup or selection |
 | `?` | Help (context-only by default, `Tab` to show all) |
-| `Ctrl+P` | Command palette |
-| `Ctrl+S` | Save current profile |
+| `Ctrl+p` | Command palette |
+| `Ctrl+s` | Save current profile |
 | `P` | Load/switch profile |
 | `p` | Pause/resume auto-refresh (except log view, port forwards view) |
 
@@ -96,6 +96,7 @@ Keyboard-only. All navigation uses vim-style bindings.
 | `G` / `End` | Jump to bottom of list |
 | `Enter` | Open detail / move focus to right panel |
 | `Tab` | Toggle focus between sidebar and table |
+| `< / >` | Shrink / grow sidebar width |
 | `r` | Focus resource table |
 | `c` | Switch cluster context (popup) |
 | `n` | Switch namespace (popup) |
@@ -124,18 +125,19 @@ Keyboard-only. All navigation uses vim-style bindings.
 | `Ctrl+u` / `PgUp` | Page up |
 | `Home` | Jump to top |
 | `v` | Cycle view: Smart → YAML → Smart |
-| `s` | Enter/leave label/annotation selection |
+| `l` | Enter/leave label selection |
+| `a` | Enter/leave annotation selection |
 | `Enter` | Edit selected label/annotation |
 | `Space` | Expand/collapse selected entry or decode secret |
 | `y` | Copy: selected entry value, full YAML, or secret |
 | `e` | Edit resource ($EDITOR) |
-| `l` | Open logs (workload resources) |
+| `L` | Open logs (workload resources) |
 | `F` | Create port forward (popup) |
 | `D` | Delete resource (confirmation popup) |
 | `R` | Restart workload |
 | `S` | Scale workload |
 | `w` | Toggle watch mode (auto-refresh detail) |
-| `Tab` | Toggle related resources selection |
+| `r` | Toggle related resources selection |
 | `X` | Exec into pod (experimental) |
 | `*` | Toggle favorite for current resource |
 
@@ -180,25 +182,30 @@ Keyboard-only. All navigation uses vim-style bindings.
 | `k` / `Up` | Navigate list |
 | `p` | Pause/resume selected forward |
 | `d` | Cancel (delete) selected forward |
+| `e` | Edit local port number |
 
 ## Sidebar Structure
 
 The sidebar is a flat list with category headers (non-selectable) and selectable items.
-Overview is always the first item and the default landing screen.
+Overview is always the first item and the default landing screen. Width is adjustable
+with `<` / `>` (min 16, max 60 columns).
 
 1. **Overview** — Cluster stats, health, node grid (default on startup)
 2. **Favorites** — Starred resources across all types (`*` to toggle, shows count badge)
 3. **Port Forwards** — View, pause, resume, cancel; persisted to config
-4. **WORKLOADS** — Deployments, StatefulSets, DaemonSets, ReplicaSets, Pods, CronJobs, Jobs, HPAs
-5. **NETWORK** — Services, Ingresses, Endpoints, NetworkPolicies
-6. **CONFIG** — ConfigMaps, Secrets
-7. **STORAGE** — PVCs, PVs, StorageClasses
-8. **RBAC** — ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
-9. **CLUSTER** — Nodes, Namespaces, Events, CRDs
-10. **CUSTOM RESOURCES** — Dynamically discovered from CRDs in the cluster (appears only if CRDs exist)
+4. **Profiles** — Named sets of favorites and port forwards
+5. **WORKLOADS** — Deployments, StatefulSets, DaemonSets, ReplicaSets, Pods, CronJobs, Jobs, HPAs
+6. **NETWORK** — Services, Ingresses, Endpoints, NetworkPolicies
+7. **CONFIG** — ConfigMaps, Secrets
+8. **STORAGE** — PVCs, PVs, StorageClasses
+9. **RBAC** — ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings
+10. **CLUSTER** — Nodes, Namespaces, Events, CRDs
+11. **Custom Resources** — Dynamically discovered CRDs, grouped by API group domain as
+    sub-categories (e.g., `cert-manager.io`, `argoproj.io`). Appears only if CRDs exist.
 
-Categories are non-selectable headers (`NavItemKind::Category`). Navigation with j/k
-skips over them.
+Categories are non-selectable headers (`NavItemKind::Category`). Sub-categories use
+`NavItemKind::SubCategory` (dimmer styling, also non-selectable). Navigation with j/k
+skips over both.
 
 Cluster-scoped resources (Node, Namespace, PV, StorageClass, ClusterRole, ClusterRoleBinding,
 CustomResourceDefinition) use `list_cluster`/`get_value_cluster` helpers instead of the
@@ -227,10 +234,10 @@ events log. Filter persists across auto-refreshes, clears on resource type chang
 
 ### Selectable Labels/Annotations
 
-In the detail smart view, press `s` to enter selection mode on labels/annotations. Navigate
-with `j`/`k`, press `Space` to expand/collapse long values (word-wrapped at 100 chars), press
-`y` to copy `key: value` to clipboard. Press `s` again to leave selection mode. Values longer
-than 70 chars are truncated with `...` until expanded.
+In the detail smart view, press `l` to enter selection mode on labels (or `a` for annotations).
+Navigate with `j`/`k`, press `Space` to expand/collapse long values (word-wrapped at 100 chars),
+press `y` to copy `key: value` to clipboard. Press `l`/`a` again to leave selection mode.
+Values longer than 70 chars are truncated with `...` until expanded.
 
 ### Resource Editing
 
@@ -279,7 +286,7 @@ an editable field for the new count. Uses `Api::patch` with `Patch::Merge` to up
 
 **Experimental** — requires `qb -e` to enable.
 
-Press `x` to open the exec dialog: choose container (Tab to switch fields, Up/Down for
+Press `X` to open the exec dialog: choose container (Tab to switch fields, Up/Down for
 containers), edit command (split on whitespace for argv), and override the terminal application.
 
 Exec opens a **new terminal window** running `kubectl exec -it`. The terminal is resolved as:
@@ -347,7 +354,7 @@ type. Press `*` to de-favorite. Resources show `★` prefix when favorited. Miss
 ### Profiles
 
 Profiles group favorites and saved port forwards under a name. The default profile is always
-created on first run. `Ctrl+S` opens a save dialog, `P` opens the profile switcher. Profiles
+created on first run. `Ctrl+s` opens a save dialog, `P` opens the profile switcher. Profiles
 are stored in config and auto-saved on changes.
 
 ### Custom Resource Definitions and Custom Resources
@@ -355,14 +362,16 @@ are stored in config and auto-saved on changes.
 CRDs are a built-in `ResourceType::CustomResourceDefinition` in the CLUSTER sidebar category.
 Custom Resources (instances of CRDs) are discovered dynamically on startup and context switch
 via `KubeClient::discover_crds()`, which lists all CRDs and extracts metadata into `CrdInfo`
-structs. Discovered CRs appear in the sidebar under a "CUSTOM RESOURCES" category.
+structs. Discovered CRs appear in the sidebar grouped by API group domain as sub-categories.
 
 Architecture:
 - **`CrdInfo`** (`k8s/mod.rs`) — holds group, version, kind, plural, scope, display name,
   and `additionalPrinterColumns` for dynamic API operations and table rendering.
 - **`Panel::CustomResourceList(CrdInfo)`** — panel variant for browsing CR instances.
 - **`NavItemKind::CustomResource(CrdInfo)`** — sidebar nav item for each discovered CRD.
+- **`NavItemKind::SubCategory`** — non-selectable dimmer header for API group domains.
 - **`PendingLoad::DiscoverCrds`** — async CRD discovery, chained on startup before ClusterStats.
+  Also triggered on context switch, profile switch, and kubeconfig load.
 - **`PendingLoad::CustomResources`** / **`CustomResourceDetail`** — deferred loading for CRs.
 - Dynamic API methods: `list_custom_resources()`, `get_custom_resource()`,
   `replace_custom_resource()`, `delete_custom_resource()`, `patch_custom_resource_metadata()`.
@@ -476,7 +485,8 @@ for exhaustive matching. No `unreachable!()` in dispatch.
 - **Edit flow**: `PendingEdit` is set by key handler, consumed by the event loop in `tui/mod.rs`
   to suspend terminal → run `$EDITOR` → resume terminal. Result feeds into `handle_edit_result`
   which computes the diff and enters `View::EditDiff`. Apply uses `KubeClient::replace_resource_yaml`
-  with `DynamicObject` + `ApiResource` for generic resource replacement.
+  with `DynamicObject` + `ApiResource` for generic resource replacement. For CRs, uses
+  `replace_custom_resource()` when `crd_info` is `Some`.
 - **External editor**: Resolved as `$EDITOR` → `vim` → `vi`. Terminal is fully suspended
   (leave alternate screen, disable raw mode) before editor runs, and restored after.
 - **OSC 52 vs arboard**: Clipboard currently uses `arboard` (native macOS/Linux clipboard). If

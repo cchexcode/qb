@@ -258,6 +258,7 @@ pub enum PendingLoad {
     CustomResourceDetail { name: String, namespace: String },
     Logs { name: String, namespace: String },
     ReloadLogs,
+    CheckLogPods,
     ClusterStats,
     DiscoverCrds,
 }
@@ -924,6 +925,7 @@ impl App {
                 },
                 | PendingLoad::Logs { name, namespace } => self.load_logs(&namespace, &name).await,
                 | PendingLoad::ReloadLogs => self.reload_logs().await,
+                | PendingLoad::CheckLogPods => self.check_log_pods().await,
                 | PendingLoad::ClusterStats => self.load_cluster_stats().await,
                 | PendingLoad::DiscoverCrds => self.discover_crds().await,
             }
@@ -931,13 +933,18 @@ impl App {
     }
 
     /// Poll the log stream channel for new lines (called every event loop
-    /// tick). Paused state suppresses polling.
+    /// tick). Paused state suppresses polling. Also triggers pod re-discovery
+    /// for rolling updates when in follow mode.
     pub fn poll_log_stream(&mut self) {
         if self.paused {
             return;
         }
         if let Some(state) = &mut self.log {
             state.poll_stream();
+            // Queue pod re-discovery if due (only when following a workload)
+            if state.needs_pod_check() && self.pending_load.is_none() {
+                self.pending_load = Some(PendingLoad::CheckLogPods);
+            }
         }
     }
 
@@ -1271,6 +1278,13 @@ impl App {
                     | Ok(lines) => {
                         let mut state = LogViewState::new(pods, ns.to_string(), lines);
                         state.since_seconds = default_since;
+                        // Set source for auto pod re-discovery (not needed for direct Pod)
+                        if rt != ResourceType::Pod {
+                            state.source = Some(super::logs::LogSource {
+                                resource_type: rt,
+                                resource_name: name.to_string(),
+                            });
+                        }
                         self.log = Some(state);
                         self.view = View::Logs;
                         self.error = None;
@@ -1300,6 +1314,9 @@ impl App {
 
         match self.kube.fetch_logs_multi(&ns, &pairs, 500, since).await {
             | Ok(lines) => {
+                for line in &lines {
+                    log_state.ensure_pod_color(&line.pod);
+                }
                 log_state.lines = lines;
                 log_state.scroll = 0;
                 log_state.auto_scroll = true;
@@ -1307,6 +1324,37 @@ impl App {
             },
             | Err(e) => {
                 self.error = Some(format!("Failed to reload logs: {}", e));
+            },
+        }
+    }
+
+    async fn check_log_pods(&mut self) {
+        let log_state = match &mut self.log {
+            | Some(s) => s,
+            | None => return,
+        };
+        let source = match &log_state.source {
+            | Some(s) => s,
+            | None => {
+                log_state.last_pod_check = std::time::Instant::now();
+                return;
+            },
+        };
+        let rt = source.resource_type;
+        let name = source.resource_name.clone();
+        let ns = log_state.namespace.clone();
+        match self.kube.find_pods(rt, &ns, &name).await {
+            | Ok(new_pods) => {
+                let client = self.kube.client.streaming.clone();
+                if let Some(state) = &mut self.log {
+                    state.integrate_new_pods(new_pods, client);
+                }
+            },
+            | Err(_) => {
+                // Silently ignore — will retry on next tick
+                if let Some(state) = &mut self.log {
+                    state.last_pod_check = std::time::Instant::now();
+                }
             },
         }
     }
@@ -2298,7 +2346,7 @@ impl App {
                     if let Some(sel) = state.selected_line {
                         let visible = state.visible_lines();
                         if let Some(line) = visible.get(sel) {
-                            self.log_detail_line = Some(line.to_string());
+                            self.log_detail_line = Some(line.display_text());
                         }
                     }
                 }
@@ -4298,17 +4346,18 @@ impl App {
         if let Some(state) = &self.log {
             let visible = state.visible_lines();
             let (text, count) = if let Some((start, end)) = state.selection_range() {
-                let selected: Vec<&str> = visible
+                let selected: Vec<String> = visible
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| *i >= start && *i <= end)
-                    .map(|(_, l)| *l)
+                    .map(|(_, l)| l.display_text())
                     .collect();
                 let n = selected.len();
                 (selected.join("\n"), n)
             } else {
                 let n = visible.len();
-                (visible.join("\n"), n)
+                let texts: Vec<String> = visible.iter().map(|l| l.display_text()).collect();
+                (texts.join("\n"), n)
             };
             match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
                 | Ok(()) => {

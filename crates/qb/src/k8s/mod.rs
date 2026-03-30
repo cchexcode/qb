@@ -2302,30 +2302,31 @@ impl KubeClient {
     }
 
     /// Fetch logs for multiple pod/container pairs and merge them with
-    /// prefixes.
+    /// prefixes.  Returns structured `LogLine`s sorted by timestamp.
     pub async fn fetch_logs_multi(
         &self,
         ns: &str,
         pairs: &[(String, String)],
         tail: i64,
         since_seconds: Option<i64>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<crate::tui::logs::LogLine>> {
+        use crate::tui::logs::LogLine;
         let mut all_lines = Vec::new();
         for (pod, container) in pairs {
             let prefix = format!("[{}/{}] ", pod, container);
             match self.fetch_logs(ns, pod, container, tail, since_seconds).await {
                 | Ok(logs) => {
                     for line in logs.lines() {
-                        all_lines.push(format!("{}{}", prefix, line));
+                        all_lines.push(LogLine::parse(&format!("{}{}", prefix, line)));
                     }
                 },
                 | Err(_) => {
-                    all_lines.push(format!("{}(failed to fetch logs)", prefix));
+                    all_lines.push(LogLine::parse(&format!("{}(failed to fetch logs)", prefix)));
                 },
             }
         }
-        // Sort by timestamp (the timestamp comes after the prefix)
-        all_lines.sort();
+        // Sort by timestamp — RFC3339 timestamps are lexicographically sortable.
+        all_lines.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         Ok(all_lines)
     }
 
