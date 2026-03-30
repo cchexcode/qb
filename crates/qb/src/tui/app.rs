@@ -324,6 +324,8 @@ pub struct ResourceTable {
 pub struct ClusterOverview {
     pub stats: Option<ClusterStatsData>,
     pub scroll: u16,
+    /// Background fetch — polled each tick, never blocks the event loop.
+    pub pending_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<ClusterStatsData>>>,
 }
 
 pub struct RelatedState {
@@ -466,7 +468,11 @@ impl App {
             },
             panel: Panel::Overview,
             return_panel: None,
-            overview: ClusterOverview { stats: None, scroll: 0 },
+            overview: ClusterOverview {
+                stats: None,
+                scroll: 0,
+                pending_rx: None,
+            },
             detail: DetailState {
                 value: Value::Null,
                 yaml: String::new(),
@@ -926,7 +932,7 @@ impl App {
                 | PendingLoad::Logs { name, namespace } => self.load_logs(&namespace, &name).await,
                 | PendingLoad::ReloadLogs => self.reload_logs().await,
                 | PendingLoad::CheckLogPods => self.check_log_pods().await,
-                | PendingLoad::ClusterStats => self.load_cluster_stats().await,
+                | PendingLoad::ClusterStats => self.load_cluster_stats(),
                 | PendingLoad::DiscoverCrds => self.discover_crds().await,
             }
         }
@@ -1359,18 +1365,45 @@ impl App {
         }
     }
 
-    async fn load_cluster_stats(&mut self) {
-        match self.kube.fetch_cluster_stats().await {
-            | Ok(stats) => {
+    fn load_cluster_stats(&mut self) {
+        // Don't spawn a new fetch if one is already in flight
+        if self.overview.pending_rx.is_some() {
+            return;
+        }
+        let client = self.kube.client.default.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.overview.pending_rx = Some(rx);
+        tokio::spawn(async move {
+            let result = crate::k8s::KubeClient::fetch_cluster_stats_with_client(&client).await;
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll background cluster stats fetch — called every event loop tick.
+    pub fn poll_cluster_stats(&mut self) {
+        let rx = match &mut self.overview.pending_rx {
+            | Some(rx) => rx,
+            | None => return,
+        };
+        match rx.try_recv() {
+            | Ok(Ok(stats)) => {
                 self.overview.stats = Some(stats);
-                // Preserve scroll position on auto-refresh
                 self.error = None;
+                self.overview.pending_rx = None;
+                self.last_refresh = std::time::Instant::now();
             },
-            | Err(e) => {
+            | Ok(Err(e)) => {
                 self.error = Some(format!("Failed to load cluster stats: {}", e));
+                self.overview.pending_rx = None;
+                self.last_refresh = std::time::Instant::now();
+            },
+            | Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                // Still loading — don't block
+            },
+            | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.overview.pending_rx = None;
             },
         }
-        self.last_refresh = std::time::Instant::now();
     }
 
     // -----------------------------------------------------------------------

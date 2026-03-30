@@ -487,16 +487,59 @@ pub struct NodeCounts {
     pub ready: usize,
     pub not_ready: usize,
     pub cordoned: usize,
-    pub with_pressure: usize,
 }
 
 pub struct PodCounts {
     pub total: usize,
     pub running: usize,
     pub pending: usize,
+    pub succeeded: usize,
     pub failed: usize,
     pub crash_loop: usize,
     pub error: usize,
+}
+
+pub struct WorkloadHealth {
+    pub deployments_ready: usize,
+    pub deployments_total: usize,
+    pub statefulsets_ready: usize,
+    pub statefulsets_total: usize,
+    pub daemonsets_ready: usize,
+    pub daemonsets_desired: usize,
+}
+
+pub struct ContainerCounts {
+    pub total: usize,
+    pub ready: usize,
+    pub total_restarts: i64,
+}
+
+pub struct ClusterResources {
+    pub cpu_capacity: f64,
+    pub cpu_allocatable: f64,
+    pub mem_capacity_bytes: f64,
+    pub mem_allocatable_bytes: f64,
+    pub pod_capacity: usize,
+    pub pod_allocatable: usize,
+}
+
+pub struct TopRestartingPod {
+    pub name: String,
+    pub namespace: String,
+    pub restart_count: i64,
+}
+
+pub struct WarningEventDetail {
+    pub reason: String,
+    pub message: String,
+    pub namespace: String,
+    pub count: i32,
+}
+
+pub struct PressureDetail {
+    pub disk_pressure: usize,
+    pub memory_pressure: usize,
+    pub pid_pressure: usize,
 }
 
 pub struct ClusterStatsData {
@@ -508,6 +551,21 @@ pub struct ClusterStatsData {
     pub deployment_count: usize,
     pub service_count: usize,
     pub recent_warnings: usize,
+    pub statefulset_count: usize,
+    pub daemonset_count: usize,
+    pub job_count: usize,
+    pub cronjob_count: usize,
+    pub configmap_count: usize,
+    pub secret_count: usize,
+    pub pvc_count: usize,
+    pub ingress_count: usize,
+    pub hpa_count: usize,
+    pub workload_health: WorkloadHealth,
+    pub containers: ContainerCounts,
+    pub cluster_resources: ClusterResources,
+    pub top_restarting: Vec<TopRestartingPod>,
+    pub warning_details: Vec<WarningEventDetail>,
+    pub pressure: PressureDetail,
 }
 
 // ---------------------------------------------------------------------------
@@ -613,19 +671,97 @@ impl KubeClient {
         Ok(names)
     }
 
-    pub async fn fetch_cluster_stats(&self) -> Result<ClusterStatsData> {
+    pub async fn fetch_cluster_stats_with_client(c: &Client) -> Result<ClusterStatsData> {
+        let lp = ListParams::default();
+
         // Server version
-        let server_version = match self.client.default.apiserver_version().await {
+        let server_version = match c.apiserver_version().await {
             | Ok(info) => format!("{}.{}", info.major, info.minor),
             | Err(_) => "unknown".into(),
         };
 
-        // Nodes
-        let node_api: Api<Node> = Api::all(self.client.default.clone());
-        let node_list = node_api.list(&ListParams::default()).await?;
+        // Parallel API calls
+        let node_api: Api<Node> = Api::all(c.clone());
+        let ns_api: Api<Namespace> = Api::all(c.clone());
+        let pod_api: Api<Pod> = Api::all(c.clone());
+        let dep_api: Api<Deployment> = Api::all(c.clone());
+        let svc_api: Api<Service> = Api::all(c.clone());
+        let sts_api: Api<StatefulSet> = Api::all(c.clone());
+        let ds_api: Api<DaemonSet> = Api::all(c.clone());
+        let job_api: Api<Job> = Api::all(c.clone());
+        let cj_api: Api<CronJob> = Api::all(c.clone());
+        let cm_api: Api<ConfigMap> = Api::all(c.clone());
+        let secret_api: Api<Secret> = Api::all(c.clone());
+        let pvc_api: Api<PersistentVolumeClaim> = Api::all(c.clone());
+        let ing_api: Api<Ingress> = Api::all(c.clone());
+        let hpa_api: Api<HorizontalPodAutoscaler> = Api::all(c.clone());
+        let event_api: Api<Event> = Api::all(c.clone());
+
+        let (
+            node_res,
+            ns_res,
+            pod_res,
+            dep_res,
+            svc_res,
+            sts_res,
+            ds_res,
+            job_res,
+            cj_res,
+            cm_res,
+            secret_res,
+            pvc_res,
+            ing_res,
+            hpa_res,
+            event_res,
+        ) = tokio::join!(
+            node_api.list(&lp),
+            ns_api.list(&lp),
+            pod_api.list(&lp),
+            dep_api.list(&lp),
+            svc_api.list(&lp),
+            sts_api.list(&lp),
+            ds_api.list(&lp),
+            job_api.list(&lp),
+            cj_api.list(&lp),
+            cm_api.list(&lp),
+            secret_api.list(&lp),
+            pvc_api.list(&lp),
+            ing_api.list(&lp),
+            hpa_api.list(&lp),
+            event_api.list(&lp),
+        );
+
+        let node_list = node_res?;
+        let pod_list = pod_res?;
+        let dep_list = dep_res?;
+        let sts_list = sts_res?;
+        let ds_list = ds_res?;
+
+        let ns_count = ns_res.map(|l| l.items.len()).unwrap_or(0);
+        let service_count = svc_res.map(|l| l.items.len()).unwrap_or(0);
+        let job_count = job_res.map(|l| l.items.len()).unwrap_or(0);
+        let cronjob_count = cj_res.map(|l| l.items.len()).unwrap_or(0);
+        let configmap_count = cm_res.map(|l| l.items.len()).unwrap_or(0);
+        let secret_count = secret_res.map(|l| l.items.len()).unwrap_or(0);
+        let pvc_count = pvc_res.map(|l| l.items.len()).unwrap_or(0);
+        let ingress_count = ing_res.map(|l| l.items.len()).unwrap_or(0);
+        let hpa_count = hpa_res.map(|l| l.items.len()).unwrap_or(0);
+
+        // ── Nodes ────────────────────────────────────────────────
         let mut nodes_ready = 0usize;
         let mut nodes_not_ready = 0usize;
         let mut node_stats = Vec::new();
+        let mut total_cpu_cap = 0.0f64;
+        let mut total_cpu_alloc = 0.0f64;
+        let mut total_mem_cap = 0.0f64;
+        let mut total_mem_alloc = 0.0f64;
+        let mut total_pod_cap = 0usize;
+        let mut total_pod_alloc = 0usize;
+        let mut pressure = PressureDetail {
+            disk_pressure: 0,
+            memory_pressure: 0,
+            pid_pressure: 0,
+        };
 
         for n in &node_list.items {
             let status = n.status.as_ref();
@@ -638,6 +774,20 @@ impl KubeClient {
                 nodes_ready += 1;
             } else {
                 nodes_not_ready += 1;
+            }
+
+            // Pressure per type
+            if let Some(conds) = conditions {
+                for cond in conds {
+                    if cond.status == "True" {
+                        match cond.type_.as_str() {
+                            | "DiskPressure" => pressure.disk_pressure += 1,
+                            | "MemoryPressure" => pressure.memory_pressure += 1,
+                            | "PIDPressure" => pressure.pid_pressure += 1,
+                            | _ => {},
+                        }
+                    }
+                }
             }
 
             let roles = n
@@ -670,6 +820,21 @@ impl KubeClient {
                     .unwrap_or_else(|| "-".into())
             };
 
+            // Aggregate cluster resources
+            let cpu_cap_raw = get_res(capacity, "cpu");
+            let cpu_alloc_raw = get_res(allocatable, "cpu");
+            let mem_cap_raw = get_res(capacity, "memory");
+            let mem_alloc_raw = get_res(allocatable, "memory");
+            let pod_cap_raw = get_res(capacity, "pods");
+            let pod_alloc_raw = get_res(allocatable, "pods");
+
+            total_cpu_cap += parse_cpu_cores(&cpu_cap_raw);
+            total_cpu_alloc += parse_cpu_cores(&cpu_alloc_raw);
+            total_mem_cap += parse_memory_bytes(&mem_cap_raw);
+            total_mem_alloc += parse_memory_bytes(&mem_alloc_raw);
+            total_pod_cap += pod_cap_raw.parse::<usize>().unwrap_or(0);
+            total_pod_alloc += pod_alloc_raw.parse::<usize>().unwrap_or(0);
+
             let unschedulable = n.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false);
             let node_status = match (is_ready, unschedulable) {
                 | (true, false) => "Ready".to_string(),
@@ -688,44 +853,55 @@ impl KubeClient {
                     .map(|i| format!("{}/{}", i.operating_system, i.architecture))
                     .unwrap_or_default(),
                 cpu: ResourceCapacity {
-                    capacity: get_res(capacity, "cpu"),
-                    allocatable: get_res(allocatable, "cpu"),
+                    capacity: cpu_cap_raw,
+                    allocatable: cpu_alloc_raw,
                 },
                 mem: ResourceCapacity {
-                    capacity: format_memory_gb(&get_res(capacity, "memory")),
-                    allocatable: format_memory_gb(&get_res(allocatable, "memory")),
+                    capacity: format_memory_gb(&mem_cap_raw),
+                    allocatable: format_memory_gb(&mem_alloc_raw),
                 },
                 pods: ResourceCapacity {
-                    capacity: get_res(capacity, "pods"),
-                    allocatable: get_res(allocatable, "pods"),
+                    capacity: pod_cap_raw,
+                    allocatable: pod_alloc_raw,
                 },
                 age: format_age(n.metadata.creation_timestamp.as_ref()),
             });
         }
 
-        // Namespaces
-        let ns_api: Api<Namespace> = Api::all(self.client.default.clone());
-        let ns_count = ns_api.list(&ListParams::default()).await?.items.len();
+        let nodes_cordoned = node_stats.iter().filter(|n| n.unschedulable).count();
 
-        // Pods
-        let pod_api: Api<Pod> = Api::all(self.client.default.clone());
-        let pod_list = pod_api.list(&ListParams::default()).await?;
+        // ── Pods ─────────────────────────────────────────────────
         let pod_count = pod_list.items.len();
         let mut pods_running = 0usize;
         let mut pods_pending = 0usize;
+        let mut pods_succeeded = 0usize;
         let mut pods_failed = 0usize;
         let mut pods_crash_loop = 0usize;
         let mut pods_error = 0usize;
+        let mut total_containers = 0usize;
+        let mut ready_containers = 0usize;
+        let mut total_restarts = 0i64;
+        let mut restart_pods: Vec<TopRestartingPod> = Vec::new();
+
         for p in &pod_list.items {
             match p.status.as_ref().and_then(|s| s.phase.as_deref()) {
                 | Some("Running") => pods_running += 1,
                 | Some("Pending") => pods_pending += 1,
+                | Some("Succeeded") => pods_succeeded += 1,
                 | Some("Failed") => pods_failed += 1,
                 | _ => {},
             }
             let container_statuses = p.status.as_ref().and_then(|s| s.container_statuses.as_ref());
             if let Some(statuses) = container_statuses {
+                let mut pod_restarts = 0i64;
                 for cs in statuses {
+                    total_containers += 1;
+                    if cs.ready {
+                        ready_containers += 1;
+                    }
+                    let r = cs.restart_count as i64;
+                    total_restarts += r;
+                    pod_restarts += r;
                     if let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) {
                         match waiting.reason.as_deref() {
                             | Some("CrashLoopBackOff") => pods_crash_loop += 1,
@@ -736,35 +912,67 @@ impl KubeClient {
                         }
                     }
                 }
+                if pod_restarts > 0 {
+                    restart_pods.push(TopRestartingPod {
+                        name: meta_name(&p.metadata),
+                        namespace: meta_ns(&p.metadata),
+                        restart_count: pod_restarts,
+                    });
+                }
             }
-        }
-
-        // Deployments & Services
-        let dep_api: Api<Deployment> = Api::all(self.client.default.clone());
-        let deployment_count = dep_api.list(&ListParams::default()).await?.items.len();
-        let svc_api: Api<Service> = Api::all(self.client.default.clone());
-        let service_count = svc_api.list(&ListParams::default()).await?.items.len();
-
-        // Nodes with resource pressure
-        let mut nodes_with_pressure = 0usize;
-        for n in &node_list.items {
-            if let Some(conditions) = n.status.as_ref().and_then(|s| s.conditions.as_ref()) {
-                for c in conditions {
-                    if matches!(c.type_.as_str(), "DiskPressure" | "MemoryPressure" | "PIDPressure")
-                        && c.status == "True"
-                    {
-                        nodes_with_pressure += 1;
-                        break;
+            // Also count init containers
+            if let Some(init_statuses) = p.status.as_ref().and_then(|s| s.init_container_statuses.as_ref()) {
+                for cs in init_statuses {
+                    total_containers += 1;
+                    if cs.ready {
+                        ready_containers += 1;
                     }
                 }
             }
         }
 
-        // Recent warning events (last 1 hour)
-        let event_api: Api<Event> = Api::all(self.client.default.clone());
-        let recent_warnings = if let Ok(events) = event_api.list(&ListParams::default()).await {
+        // Top 5 restarting pods
+        restart_pods.sort_by(|a, b| b.restart_count.cmp(&a.restart_count));
+        restart_pods.truncate(5);
+
+        // ── Workload health ──────────────────────────────────────
+        let deployment_count = dep_list.items.len();
+        let deployments_ready = dep_list
+            .items
+            .iter()
+            .filter(|d| {
+                let desired = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+                let available = d.status.as_ref().and_then(|s| s.available_replicas).unwrap_or(0);
+                available >= desired
+            })
+            .count();
+
+        let statefulset_count = sts_list.items.len();
+        let statefulsets_ready = sts_list
+            .items
+            .iter()
+            .filter(|s| {
+                let desired = s.spec.as_ref().and_then(|sp| sp.replicas).unwrap_or(1);
+                let ready = s.status.as_ref().and_then(|st| st.ready_replicas).unwrap_or(0);
+                ready >= desired
+            })
+            .count();
+
+        let daemonset_count = ds_list.items.len();
+        let daemonsets_ready = ds_list
+            .items
+            .iter()
+            .filter(|d| {
+                let desired = d.status.as_ref().map(|s| s.desired_number_scheduled).unwrap_or(0);
+                let ready = d.status.as_ref().map(|s| s.number_ready).unwrap_or(0);
+                ready >= desired
+            })
+            .count();
+
+        // ── Events ───────────────────────────────────────────────
+        let (recent_warnings, warning_details) = if let Ok(events) = event_res {
             let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(1);
-            events
+            let recent: Vec<_> = events
                 .items
                 .iter()
                 .filter(|e| {
@@ -776,12 +984,33 @@ impl KubeClient {
                             .map(|t| t >= cutoff)
                             .unwrap_or(false)
                 })
-                .count()
-        } else {
-            0
-        };
+                .collect();
+            let count = recent.len();
 
-        let nodes_cordoned = node_stats.iter().filter(|n| n.unschedulable).count();
+            // Deduplicate by (reason, message), aggregate counts
+            let mut event_map: std::collections::HashMap<(String, String), WarningEventDetail> =
+                std::collections::HashMap::new();
+            for e in &recent {
+                let reason = e.reason.clone().unwrap_or_default();
+                let msg = e.note.clone().unwrap_or_default();
+                let ns = e.metadata.namespace.clone().unwrap_or_default();
+                let key = (reason.clone(), msg.clone());
+                let entry = event_map.entry(key).or_insert(WarningEventDetail {
+                    reason,
+                    message: msg,
+                    namespace: ns,
+                    count: 0,
+                });
+                entry.count += 1;
+            }
+            let mut details: Vec<_> = event_map.into_values().collect();
+            details.sort_by(|a, b| b.count.cmp(&a.count));
+            details.truncate(8);
+
+            (count, details)
+        } else {
+            (0, Vec::new())
+        };
 
         Ok(ClusterStatsData {
             server_version,
@@ -790,7 +1019,6 @@ impl KubeClient {
                 ready: nodes_ready,
                 not_ready: nodes_not_ready,
                 cordoned: nodes_cordoned,
-                with_pressure: nodes_with_pressure,
             },
             node_list: node_stats,
             namespace_count: ns_count,
@@ -798,6 +1026,7 @@ impl KubeClient {
                 total: pod_count,
                 running: pods_running,
                 pending: pods_pending,
+                succeeded: pods_succeeded,
                 failed: pods_failed,
                 crash_loop: pods_crash_loop,
                 error: pods_error,
@@ -805,6 +1034,39 @@ impl KubeClient {
             deployment_count,
             service_count,
             recent_warnings,
+            statefulset_count,
+            daemonset_count,
+            job_count,
+            cronjob_count,
+            configmap_count,
+            secret_count,
+            pvc_count,
+            ingress_count,
+            hpa_count,
+            workload_health: WorkloadHealth {
+                deployments_ready,
+                deployments_total: deployment_count,
+                statefulsets_ready,
+                statefulsets_total: statefulset_count,
+                daemonsets_ready,
+                daemonsets_desired: daemonset_count,
+            },
+            containers: ContainerCounts {
+                total: total_containers,
+                ready: ready_containers,
+                total_restarts,
+            },
+            cluster_resources: ClusterResources {
+                cpu_capacity: total_cpu_cap,
+                cpu_allocatable: total_cpu_alloc,
+                mem_capacity_bytes: total_mem_cap,
+                mem_allocatable_bytes: total_mem_alloc,
+                pod_capacity: total_pod_cap,
+                pod_allocatable: total_pod_alloc,
+            },
+            top_restarting: restart_pods,
+            warning_details,
+            pressure,
         })
     }
 
@@ -3207,14 +3469,11 @@ fn format_duration(dur: jiff::SignedDuration) -> String {
     }
 }
 
-/// Parse a Kubernetes memory quantity string (e.g. "16384Ki", "8Gi",
-/// "16777216000") and format it as gigabytes with one decimal place.
-fn format_memory_gb(raw: &str) -> String {
+fn parse_memory_bytes(raw: &str) -> f64 {
     if raw == "-" || raw.is_empty() {
-        return raw.to_string();
+        return 0.0;
     }
-
-    let bytes: f64 = if let Some(val) = raw.strip_suffix("Ki") {
+    if let Some(val) = raw.strip_suffix("Ki") {
         val.parse::<f64>().unwrap_or(0.0) * 1024.0
     } else if let Some(val) = raw.strip_suffix("Mi") {
         val.parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0
@@ -3231,15 +3490,49 @@ fn format_memory_gb(raw: &str) -> String {
     } else if let Some(val) = raw.strip_suffix('T') {
         val.parse::<f64>().unwrap_or(0.0) * 1_000_000_000_000.0
     } else {
-        // Plain bytes
         raw.parse::<f64>().unwrap_or(0.0)
-    };
+    }
+}
 
+fn parse_cpu_cores(raw: &str) -> f64 {
+    if raw == "-" || raw.is_empty() {
+        return 0.0;
+    }
+    if let Some(val) = raw.strip_suffix('m') {
+        val.parse::<f64>().unwrap_or(0.0) / 1000.0
+    } else if let Some(val) = raw.strip_suffix('n') {
+        val.parse::<f64>().unwrap_or(0.0) / 1_000_000_000.0
+    } else {
+        raw.parse::<f64>().unwrap_or(0.0)
+    }
+}
+
+fn format_memory_gb(raw: &str) -> String {
+    if raw == "-" || raw.is_empty() {
+        return raw.to_string();
+    }
+    let gb = parse_memory_bytes(raw) / (1024.0 * 1024.0 * 1024.0);
+    if gb >= 10.0 {
+        format!("{:.0}Gi", gb)
+    } else {
+        format!("{:.1}Gi", gb)
+    }
+}
+
+pub fn format_memory_gb_from_bytes(bytes: f64) -> String {
     let gb = bytes / (1024.0 * 1024.0 * 1024.0);
     if gb >= 10.0 {
         format!("{:.0}Gi", gb)
     } else {
         format!("{:.1}Gi", gb)
+    }
+}
+
+pub fn format_cpu_cores(cores: f64) -> String {
+    if cores >= 10.0 {
+        format!("{:.0}", cores)
+    } else {
+        format!("{:.1}", cores)
     }
 }
 

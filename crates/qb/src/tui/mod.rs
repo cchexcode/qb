@@ -81,6 +81,9 @@ async fn run_event_loop_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdou
         // Process deferred loads after rendering
         app.process_pending_load().await;
 
+        // Poll background cluster stats (non-blocking)
+        app.poll_cluster_stats();
+
         // Poll log stream for new lines
         app.poll_log_stream();
 

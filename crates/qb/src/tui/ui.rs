@@ -526,6 +526,29 @@ fn gauge_bar(filled: usize, total: usize, width: usize) -> Vec<Span<'static>> {
     ]
 }
 
+/// Like gauge_bar but takes a pre-computed percentage (0-100).
+fn gauge_bar_inv(pct: usize, width: usize) -> Vec<Span<'static>> {
+    let pct_f = (pct as f64 / 100.0).clamp(0.0, 1.0);
+    let filled_w = ((pct_f * width as f64) as usize).min(width);
+    let empty_w = width - filled_w;
+
+    let bar_color = if pct >= 95 {
+        Color::Green
+    } else if pct >= 80 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    vec![
+        Span::styled("[", Style::default().fg(Color::DarkGray)),
+        Span::styled("█".repeat(filled_w), Style::default().fg(bar_color)),
+        Span::styled("░".repeat(empty_w), Style::default().fg(Color::DarkGray)),
+        Span::styled("] ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}%", pct), Style::default().fg(bar_color)),
+    ]
+}
+
 /// Builds a mini stat card: ` ╭ LABEL ─────╮\n │  VALUE      │\n
 /// ╰─────────────╯`
 fn stat_card(label: &str, value: &str, value_style: Style, width: usize) -> Vec<Line<'static>> {
@@ -692,6 +715,29 @@ fn build_node_card(node: &crate::k8s::NodeStats, w: usize) -> Vec<Vec<Span<'stat
     card
 }
 
+fn section_heading<'a>(title: &str, heading: Style, dim: Style) -> Vec<Line<'a>> {
+    vec![
+        Line::from(Span::styled(format!(" {title}"), heading)),
+        Line::from(Span::styled(
+            " ──────────────────────────────────────────────────────────",
+            dim,
+        )),
+    ]
+}
+
+fn render_card_row<'a>(cards: &[Vec<Line<'a>>], lines: &mut Vec<Line<'a>>) {
+    for row in 0..3 {
+        let mut spans = Vec::new();
+        for card in cards {
+            if let Some(line) = card.get(row) {
+                spans.extend(line.spans.iter().cloned());
+            }
+            spans.push(Span::styled(" ", Style::default()));
+        }
+        lines.push(Line::from(spans));
+    }
+}
+
 fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Resources;
     let border_color = if focused { Color::Cyan } else { Color::DarkGray };
@@ -713,47 +759,84 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
     let value = Style::default().fg(Color::White);
     let good = Style::default().fg(Color::Green);
     let bad = Style::default().fg(Color::Red);
+    let warn = Style::default().fg(Color::Yellow);
     let dim = Style::default().fg(Color::DarkGray);
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // ── Top stat cards row ──────────────────────────────────
-    let card_w = 20;
+    // ── Stat cards row 1: Cluster identity ───────────────────
+    let card_w = 18;
     let node_style = if stats.nodes.not_ready > 0 {
         bad
     } else if stats.nodes.cordoned > 0 {
-        Style::default().fg(Color::Yellow)
+        warn
     } else {
         good
     };
-    let node_value = if stats.nodes.cordoned > 0 {
-        format!(
-            "{} ready, {} cordoned / {}",
-            stats.nodes.ready, stats.nodes.cordoned, stats.nodes.total
-        )
+    let node_value = format!("{}/{}", stats.nodes.ready, stats.nodes.total);
+    let pod_style = if stats.pods.crash_loop > 0 || stats.pods.failed > 0 {
+        bad
+    } else if stats.pods.pending > 0 {
+        warn
     } else {
-        format!("{} ready / {}", stats.nodes.ready, stats.nodes.total)
+        good
     };
-    let cards: Vec<Vec<Line>> = vec![
-        stat_card("K8s", &stats.server_version, value, card_w),
-        stat_card("Nodes", &node_value, node_style, card_w),
-        stat_card("Namespaces", &stats.namespace_count.to_string(), value, card_w),
-        stat_card("Deployments", &stats.deployment_count.to_string(), value, card_w),
-        stat_card("Services", &stats.service_count.to_string(), value, card_w),
-    ];
 
-    // Render cards side by side (each card is 3 lines tall)
-    for row in 0..3 {
-        let mut spans = Vec::new();
-        for card in &cards {
-            if let Some(line) = card.get(row) {
-                spans.extend(line.spans.iter().cloned());
-            }
-            spans.push(Span::styled("  ", Style::default())); // gap between
-                                                              // cards
-        }
-        lines.push(Line::from(spans));
-    }
+    render_card_row(
+        &[
+            stat_card("K8s", &stats.server_version, value, card_w),
+            stat_card("Nodes", &node_value, node_style, card_w),
+            stat_card("Namespaces", &stats.namespace_count.to_string(), value, card_w),
+            stat_card(
+                "Pods",
+                &format!("{}/{}", stats.pods.running, stats.pods.total),
+                pod_style,
+                card_w,
+            ),
+        ],
+        &mut lines,
+    );
+
+    // ── Stat cards row 2: Workloads ──────────────────────────
+    let dep_style = if stats.workload_health.deployments_ready < stats.workload_health.deployments_total {
+        warn
+    } else {
+        value
+    };
+    let sts_style = if stats.workload_health.statefulsets_ready < stats.workload_health.statefulsets_total {
+        warn
+    } else {
+        value
+    };
+    let ds_style = if stats.workload_health.daemonsets_ready < stats.workload_health.daemonsets_desired {
+        warn
+    } else {
+        value
+    };
+
+    render_card_row(
+        &[
+            stat_card("Deploys", &stats.deployment_count.to_string(), dep_style, card_w),
+            stat_card("StatefulSets", &stats.statefulset_count.to_string(), sts_style, card_w),
+            stat_card("DaemonSets", &stats.daemonset_count.to_string(), ds_style, card_w),
+            stat_card("Jobs", &stats.job_count.to_string(), value, card_w),
+            stat_card("CronJobs", &stats.cronjob_count.to_string(), value, card_w),
+        ],
+        &mut lines,
+    );
+
+    // ── Stat cards row 3: Resources ──────────────────────────
+    render_card_row(
+        &[
+            stat_card("ConfigMaps", &stats.configmap_count.to_string(), value, card_w),
+            stat_card("Secrets", &stats.secret_count.to_string(), value, card_w),
+            stat_card("Services", &stats.service_count.to_string(), value, card_w),
+            stat_card("Ingresses", &stats.ingress_count.to_string(), value, card_w),
+            stat_card("PVCs", &stats.pvc_count.to_string(), value, card_w),
+            stat_card("HPAs", &stats.hpa_count.to_string(), value, card_w),
+        ],
+        &mut lines,
+    );
     lines.push(Line::from(""));
 
     // ── Health warnings ─────────────────────────────────────
@@ -762,63 +845,187 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
         if stats.pods.crash_loop > 0 {
             warnings.push(Line::from(Span::styled(
                 format!("  ⚠ {} pod(s) in CrashLoopBackOff", stats.pods.crash_loop),
-                Style::default().fg(Color::Red),
+                bad,
             )));
         }
         if stats.pods.error > 0 {
             warnings.push(Line::from(Span::styled(
-                format!("  ⚠ {} pod(s) in error state", stats.pods.error),
-                Style::default().fg(Color::Red),
+                format!("  ⚠ {} pod(s) in error state (ImagePull/Config)", stats.pods.error),
+                bad,
+            )));
+        }
+        if stats.nodes.not_ready > 0 {
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} node(s) NotReady", stats.nodes.not_ready),
+                bad,
             )));
         }
         if stats.nodes.cordoned > 0 {
             warnings.push(Line::from(Span::styled(
                 format!("  ⊘ {} node(s) cordoned (scheduling disabled)", stats.nodes.cordoned),
-                Style::default().fg(Color::Yellow),
+                warn,
             )));
         }
-        if stats.nodes.with_pressure > 0 {
+        if stats.pressure.memory_pressure > 0 {
             warnings.push(Line::from(Span::styled(
-                format!("  ⚠ {} node(s) with resource pressure", stats.nodes.with_pressure),
-                Style::default().fg(Color::Red),
+                format!("  ⚠ {} node(s) with MemoryPressure", stats.pressure.memory_pressure),
+                bad,
+            )));
+        }
+        if stats.pressure.disk_pressure > 0 {
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} node(s) with DiskPressure", stats.pressure.disk_pressure),
+                bad,
+            )));
+        }
+        if stats.pressure.pid_pressure > 0 {
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} node(s) with PIDPressure", stats.pressure.pid_pressure),
+                bad,
+            )));
+        }
+        if stats.workload_health.deployments_ready < stats.workload_health.deployments_total {
+            let unhealthy = stats.workload_health.deployments_total - stats.workload_health.deployments_ready;
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} deployment(s) not fully available", unhealthy),
+                warn,
+            )));
+        }
+        if stats.workload_health.statefulsets_ready < stats.workload_health.statefulsets_total {
+            let unhealthy = stats.workload_health.statefulsets_total - stats.workload_health.statefulsets_ready;
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} statefulset(s) not fully ready", unhealthy),
+                warn,
+            )));
+        }
+        if stats.workload_health.daemonsets_ready < stats.workload_health.daemonsets_desired {
+            let unhealthy = stats.workload_health.daemonsets_desired - stats.workload_health.daemonsets_ready;
+            warnings.push(Line::from(Span::styled(
+                format!("  ⚠ {} daemonset(s) not fully ready", unhealthy),
+                warn,
             )));
         }
         if stats.recent_warnings > 0 {
             warnings.push(Line::from(Span::styled(
                 format!("  ⚠ {} warning event(s) in last hour", stats.recent_warnings),
-                Style::default().fg(Color::Yellow),
+                warn,
             )));
         }
         if warnings.is_empty() {
-            warnings.push(Line::from(Span::styled(
-                "  ✓ Cluster healthy — no warnings",
-                Style::default().fg(Color::Green),
-            )));
+            warnings.push(Line::from(Span::styled("  ✓ Cluster healthy — no warnings", good)));
         }
-        lines.push(Line::from(Span::styled(" Health", heading)));
-        lines.push(Line::from(Span::styled(
-            " ──────────────────────────────────────────────────────────",
-            dim,
-        )));
+        lines.extend(section_heading("Health", heading, dim));
         lines.extend(warnings);
         lines.push(Line::from(""));
     }
 
-    // ── Pod breakdown with gauge bar ────────────────────────
-    lines.push(Line::from(Span::styled(
-        format!(" Pods ({})", stats.pods.total),
-        heading,
-    )));
-    lines.push(Line::from(Span::styled(
-        " ──────────────────────────────────────────────────────────",
-        dim,
-    )));
+    // ── Workload health bars ─────────────────────────────────
+    {
+        let wh = &stats.workload_health;
+        let has_workloads = wh.deployments_total > 0 || wh.statefulsets_total > 0 || wh.daemonsets_desired > 0;
+        if has_workloads {
+            lines.extend(section_heading("Workload Health", heading, dim));
+            let bar_w = 30;
+            let lbl_w = 16;
+
+            if wh.deployments_total > 0 {
+                let mut spans = vec![Span::styled(format!("  {:<w$}", "Deployments", w = lbl_w), label)];
+                spans.extend(gauge_bar(wh.deployments_ready, wh.deployments_total, bar_w));
+                spans.push(Span::styled(
+                    format!("  {}/{} ready", wh.deployments_ready, wh.deployments_total),
+                    dim,
+                ));
+                lines.push(Line::from(spans));
+            }
+            if wh.statefulsets_total > 0 {
+                let mut spans = vec![Span::styled(format!("  {:<w$}", "StatefulSets", w = lbl_w), label)];
+                spans.extend(gauge_bar(wh.statefulsets_ready, wh.statefulsets_total, bar_w));
+                spans.push(Span::styled(
+                    format!("  {}/{} ready", wh.statefulsets_ready, wh.statefulsets_total),
+                    dim,
+                ));
+                lines.push(Line::from(spans));
+            }
+            if wh.daemonsets_desired > 0 {
+                let mut spans = vec![Span::styled(format!("  {:<w$}", "DaemonSets", w = lbl_w), label)];
+                spans.extend(gauge_bar(wh.daemonsets_ready, wh.daemonsets_desired, bar_w));
+                spans.push(Span::styled(
+                    format!("  {}/{} ready", wh.daemonsets_ready, wh.daemonsets_desired),
+                    dim,
+                ));
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    // ── Cluster Resources ────────────────────────────────────
+    {
+        let cr = &stats.cluster_resources;
+        if cr.cpu_capacity > 0.0 || cr.mem_capacity_bytes > 0.0 {
+            lines.extend(section_heading("Cluster Resources", heading, dim));
+            let bar_w = 30;
+            let lbl_w = 16;
+
+            // CPU: allocatable / capacity
+            let cpu_alloc_pct = if cr.cpu_capacity > 0.0 {
+                (cr.cpu_allocatable / cr.cpu_capacity * 100.0) as usize
+            } else {
+                0
+            };
+            let mut spans = vec![Span::styled(format!("  {:<w$}", "CPU", w = lbl_w), label)];
+            spans.extend(gauge_bar_inv(cpu_alloc_pct, bar_w));
+            spans.push(Span::styled(
+                format!(
+                    "  {} / {} cores",
+                    crate::k8s::format_cpu_cores(cr.cpu_allocatable),
+                    crate::k8s::format_cpu_cores(cr.cpu_capacity)
+                ),
+                dim,
+            ));
+            lines.push(Line::from(spans));
+
+            // Memory: allocatable / capacity
+            let mem_alloc_pct = if cr.mem_capacity_bytes > 0.0 {
+                (cr.mem_allocatable_bytes / cr.mem_capacity_bytes * 100.0) as usize
+            } else {
+                0
+            };
+            let mut spans = vec![Span::styled(format!("  {:<w$}", "Memory", w = lbl_w), label)];
+            spans.extend(gauge_bar_inv(mem_alloc_pct, bar_w));
+            spans.push(Span::styled(
+                format!(
+                    "  {} / {}",
+                    crate::k8s::format_memory_gb_from_bytes(cr.mem_allocatable_bytes),
+                    crate::k8s::format_memory_gb_from_bytes(cr.mem_capacity_bytes)
+                ),
+                dim,
+            ));
+            lines.push(Line::from(spans));
+
+            // Pods: allocatable / capacity
+            if cr.pod_capacity > 0 {
+                let mut spans = vec![Span::styled(format!("  {:<w$}", "Pod Capacity", w = lbl_w), label)];
+                spans.extend(gauge_bar(cr.pod_allocatable, cr.pod_capacity, bar_w));
+                spans.push(Span::styled(
+                    format!("  {} / {} slots", cr.pod_allocatable, cr.pod_capacity),
+                    dim,
+                ));
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    // ── Pod breakdown ────────────────────────────────────────
+    lines.extend(section_heading(&format!("Pods ({})", stats.pods.total), heading, dim));
 
     if stats.pods.total > 0 {
         let bar_width = 30;
+        let lbl_w = 16;
 
         // Running
-        let mut running_spans = vec![Span::styled(format!("  {:<12}", "Running"), label)];
+        let mut running_spans = vec![Span::styled(format!("  {:<w$}", "Running", w = lbl_w), label)];
         running_spans.extend(gauge_bar(stats.pods.running, stats.pods.total, bar_width));
         running_spans.push(Span::styled(
             format!("  {}/{}", stats.pods.running, stats.pods.total),
@@ -826,19 +1033,48 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
         ));
         lines.push(Line::from(running_spans));
 
-        // Pending
+        if stats.pods.succeeded > 0 {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<w$}", "Succeeded", w = lbl_w), label),
+                Span::styled(stats.pods.succeeded.to_string(), good),
+            ]));
+        }
         if stats.pods.pending > 0 {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<12}", "Pending"), label),
-                Span::styled(format!("{}", stats.pods.pending), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("  {:<w$}", "Pending", w = lbl_w), label),
+                Span::styled(stats.pods.pending.to_string(), warn),
+            ]));
+        }
+        if stats.pods.failed > 0 {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<w$}", "Failed", w = lbl_w), label),
+                Span::styled(stats.pods.failed.to_string(), bad),
             ]));
         }
 
-        // Failed
-        if stats.pods.failed > 0 {
+        // Containers
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<w$}", "Containers", w = lbl_w), label),
+            Span::styled(
+                format!("{}/{} ready", stats.containers.ready, stats.containers.total),
+                if stats.containers.ready < stats.containers.total {
+                    warn
+                } else {
+                    value
+                },
+            ),
+        ]));
+        if stats.containers.total_restarts > 0 {
+            let restart_style = if stats.containers.total_restarts > 100 {
+                bad
+            } else if stats.containers.total_restarts > 10 {
+                warn
+            } else {
+                value
+            };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<12}", "Failed"), label),
-                Span::styled(format!("{}", stats.pods.failed), bad),
+                Span::styled(format!("  {:<w$}", "Restarts", w = lbl_w), label),
+                Span::styled(format!("{}", stats.containers.total_restarts), restart_style),
             ]));
         }
     } else {
@@ -846,21 +1082,54 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
     }
     lines.push(Line::from(""));
 
+    // ── Top restarting pods ──────────────────────────────────
+    if !stats.top_restarting.is_empty() {
+        lines.extend(section_heading("Top Restarting Pods", heading, dim));
+        for pod in &stats.top_restarting {
+            let restart_style = if pod.restart_count > 100 { bad } else { warn };
+            lines.push(Line::from(vec![
+                Span::styled("  ", dim),
+                Span::styled(format!("{:<40}", pod.name), value),
+                Span::styled(format!("{:<20}", pod.namespace), dim),
+                Span::styled(format!("{}", pod.restart_count), restart_style),
+                Span::styled(" restarts", dim),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // ── Recent warning events ────────────────────────────────
+    if !stats.warning_details.is_empty() {
+        lines.extend(section_heading("Recent Warnings (last hour)", heading, dim));
+        for evt in &stats.warning_details {
+            let msg = if evt.message.len() > 60 {
+                format!("{}…", &evt.message[..59])
+            } else {
+                evt.message.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ⚠ ", warn),
+                Span::styled(format!("{:<18}", evt.reason), label),
+                Span::styled(format!("{:<16}", evt.namespace), dim),
+                Span::styled(format!("×{:<4}", evt.count), warn),
+                Span::styled(msg, value),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
     // ── Node grid ─────────────────────────────────────────
     if !stats.node_list.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(" Nodes ({})", stats.node_list.len()),
+        lines.extend(section_heading(
+            &format!("Nodes ({})", stats.node_list.len()),
             heading,
-        )));
-        lines.push(Line::from(Span::styled(
-            " ──────────────────────────────────────────────────────────",
             dim,
-        )));
+        ));
 
         // Build node cards, then tile them in a grid
         let node_card_w: usize = 36;
         let gap = 1;
-        let avail_w = area.width.saturating_sub(3) as usize; // inner width minus border + pad
+        let avail_w = area.width.saturating_sub(3) as usize;
         let cols = ((avail_w + gap) / (node_card_w + gap)).max(1);
         let node_cards: Vec<Vec<Vec<Span>>> = stats
             .node_list
@@ -868,7 +1137,6 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
             .map(|node| build_node_card(node, node_card_w))
             .collect();
 
-        // Tile cards into grid rows
         for chunk in node_cards.chunks(cols) {
             let card_height = chunk.iter().map(|c| c.len()).max().unwrap_or(0);
             for row in 0..card_height {
@@ -880,13 +1148,12 @@ fn render_cluster_stats(f: &mut Frame, app: &mut App, area: Rect) {
                     if let Some(card_row) = card.get(row) {
                         spans.extend(card_row.iter().cloned());
                     } else {
-                        // Pad empty rows to keep alignment
                         spans.push(Span::raw(" ".repeat(node_card_w)));
                     }
                 }
                 lines.push(Line::from(spans));
             }
-            lines.push(Line::from("")); // gap between grid rows
+            lines.push(Line::from(""));
         }
     }
 
