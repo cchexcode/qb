@@ -1306,6 +1306,62 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Render a stacked bar: usage (green/red) | wasted request (blue) | headroom
+/// to limit (dark) The bar shows three layers within `width` chars, scaled to
+/// `max_val`.
+fn stacked_bar(usage: f64, request: f64, limit: f64, max_val: f64, width: usize) -> Vec<Span<'static>> {
+    if max_val <= 0.0 || width == 0 {
+        return vec![Span::raw("")];
+    }
+    let scale = |v: f64| -> usize { ((v / max_val) * width as f64).round().min(width as f64) as usize };
+
+    let use_w = scale(usage);
+    let req_w = scale(request).saturating_sub(use_w);
+    let lim_w = if limit > 0.0 {
+        scale(limit).saturating_sub(use_w + req_w)
+    } else {
+        0
+    };
+    let empty_w = width.saturating_sub(use_w + req_w + lim_w);
+
+    let use_color = if request > 0.0 && usage > request * 1.2 {
+        Color::Red
+    } else if request > 0.0 && usage < request * 0.2 {
+        Color::Blue
+    } else {
+        Color::Green
+    };
+
+    vec![
+        Span::styled("█".repeat(use_w), Style::default().fg(use_color)),
+        Span::styled("▒".repeat(req_w), Style::default().fg(Color::DarkGray)),
+        Span::styled("░".repeat(lim_w), Style::default().fg(Color::Rgb(50, 50, 50))),
+        Span::styled("·".repeat(empty_w), Style::default().fg(Color::Rgb(30, 30, 30))),
+    ]
+}
+
+/// Pick a unique-ish color for a namespace/workload name by hashing it.
+fn name_color(name: &str) -> Color {
+    let hash: u32 = name
+        .bytes()
+        .fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32));
+    let colors = [
+        Color::Green,
+        Color::Cyan,
+        Color::Blue,
+        Color::Magenta,
+        Color::Yellow,
+        Color::Red,
+        Color::LightGreen,
+        Color::LightCyan,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightYellow,
+        Color::LightRed,
+    ];
+    colors[(hash as usize) % colors.len()]
+}
+
 fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
     use super::app::ResourceMapSort;
 
@@ -1336,6 +1392,7 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
     let good = Style::default().fg(Color::Green);
     let warn = Style::default().fg(Color::Yellow);
     let bad = Style::default().fg(Color::Red);
+    let over_prov = Style::default().fg(Color::Blue);
 
     // Filter by selected namespace
     let ns_filter = app.kube.context.namespace.as_deref();
@@ -1357,6 +1414,8 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
     let total_cpu_lim: f64 = filtered_pods.iter().map(|p| p.spec.cpu_limit).sum();
     let total_mem_req: f64 = filtered_pods.iter().map(|p| p.spec.mem_request).sum();
     let total_mem_lim: f64 = filtered_pods.iter().map(|p| p.spec.mem_limit).sum();
+    let inner_w = area.width.saturating_sub(4) as usize;
+    let bar_w = inner_w.saturating_sub(32).min(50).max(15);
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -1365,7 +1424,6 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
         | ResourceMapSort::Cpu => "CPU",
         | ResourceMapSort::Memory => "Memory",
     };
-
     let ns_label = ns_filter.unwrap_or("all namespaces");
 
     // ── Header ───────────────────────────────────────────────
@@ -1377,92 +1435,99 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("m", label),
         Span::styled(" toggle  ", dim),
         Span::styled("n", label),
-        Span::styled(" namespace)  ", dim),
-        Span::styled("!", bad),
-        Span::styled(" over limit  ", dim),
-        Span::styled("$", Style::default().fg(Color::Blue)),
-        Span::styled(" over-provisioned", dim),
+        Span::styled(" namespace)", dim),
+    ]));
+    // Legend
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim),
+        Span::styled("█", good),
+        Span::styled(" usage  ", dim),
+        Span::styled("▒", dim),
+        Span::styled(" unused request  ", dim),
+        Span::styled("░", Style::default().fg(Color::Rgb(50, 50, 50))),
+        Span::styled(" headroom to limit  ", dim),
+        Span::styled("█", bad),
+        Span::styled(" over request  ", dim),
+        Span::styled("█", over_prov),
+        Span::styled(" <20% used", dim),
     ]));
     lines.push(Line::from(""));
 
-    // ── Efficiency ─────────────────────────────────────────
-    let eff_title = if ns_filter.is_some() {
-        "Namespace Efficiency"
-    } else {
-        "Cluster Efficiency"
-    };
-    lines.extend(section_heading(eff_title, heading, dim));
+    // ── Cluster/Namespace summary bars ───────────────────────
     {
-        let cpu_req = total_cpu_req;
-        let cpu_lim = total_cpu_lim;
-        let mem_req = total_mem_req;
-        let mem_lim = total_mem_lim;
+        let eff_title = if ns_filter.is_some() {
+            "Namespace Summary"
+        } else {
+            "Cluster Summary"
+        };
+        lines.extend(section_heading(eff_title, heading, dim));
 
-        // CPU: usage / request / limit
-        let mut cpu_spans = vec![Span::styled("  CPU      ", label)];
-        cpu_spans.push(Span::styled(
-            format!("used: {}  ", crate::k8s::format_cpu_cores(total_cpu)),
+        let max_cpu = total_cpu.max(total_cpu_req).max(total_cpu_lim).max(0.001);
+        let max_mem = total_mem.max(total_mem_req).max(total_mem_lim).max(1.0);
+
+        // CPU bar
+        let mut s = vec![Span::styled("  CPU    ", label)];
+        s.extend(stacked_bar(total_cpu, total_cpu_req, total_cpu_lim, max_cpu, bar_w));
+        s.push(Span::styled(
+            format!(" {} used", crate::k8s::format_cpu_cores(total_cpu),),
             value,
         ));
-        if cpu_req > 0.0 {
-            let pct = (total_cpu / cpu_req * 100.0) as usize;
-            cpu_spans.push(Span::styled(
-                format!("req: {} ({}% used)  ", crate::k8s::format_cpu_cores(cpu_req), pct),
-                if pct < 50 {
-                    Style::default().fg(Color::Blue)
-                } else {
-                    good
-                },
+        if total_cpu_req > 0.0 {
+            let pct = (total_cpu / total_cpu_req * 100.0) as usize;
+            s.push(Span::styled(
+                format!(" / {} req ({}%)", crate::k8s::format_cpu_cores(total_cpu_req), pct),
+                dim,
             ));
         }
-        if cpu_lim > 0.0 {
-            let pct = (total_cpu / cpu_lim * 100.0) as usize;
-            cpu_spans.push(Span::styled(
-                format!("lim: {} ({}% used)", crate::k8s::format_cpu_cores(cpu_lim), pct),
-                if pct > 90 { bad } else { dim },
+        if total_cpu_lim > 0.0 {
+            s.push(Span::styled(
+                format!(" / {} lim", crate::k8s::format_cpu_cores(total_cpu_lim)),
+                dim,
             ));
         }
-        lines.push(Line::from(cpu_spans));
+        lines.push(Line::from(s));
 
-        // Memory: usage / request / limit
-        let mut mem_spans = vec![Span::styled("  Memory   ", label)];
-        mem_spans.push(Span::styled(
-            format!("used: {}  ", crate::k8s::format_memory_gb_from_bytes(total_mem)),
+        // Memory bar
+        let mut s = vec![Span::styled("  Memory ", label)];
+        s.extend(stacked_bar(total_mem, total_mem_req, total_mem_lim, max_mem, bar_w));
+        s.push(Span::styled(
+            format!(" {} used", crate::k8s::format_memory_gb_from_bytes(total_mem)),
             value,
         ));
-        if mem_req > 0.0 {
-            let pct = (total_mem / mem_req * 100.0) as usize;
-            mem_spans.push(Span::styled(
+        if total_mem_req > 0.0 {
+            let pct = (total_mem / total_mem_req * 100.0) as usize;
+            s.push(Span::styled(
                 format!(
-                    "req: {} ({}% used)  ",
-                    crate::k8s::format_memory_gb_from_bytes(mem_req),
+                    " / {} req ({}%)",
+                    crate::k8s::format_memory_gb_from_bytes(total_mem_req),
                     pct
                 ),
-                if pct < 50 {
-                    Style::default().fg(Color::Blue)
-                } else {
-                    good
-                },
+                dim,
             ));
         }
-        if mem_lim > 0.0 {
-            let pct = (total_mem / mem_lim * 100.0) as usize;
-            mem_spans.push(Span::styled(
-                format!(
-                    "lim: {} ({}% used)",
-                    crate::k8s::format_memory_gb_from_bytes(mem_lim),
-                    pct
-                ),
-                if pct > 90 { bad } else { dim },
+        if total_mem_lim > 0.0 {
+            s.push(Span::styled(
+                format!(" / {} lim", crate::k8s::format_memory_gb_from_bytes(total_mem_lim)),
+                dim,
             ));
         }
-        lines.push(Line::from(mem_spans));
+        lines.push(Line::from(s));
+        lines.push(Line::from(""));
     }
-    lines.push(Line::from(""));
 
-    // ── Workloads ────────────────────────────────────────────
+    // ── Workload stacked bar chart ───────────────────────────
     if !filtered_workloads.is_empty() {
-        let mut wls = filtered_workloads.clone();
+        let wl_filter = &app.resource_map.filter;
+        let mut wls: Vec<&crate::k8s::WorkloadMetrics> = filtered_workloads
+            .iter()
+            .filter(|w| {
+                wl_filter.is_empty()
+                    || w.name.contains(wl_filter.as_str())
+                    || w.namespace.contains(wl_filter.as_str())
+                    || w.kind.contains(wl_filter.as_str())
+            })
+            .copied()
+            .collect();
         match sort {
             | ResourceMapSort::Cpu => {
                 wls.sort_by(|a, b| {
@@ -1479,108 +1544,398 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
                 })
             },
         }
-        let top_n = 25.min(wls.len());
+
+        // Find max for scaling all bars to the same axis
+        let (max_bar_val, fmt_use): (f64, Box<dyn Fn(f64) -> String>) = match sort {
+            | ResourceMapSort::Cpu => {
+                let m = wls
+                    .iter()
+                    .map(|w| w.cpu_usage.max(w.cpu_request).max(w.cpu_limit))
+                    .fold(0.0f64, f64::max);
+                (
+                    m,
+                    Box::new(|v| crate::k8s::format_cpu_cores(v)) as Box<dyn Fn(f64) -> String>,
+                )
+            },
+            | ResourceMapSort::Memory => {
+                let m = wls
+                    .iter()
+                    .map(|w| w.mem_usage.max(w.mem_request).max(w.mem_limit))
+                    .fold(0.0f64, f64::max);
+                (
+                    m,
+                    Box::new(|v| crate::k8s::format_memory_gb_from_bytes(v)) as Box<dyn Fn(f64) -> String>,
+                )
+            },
+        };
+
+        let wl_focused = matches!(app.resource_map.focus, super::app::ResourceMapFocus::Workloads { .. });
+        let wl_cursor = match app.resource_map.focus {
+            | super::app::ResourceMapFocus::Workloads { cursor } => Some(cursor),
+            | _ => None,
+        };
+        let show_n = if wl_focused { wls.len() } else { 20.min(wls.len()) };
+
+        let focus_hint = if wl_focused {
+            " (w/Esc exit  / filter  x clear)"
+        } else {
+            " (w to focus)"
+        };
+        let wl_total = filtered_workloads.len();
         lines.extend(section_heading(
-            &format!("Workloads by {sort_label} ({top_n}/{} total)", wls.len()),
+            &format!(
+                "Workload {sort_label} — usage vs request vs limit ({}/{}){focus_hint}",
+                wls.len(),
+                wl_total
+            ),
             heading,
             dim,
         ));
 
-        // Header
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {:<30}", "WORKLOAD"), dim),
-            Span::styled(format!("{:<16}", "NAMESPACE"), dim),
-            Span::styled(format!("{:<5}", "KIND"), dim),
-            Span::styled(format!("{:>4}", "#"), dim),
-            Span::styled(format!("{:>16}", "CPU use/req"), dim),
-            Span::styled(format!("{:>16}", "MEM use/req"), dim),
-        ]));
+        // Filter bar
+        if wl_focused {
+            if app.resource_map.filter_editing {
+                lines.push(Line::from(vec![
+                    Span::styled("  /", label),
+                    Span::styled(
+                        format!("{}_", app.resource_map.filter_buf),
+                        Style::default().fg(Color::White).add_modifier(Modifier::UNDERLINED),
+                    ),
+                ]));
+            } else if !app.resource_map.filter.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("  filter: ", dim),
+                    Span::styled(app.resource_map.filter.clone(), label),
+                    Span::styled(
+                        format!("  ({} match{})", wls.len(), if wls.len() == 1 { "" } else { "es" }),
+                        dim,
+                    ),
+                ]));
+            }
+        }
 
-        for wl in wls.iter().take(top_n) {
-            let cpu_pct_str = if wl.cpu_request > 0.0 {
-                format!(
-                    "{}/{}",
-                    crate::k8s::format_cpu_cores(wl.cpu_usage),
-                    crate::k8s::format_cpu_cores(wl.cpu_request)
-                )
-            } else {
-                format!("{}/–", crate::k8s::format_cpu_cores(wl.cpu_usage))
-            };
-            let mem_pct_str = if wl.mem_request > 0.0 {
-                format!(
-                    "{}/{}",
-                    crate::k8s::format_memory_gb_from_bytes(wl.mem_usage),
-                    crate::k8s::format_memory_gb_from_bytes(wl.mem_request)
-                )
-            } else {
-                format!("{}/–", crate::k8s::format_memory_gb_from_bytes(wl.mem_usage))
-            };
+        // Track line index where the workload list starts so we can auto-scroll
+        let wl_section_start = lines.len();
 
-            let cpu_color = if wl.cpu_request > 0.0 {
-                let r = wl.cpu_usage / wl.cpu_request;
-                if r > 1.5 {
-                    Color::Red
-                } else if r < 0.2 {
-                    Color::Blue
-                } else {
-                    Color::Green
-                }
-            } else {
-                Color::White
-            };
-            let mem_color = if wl.mem_request > 0.0 {
-                let r = wl.mem_usage / wl.mem_request;
-                if r > 1.5 {
-                    Color::Red
-                } else if r < 0.2 {
-                    Color::Blue
-                } else {
-                    Color::Green
-                }
-            } else {
-                Color::White
+        let name_w = 24;
+        for (i, wl) in wls.iter().enumerate().take(show_n) {
+            let (usage, request, limit) = match sort {
+                | ResourceMapSort::Cpu => (wl.cpu_usage, wl.cpu_request, wl.cpu_limit),
+                | ResourceMapSort::Memory => (wl.mem_usage, wl.mem_request, wl.mem_limit),
             };
 
             let kind_short = match wl.kind.as_str() {
-                | "Deployment" => "Dply",
-                | "StatefulSet" => "SSet",
-                | "DaemonSet" => "DS",
-                | "Job" => "Job",
-                | "CronJob" => "CJob",
-                | "Pod" => "Pod",
+                | "Deployment" => "dply",
+                | "StatefulSet" => "sset",
+                | "DaemonSet" => "ds",
+                | "Job" => "job",
+                | "Pod" => "pod",
                 | k => &k[..4.min(k.len())],
             };
 
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<30}", truncate(&wl.name, 28)), value),
-                Span::styled(format!("{:<16}", truncate(&wl.namespace, 14)), dim),
-                Span::styled(format!("{:<5}", kind_short), dim),
-                Span::styled(format!("{:>4}", wl.pod_count), dim),
-                Span::styled(format!("{:>16}", cpu_pct_str), Style::default().fg(cpu_color)),
-                Span::styled(format!("{:>16}", mem_pct_str), Style::default().fg(mem_color)),
-            ]));
+            let disp_name = format!("{}/{}", kind_short, truncate(&wl.name, name_w - kind_short.len() - 1));
+            let pct_str = if request > 0.0 {
+                format!("{}%", (usage / request * 100.0) as usize)
+            } else {
+                "–".into()
+            };
+
+            let is_selected = wl_cursor == Some(i);
+            let row_style = if is_selected {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            let name_style = if is_selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                value
+            };
+
+            let prefix = if is_selected { "▸ " } else { "  " };
+
+            let mut s: Vec<Span> = vec![
+                Span::styled(
+                    prefix,
+                    if is_selected {
+                        Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+                    } else {
+                        dim
+                    },
+                ),
+                Span::styled(format!("{:<w$}", truncate(&disp_name, name_w), w = name_w), name_style),
+            ];
+            // Stacked bar — apply bg highlight if selected
+            for mut span in stacked_bar(usage, request, limit, max_bar_val, bar_w) {
+                if is_selected {
+                    span.style = span.style.bg(Color::DarkGray);
+                }
+                s.push(span);
+            }
+            s.push(Span::styled(
+                format!(" {} ", fmt_use(usage)),
+                if is_selected { name_style } else { value },
+            ));
+            s.push(Span::styled(
+                format!("({pct_str})"),
+                if is_selected {
+                    row_style.fg(Color::DarkGray)
+                } else {
+                    dim
+                },
+            ));
+            lines.push(Line::from(s));
+
+            // If selected, show expanded detail below
+            if is_selected {
+                let cpu_use = crate::k8s::format_cpu_cores(wl.cpu_usage);
+                let cpu_req = crate::k8s::format_cpu_cores(wl.cpu_request);
+                let cpu_lim = crate::k8s::format_cpu_cores(wl.cpu_limit);
+                let mem_use = crate::k8s::format_memory_gb_from_bytes(wl.mem_usage);
+                let mem_req = crate::k8s::format_memory_gb_from_bytes(wl.mem_request);
+                let mem_lim = crate::k8s::format_memory_gb_from_bytes(wl.mem_limit);
+
+                let detail_dim = Style::default().fg(Color::DarkGray);
+                let detail_lbl = Style::default().fg(Color::Cyan);
+                let detail_val = Style::default().fg(Color::White);
+
+                lines.push(Line::from(vec![
+                    Span::styled("    ", detail_dim),
+                    Span::styled(format!("{} ", wl.kind), detail_dim),
+                    Span::styled(format!("{}", wl.name), detail_val),
+                    Span::styled(format!("  ns:{}", wl.namespace), detail_dim),
+                    Span::styled(format!("  pods:{}", wl.pod_count), detail_dim),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("    ", detail_dim),
+                    Span::styled("cpu  ", detail_lbl),
+                    Span::styled(format!("use:{cpu_use}  "), detail_val),
+                    Span::styled(format!("req:{cpu_req}  "), detail_dim),
+                    Span::styled(format!("lim:{cpu_lim}  "), detail_dim),
+                    if wl.cpu_request > 0.0 {
+                        let pct = (wl.cpu_usage / wl.cpu_request * 100.0) as usize;
+                        Span::styled(
+                            format!("({pct}% of req)"),
+                            if pct > 100 {
+                                bad
+                            } else if pct < 20 {
+                                over_prov
+                            } else {
+                                good
+                            },
+                        )
+                    } else {
+                        Span::styled("(no request)", warn)
+                    },
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("    ", detail_dim),
+                    Span::styled("mem  ", detail_lbl),
+                    Span::styled(format!("use:{mem_use}  "), detail_val),
+                    Span::styled(format!("req:{mem_req}  "), detail_dim),
+                    Span::styled(format!("lim:{mem_lim}  "), detail_dim),
+                    if wl.mem_request > 0.0 {
+                        let pct = (wl.mem_usage / wl.mem_request * 100.0) as usize;
+                        Span::styled(
+                            format!("({pct}% of req)"),
+                            if pct > 100 {
+                                bad
+                            } else if pct < 20 {
+                                over_prov
+                            } else {
+                                good
+                            },
+                        )
+                    } else {
+                        Span::styled("(no request)", warn)
+                    },
+                ]));
+                // Right-sizing suggestion
+                if wl.cpu_request > 0.0 && wl.cpu_usage < wl.cpu_request * 0.3 {
+                    let suggested = (wl.cpu_usage * 2.0).max(0.01);
+                    lines.push(Line::from(vec![
+                        Span::styled("    → ", label),
+                        Span::styled(
+                            format!(
+                                "CPU request could be lowered to {}",
+                                crate::k8s::format_cpu_cores(suggested)
+                            ),
+                            over_prov,
+                        ),
+                    ]));
+                }
+                if wl.cpu_limit > 0.0 && wl.cpu_usage > wl.cpu_limit * 0.9 {
+                    let suggested = wl.cpu_usage * 1.5;
+                    lines.push(Line::from(vec![
+                        Span::styled("    → ", label),
+                        Span::styled(
+                            format!(
+                                "CPU limit should be raised to {}",
+                                crate::k8s::format_cpu_cores(suggested)
+                            ),
+                            bad,
+                        ),
+                    ]));
+                }
+                if wl.mem_request > 0.0 && wl.mem_usage < wl.mem_request * 0.3 {
+                    let suggested = (wl.mem_usage * 2.0).max(64.0 * 1024.0 * 1024.0);
+                    lines.push(Line::from(vec![
+                        Span::styled("    → ", label),
+                        Span::styled(
+                            format!(
+                                "Memory request could be lowered to {}",
+                                crate::k8s::format_memory_gb_from_bytes(suggested)
+                            ),
+                            over_prov,
+                        ),
+                    ]));
+                }
+                if wl.mem_limit > 0.0 && wl.mem_usage > wl.mem_limit * 0.9 {
+                    let suggested = wl.mem_usage * 1.5;
+                    lines.push(Line::from(vec![
+                        Span::styled("    → ", label),
+                        Span::styled(
+                            format!(
+                                "Memory limit should be raised to {}",
+                                crate::k8s::format_memory_gb_from_bytes(suggested)
+                            ),
+                            bad,
+                        ),
+                    ]));
+                }
+            }
+        }
+        if !wl_focused && wls.len() > show_n {
+            lines.push(Line::from(Span::styled(
+                format!("  ... and {} more (press w to see all)", wls.len() - show_n),
+                dim,
+            )));
         }
         lines.push(Line::from(""));
+
+        // Auto-scroll to keep selected workload visible
+        if let Some(cursor_idx) = wl_cursor {
+            // Each selected row expands to ~5 extra lines, non-selected is 1 line
+            let cursor_line = wl_section_start + cursor_idx.min(show_n);
+            // Add the scroll position of the panel (area height minus border)
+            let visible_h = area.height.saturating_sub(2) as usize;
+            if cursor_line >= app.resource_map.scroll as usize + visible_h {
+                app.resource_map.scroll = (cursor_line.saturating_sub(visible_h / 2)) as u16;
+            } else if cursor_line < app.resource_map.scroll as usize {
+                app.resource_map.scroll = cursor_line.saturating_sub(2) as u16;
+            }
+        }
     }
 
-    // ── Optimization flags ───────────────────────────────────
+    // ── Namespace treemap ────────────────────────────────────
+    // Shows proportional blocks per namespace, stacked horizontally like a
+    // real treemap row. Each namespace gets a colored block sized by its
+    // resource usage share.
     {
-        let over_cpu: Vec<_> = filtered_pods
-            .iter()
-            .filter(|p| p.spec.cpu_request > 0.0 && p.cpu_cores / p.spec.cpu_request < 0.1)
+        let mut ns_map: std::collections::BTreeMap<&str, (f64, f64, usize)> = std::collections::BTreeMap::new();
+        for pod in &filtered_pods {
+            let e = ns_map.entry(pod.namespace.as_str()).or_insert((0.0, 0.0, 0));
+            e.0 += pod.cpu_cores;
+            e.1 += pod.memory_bytes;
+            e.2 += 1;
+        }
+
+        let mut ns_list: Vec<(&str, f64, f64, usize)> = ns_map
+            .into_iter()
+            .map(|(ns, (cpu, mem, count))| (ns, cpu, mem, count))
             .collect();
-        let over_mem: Vec<_> = filtered_pods
-            .iter()
-            .filter(|p| p.spec.mem_request > 0.0 && p.memory_bytes / p.spec.mem_request < 0.1)
-            .collect();
-        let no_requests: Vec<_> = filtered_pods
-            .iter()
-            .filter(|p| p.spec.cpu_request == 0.0 && p.spec.mem_request == 0.0)
-            .collect();
-        let no_limits: Vec<_> = filtered_pods
-            .iter()
-            .filter(|p| p.spec.cpu_limit == 0.0 && p.spec.mem_limit == 0.0)
-            .collect();
+
+        match sort {
+            | ResourceMapSort::Cpu => {
+                ns_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            },
+            | ResourceMapSort::Memory => {
+                ns_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            },
+        }
+
+        if ns_list.len() > 1 && inner_w > 20 {
+            lines.extend(section_heading(
+                &format!("Namespace {sort_label} Treemap"),
+                heading,
+                dim,
+            ));
+
+            let total_val = match sort {
+                | ResourceMapSort::Cpu => total_cpu,
+                | ResourceMapSort::Memory => total_mem,
+            };
+
+            // Top row: colored blocks proportional to usage
+            let map_w = inner_w.saturating_sub(2);
+            let mut block_spans: Vec<Span> = vec![Span::styled(" ", dim)];
+            let mut label_entries: Vec<(&str, usize, Color)> = Vec::new();
+
+            for (ns, cpu, mem, _) in &ns_list {
+                let ns_val = match sort {
+                    | ResourceMapSort::Cpu => *cpu,
+                    | ResourceMapSort::Memory => *mem,
+                };
+                let w = ((ns_val / total_val) * map_w as f64).round().max(1.0) as usize;
+                let w = w.min(
+                    map_w.saturating_sub(block_spans.iter().map(|s| s.content.chars().count()).sum::<usize>() - 1),
+                );
+                if w == 0 {
+                    continue;
+                }
+                let color = name_color(ns);
+                block_spans.push(Span::styled("█".repeat(w), Style::default().fg(color)));
+                label_entries.push((ns, w, color));
+            }
+            lines.push(Line::from(block_spans));
+
+            // Label row below the bar
+            let mut lbl_spans: Vec<Span> = vec![Span::styled(" ", dim)];
+            for (ns, w, color) in &label_entries {
+                let ns_short = truncate(ns, w.saturating_sub(1));
+                lbl_spans.push(Span::styled(
+                    format!("{:<w$}", ns_short, w = w),
+                    Style::default().fg(*color),
+                ));
+            }
+            lines.push(Line::from(lbl_spans));
+            lines.push(Line::from(""));
+
+            // Detail rows per namespace
+            for (ns, cpu, mem, count) in &ns_list {
+                let ns_val = match sort {
+                    | ResourceMapSort::Cpu => *cpu,
+                    | ResourceMapSort::Memory => *mem,
+                };
+                let pct = (ns_val / total_val * 100.0) as usize;
+                if pct == 0 {
+                    continue;
+                }
+                let color = name_color(ns);
+                let val_str = match sort {
+                    | ResourceMapSort::Cpu => crate::k8s::format_cpu_cores(*cpu),
+                    | ResourceMapSort::Memory => crate::k8s::format_memory_gb_from_bytes(*mem),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  █ ", Style::default().fg(color)),
+                    Span::styled(
+                        format!("{:<20}", ns),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{:>5}%  ", pct), value),
+                    Span::styled(val_str, dim),
+                    Span::styled(format!("  ({count} pods)"), dim),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    // ── Optimization recommendations ─────────────────────────
+    {
         let over_limit_cpu: Vec<_> = filtered_pods
             .iter()
             .filter(|p| p.spec.cpu_limit > 0.0 && p.cpu_cores > p.spec.cpu_limit)
@@ -1589,137 +1944,255 @@ fn render_resource_map(f: &mut Frame, app: &mut App, area: Rect) {
             .iter()
             .filter(|p| p.spec.mem_limit > 0.0 && p.memory_bytes > p.spec.mem_limit)
             .collect();
+        let over_req_cpu: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.cpu_request > 0.0 && p.cpu_cores > p.spec.cpu_request * 1.2)
+            .collect();
+        let under_cpu: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.cpu_request > 0.0 && p.cpu_cores < p.spec.cpu_request * 0.2)
+            .collect();
+        let under_mem: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.mem_request > 0.0 && p.memory_bytes < p.spec.mem_request * 0.2)
+            .collect();
+        let no_req: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.cpu_request == 0.0 && p.spec.mem_request == 0.0)
+            .collect();
+        let no_lim: Vec<_> = filtered_pods
+            .iter()
+            .filter(|p| p.spec.cpu_limit == 0.0 && p.spec.mem_limit == 0.0)
+            .collect();
 
-        let has_issues = !over_cpu.is_empty()
-            || !over_mem.is_empty()
-            || !no_requests.is_empty()
-            || !no_limits.is_empty()
-            || !over_limit_cpu.is_empty()
-            || !over_limit_mem.is_empty();
+        let has_any = !over_limit_cpu.is_empty()
+            || !over_limit_mem.is_empty()
+            || !over_req_cpu.is_empty()
+            || !under_cpu.is_empty()
+            || !under_mem.is_empty()
+            || !no_req.is_empty()
+            || !no_lim.is_empty();
 
-        if has_issues {
-            lines.extend(section_heading("Optimization Opportunities", heading, dim));
+        if has_any {
+            lines.extend(section_heading("Optimization Recommendations", heading, dim));
 
+            // Critical: over limits
             if !over_limit_cpu.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("  ! {} pod(s) exceeding CPU limit (throttled)", over_limit_cpu.len()),
-                    bad,
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("  ", dim),
+                    Span::styled(
+                        "CRITICAL  ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{} pod(s) exceeding CPU limit — being throttled", over_limit_cpu.len()),
+                        bad,
+                    ),
+                ]));
+                for p in over_limit_cpu.iter().take(5) {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", dim),
+                        Span::styled(format!("{:<40}", truncate(&p.owner, 38)), value),
+                        Span::styled(
+                            format!(
+                                "using {} / {} limit",
+                                crate::k8s::format_cpu_cores(p.cpu_cores),
+                                crate::k8s::format_cpu_cores(p.spec.cpu_limit)
+                            ),
+                            bad,
+                        ),
+                        Span::styled(
+                            format!("  → raise limit to {}", crate::k8s::format_cpu_cores(p.cpu_cores * 1.3)),
+                            warn,
+                        ),
+                    ]));
+                }
             }
             if !over_limit_mem.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  ! {} pod(s) exceeding memory limit (OOMKill risk)",
-                        over_limit_mem.len()
+                lines.push(Line::from(vec![
+                    Span::styled("  ", dim),
+                    Span::styled(
+                        "CRITICAL  ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ),
-                    bad,
-                )));
-            }
-            if !no_requests.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  ? {} pod(s) with no resource requests (BestEffort QoS)",
-                        no_requests.len()
+                    Span::styled(
+                        format!("{} pod(s) exceeding memory limit — OOMKill risk", over_limit_mem.len()),
+                        bad,
                     ),
-                    warn,
-                )));
+                ]));
+                for p in over_limit_mem.iter().take(5) {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", dim),
+                        Span::styled(format!("{:<40}", truncate(&p.owner, 38)), value),
+                        Span::styled(
+                            format!(
+                                "using {} / {} limit",
+                                crate::k8s::format_memory_gb_from_bytes(p.memory_bytes),
+                                crate::k8s::format_memory_gb_from_bytes(p.spec.mem_limit)
+                            ),
+                            bad,
+                        ),
+                        Span::styled(
+                            format!(
+                                "  → raise limit to {}",
+                                crate::k8s::format_memory_gb_from_bytes(p.memory_bytes * 1.3)
+                            ),
+                            warn,
+                        ),
+                    ]));
+                }
             }
-            if !no_limits.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("  ? {} pod(s) with no resource limits", no_limits.len()),
-                    warn,
-                )));
-            }
-            if !over_cpu.is_empty() {
-                // Sum wasted CPU
-                let wasted: f64 = over_cpu.iter().map(|p| p.spec.cpu_request - p.cpu_cores).sum();
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  $ {} pod(s) using <10% of CPU request ({} cores reclaimable)",
-                        over_cpu.len(),
-                        crate::k8s::format_cpu_cores(wasted)
+
+            // Warning: over request
+            if !over_req_cpu.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", dim),
+                    Span::styled(
+                        "WARNING   ",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     ),
-                    Style::default().fg(Color::Blue),
-                )));
-            }
-            if !over_mem.is_empty() {
-                let wasted: f64 = over_mem.iter().map(|p| p.spec.mem_request - p.memory_bytes).sum();
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  $ {} pod(s) using <10% of memory request ({} reclaimable)",
-                        over_mem.len(),
-                        crate::k8s::format_memory_gb_from_bytes(wasted)
+                    Span::styled(
+                        format!(
+                            "{} pod(s) exceeding CPU request by >20% — may be evicted",
+                            over_req_cpu.len()
+                        ),
+                        warn,
                     ),
-                    Style::default().fg(Color::Blue),
-                )));
+                ]));
+            }
+
+            // Cost: over-provisioned
+            if !under_cpu.is_empty() {
+                let wasted: f64 = under_cpu
+                    .iter()
+                    .map(|p| p.spec.cpu_request * 0.8 - p.cpu_cores)
+                    .sum::<f64>()
+                    .max(0.0);
+                lines.push(Line::from(vec![
+                    Span::styled("  ", dim),
+                    Span::styled(
+                        "SAVINGS   ",
+                        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} pod(s) using <20% of CPU request — {} cores reclaimable",
+                            under_cpu.len(),
+                            crate::k8s::format_cpu_cores(wasted)
+                        ),
+                        over_prov,
+                    ),
+                ]));
+                // Show top wasters
+                let mut wasters = under_cpu.clone();
+                wasters.sort_by(|a, b| {
+                    let aw = a.spec.cpu_request - a.cpu_cores;
+                    let bw = b.spec.cpu_request - b.cpu_cores;
+                    bw.partial_cmp(&aw).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for p in wasters.iter().take(5) {
+                    let suggested = (p.cpu_cores * 2.0).max(0.01); // 2x headroom
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", dim),
+                        Span::styled(format!("{:<40}", truncate(&p.owner, 38)), value),
+                        Span::styled(
+                            format!(
+                                "using {} / {} req",
+                                crate::k8s::format_cpu_cores(p.cpu_cores),
+                                crate::k8s::format_cpu_cores(p.spec.cpu_request)
+                            ),
+                            over_prov,
+                        ),
+                        Span::styled(
+                            format!("  → lower to {}", crate::k8s::format_cpu_cores(suggested)),
+                            label,
+                        ),
+                    ]));
+                }
+            }
+            if !under_mem.is_empty() {
+                let wasted: f64 = under_mem
+                    .iter()
+                    .map(|p| p.spec.mem_request * 0.8 - p.memory_bytes)
+                    .sum::<f64>()
+                    .max(0.0);
+                lines.push(Line::from(vec![
+                    Span::styled("  ", dim),
+                    Span::styled(
+                        "SAVINGS   ",
+                        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} pod(s) using <20% of memory request — {} reclaimable",
+                            under_mem.len(),
+                            crate::k8s::format_memory_gb_from_bytes(wasted)
+                        ),
+                        over_prov,
+                    ),
+                ]));
+                let mut wasters = under_mem.clone();
+                wasters.sort_by(|a, b| {
+                    let aw = a.spec.mem_request - a.memory_bytes;
+                    let bw = b.spec.mem_request - b.memory_bytes;
+                    bw.partial_cmp(&aw).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for p in wasters.iter().take(5) {
+                    let suggested = (p.memory_bytes * 2.0).max(64.0 * 1024.0 * 1024.0);
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", dim),
+                        Span::styled(format!("{:<40}", truncate(&p.owner, 38)), value),
+                        Span::styled(
+                            format!(
+                                "using {} / {} req",
+                                crate::k8s::format_memory_gb_from_bytes(p.memory_bytes),
+                                crate::k8s::format_memory_gb_from_bytes(p.spec.mem_request)
+                            ),
+                            over_prov,
+                        ),
+                        Span::styled(
+                            format!("  → lower to {}", crate::k8s::format_memory_gb_from_bytes(suggested)),
+                            label,
+                        ),
+                    ]));
+                }
+            }
+
+            // Missing requests/limits
+            if !no_req.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", dim),
+                    Span::styled(
+                        "CONFIG    ",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} pod(s) with no resource requests — BestEffort QoS, evicted first",
+                            no_req.len()
+                        ),
+                        warn,
+                    ),
+                ]));
+            }
+            if !no_lim.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", dim),
+                    Span::styled(
+                        "CONFIG    ",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} pod(s) with no resource limits — can consume unbounded resources",
+                            no_lim.len()
+                        ),
+                        warn,
+                    ),
+                ]));
             }
             lines.push(Line::from(""));
         }
-    }
-
-    // ── Namespace treemap ────────────────────────────────────
-    let mut ns_map: std::collections::BTreeMap<&str, (f64, f64, usize)> = std::collections::BTreeMap::new();
-    for pod in &filtered_pods {
-        let entry = ns_map.entry(pod.namespace.as_str()).or_insert((0.0, 0.0, 0));
-        entry.0 += pod.cpu_cores;
-        entry.1 += pod.memory_bytes;
-        entry.2 += 1;
-    }
-
-    let mut ns_list: Vec<(&str, f64, f64, usize)> = ns_map
-        .into_iter()
-        .map(|(ns, (cpu, mem, count))| (ns, cpu, mem, count))
-        .collect();
-
-    match sort {
-        | ResourceMapSort::Cpu => ns_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)),
-        | ResourceMapSort::Memory => ns_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)),
-    }
-
-    let inner_w = area.width.saturating_sub(4) as usize;
-    if inner_w > 10 && !ns_list.is_empty() {
-        lines.extend(section_heading(
-            &format!("Namespace {sort_label} Treemap"),
-            heading,
-            dim,
-        ));
-
-        let total_val = match sort {
-            | ResourceMapSort::Cpu => total_cpu,
-            | ResourceMapSort::Memory => total_mem,
-        };
-
-        for (ns, cpu, mem, count) in &ns_list {
-            let ns_val = match sort {
-                | ResourceMapSort::Cpu => *cpu,
-                | ResourceMapSort::Memory => *mem,
-            };
-            let pct = (ns_val / total_val * 100.0) as usize;
-            if pct == 0 {
-                continue;
-            }
-
-            let block_w = ((ns_val / total_val) * inner_w as f64).max(1.0) as usize;
-            let color = usage_color(pct.min(100));
-
-            lines.push(Line::from(vec![
-                Span::styled("  ", dim),
-                Span::styled("█".repeat(block_w.min(inner_w)), Style::default().fg(color)),
-                Span::styled(" ".repeat(inner_w.saturating_sub(block_w)), Style::default()),
-            ]));
-            let val_str = match sort {
-                | ResourceMapSort::Cpu => format!("{} cores", crate::k8s::format_cpu_cores(*cpu)),
-                | ResourceMapSort::Memory => crate::k8s::format_memory_gb_from_bytes(*mem),
-            };
-            lines.push(Line::from(vec![
-                Span::styled("  ", dim),
-                Span::styled(
-                    format!("{ns} — {pct}% — {val_str} ({count} pods)"),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        }
-        lines.push(Line::from(""));
     }
 
     let paragraph = Paragraph::new(lines)

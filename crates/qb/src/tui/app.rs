@@ -340,10 +340,23 @@ pub enum ResourceMapSort {
     Memory,
 }
 
+pub enum ResourceMapFocus {
+    /// Normal scrollable view, no element focused.
+    Overview,
+    /// Workload list is focused — j/k moves cursor within it.
+    Workloads { cursor: usize },
+}
+
 pub struct ResourceMapState {
     pub scroll: u16,
     pub sort: ResourceMapSort,
     pub metrics: Option<MetricsData>,
+    pub focus: ResourceMapFocus,
+    /// Filter text for workloads (applied when non-empty).
+    pub filter: String,
+    /// True while the user is typing in the filter bar.
+    pub filter_editing: bool,
+    pub filter_buf: String,
 }
 
 pub struct RelatedState {
@@ -498,6 +511,10 @@ impl App {
                 scroll: 0,
                 sort: ResourceMapSort::Cpu,
                 metrics: None,
+                focus: ResourceMapFocus::Overview,
+                filter: String::new(),
+                filter_editing: false,
+                filter_buf: String::new(),
             },
             detail: DetailState {
                 value: Value::Null,
@@ -1491,6 +1508,149 @@ impl App {
         }
     }
 
+    /// Count of workloads visible in the resource map after namespace + filter.
+    fn filtered_workload_count(&self) -> usize {
+        self.resource_map
+            .metrics
+            .as_ref()
+            .map(|m| {
+                let ns = self.kube.context.namespace.as_deref();
+                let f = &self.resource_map.filter;
+                m.workload_metrics
+                    .iter()
+                    .filter(|w| ns.is_none() || ns == Some(w.namespace.as_str()))
+                    .filter(|w| {
+                        f.is_empty()
+                            || w.name.contains(f.as_str())
+                            || w.namespace.contains(f.as_str())
+                            || w.kind.contains(f.as_str())
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn handle_resource_map_key(&mut self, key: KeyEvent) {
+        // ── Filter editing mode ──────────────────────────────
+        if self.resource_map.filter_editing {
+            match key.code {
+                | KeyCode::Enter => {
+                    self.resource_map.filter = self.resource_map.filter_buf.clone();
+                    self.resource_map.filter_editing = false;
+                    // Reset cursor to 0 after filter change
+                    if let ResourceMapFocus::Workloads { ref mut cursor } = self.resource_map.focus {
+                        *cursor = 0;
+                    }
+                },
+                | KeyCode::Esc => {
+                    self.resource_map.filter_buf = self.resource_map.filter.clone();
+                    self.resource_map.filter_editing = false;
+                },
+                | KeyCode::Backspace => {
+                    self.resource_map.filter_buf.pop();
+                },
+                | KeyCode::Char(c) => {
+                    self.resource_map.filter_buf.push(c);
+                },
+                | _ => {},
+            }
+            return;
+        }
+
+        let wl_count = self.filtered_workload_count();
+
+        match &mut self.resource_map.focus {
+            | ResourceMapFocus::Workloads { cursor } => {
+                match key.code {
+                    | KeyCode::Up | KeyCode::Char('k') => {
+                        *cursor = cursor.saturating_sub(1);
+                    },
+                    | KeyCode::Down | KeyCode::Char('j') => {
+                        if wl_count > 0 {
+                            *cursor = (*cursor + 1).min(wl_count.saturating_sub(1));
+                        }
+                    },
+                    | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        *cursor = cursor.saturating_sub(10);
+                    },
+                    | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if wl_count > 0 {
+                            *cursor = (*cursor + 10).min(wl_count.saturating_sub(1));
+                        }
+                    },
+                    | KeyCode::Home | KeyCode::Char('g') => {
+                        *cursor = 0;
+                    },
+                    | KeyCode::End | KeyCode::Char('G') => {
+                        if wl_count > 0 {
+                            *cursor = wl_count.saturating_sub(1);
+                        }
+                    },
+                    | KeyCode::Char('/') => {
+                        self.resource_map.filter_editing = true;
+                        self.resource_map.filter_buf = self.resource_map.filter.clone();
+                    },
+                    | KeyCode::Char('x') => {
+                        self.resource_map.filter.clear();
+                        self.resource_map.filter_buf.clear();
+                        *cursor = 0;
+                    },
+                    | KeyCode::Char('w') | KeyCode::Esc => {
+                        self.resource_map.focus = ResourceMapFocus::Overview;
+                    },
+                    | KeyCode::Char('m') => {
+                        self.resource_map.sort = match self.resource_map.sort {
+                            | ResourceMapSort::Cpu => ResourceMapSort::Memory,
+                            | ResourceMapSort::Memory => ResourceMapSort::Cpu,
+                        };
+                    },
+                    | _ => {},
+                }
+            },
+            | ResourceMapFocus::Overview => {
+                match key.code {
+                    | KeyCode::Char('w') => {
+                        if wl_count > 0 {
+                            self.resource_map.focus = ResourceMapFocus::Workloads { cursor: 0 };
+                        }
+                    },
+                    | KeyCode::Up | KeyCode::Char('k') => {
+                        self.resource_map.scroll = self.resource_map.scroll.saturating_sub(1);
+                    },
+                    | KeyCode::Down | KeyCode::Char('j') => {
+                        self.resource_map.scroll = self.resource_map.scroll.saturating_add(1);
+                    },
+                    | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.resource_map.scroll = self.resource_map.scroll.saturating_sub(20);
+                    },
+                    | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.resource_map.scroll = self.resource_map.scroll.saturating_add(20);
+                    },
+                    | KeyCode::Home => {
+                        self.resource_map.scroll = 0;
+                    },
+                    | KeyCode::Char('m') => {
+                        self.resource_map.sort = match self.resource_map.sort {
+                            | ResourceMapSort::Cpu => ResourceMapSort::Memory,
+                            | ResourceMapSort::Memory => ResourceMapSort::Cpu,
+                        };
+                    },
+                    | _ => {},
+                }
+            },
+        }
+
+        // Clamp cursor after filter/sort changes
+        let count = self.filtered_workload_count();
+        if let ResourceMapFocus::Workloads { ref mut cursor } = self.resource_map.focus {
+            if count == 0 {
+                *cursor = 0;
+            } else if *cursor >= count {
+                *cursor = count.saturating_sub(1);
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Event handling
     // -----------------------------------------------------------------------
@@ -1523,7 +1683,11 @@ impl App {
 
         // [p] Toggle pause — global, works in any view (except popups/filter
         // editing/port forwards/logs)
-        if key.code == KeyCode::Char('p') && self.popup.is_none() && !self.resources.filter.editing {
+        if key.code == KeyCode::Char('p')
+            && self.popup.is_none()
+            && !self.resources.filter.editing
+            && !self.resource_map.filter_editing
+        {
             // Don't consume 'p' in: log view (pod selector), edit diff, port forwards view
             // (pause/resume)
             if self.view != View::Logs && self.view != View::EditDiff && !matches!(self.panel, Panel::PortForwards) {
@@ -1537,7 +1701,11 @@ impl App {
             }
         }
 
-        if key.code == KeyCode::Char('?') && self.popup.is_none() && !self.resources.filter.editing {
+        if key.code == KeyCode::Char('?')
+            && self.popup.is_none()
+            && !self.resources.filter.editing
+            && !self.resource_map.filter_editing
+        {
             self.help = Some(HelpState {
                 buf: String::new(),
                 cursor: 0,
@@ -1584,6 +1752,17 @@ impl App {
                 return;
             },
             | _ => {},
+        }
+
+        // When resource map has keyboard focus (workload browsing / filter editing),
+        // skip the global shortcut map and dispatch directly to the panel handler.
+        let rmap_captures = matches!(self.panel, Panel::ResourceMap)
+            && self.focus == Focus::Resources
+            && (self.resource_map.filter_editing
+                || matches!(self.resource_map.focus, ResourceMapFocus::Workloads { .. }));
+        if rmap_captures {
+            self.handle_resource_map_key(key);
+            return;
         }
 
         match key.code {
@@ -1720,6 +1899,10 @@ impl App {
                     self.panel = Panel::ResourceMap;
                     self.clear_resource_filter();
                     self.resource_map.scroll = 0;
+                    self.resource_map.focus = ResourceMapFocus::Overview;
+                    self.resource_map.filter.clear();
+                    self.resource_map.filter_buf.clear();
+                    self.resource_map.filter_editing = false;
                     self.load_metrics();
                 }
             },
@@ -1832,30 +2015,7 @@ impl App {
                 return;
             },
             | Panel::ResourceMap => {
-                match key.code {
-                    | KeyCode::Up | KeyCode::Char('k') => {
-                        self.resource_map.scroll = self.resource_map.scroll.saturating_sub(1);
-                    },
-                    | KeyCode::Down | KeyCode::Char('j') => {
-                        self.resource_map.scroll = self.resource_map.scroll.saturating_add(1);
-                    },
-                    | KeyCode::PageUp | KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.resource_map.scroll = self.resource_map.scroll.saturating_sub(20);
-                    },
-                    | KeyCode::PageDown | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.resource_map.scroll = self.resource_map.scroll.saturating_add(20);
-                    },
-                    | KeyCode::Home => {
-                        self.resource_map.scroll = 0;
-                    },
-                    | KeyCode::Char('m') => {
-                        self.resource_map.sort = match self.resource_map.sort {
-                            | ResourceMapSort::Cpu => ResourceMapSort::Memory,
-                            | ResourceMapSort::Memory => ResourceMapSort::Cpu,
-                        };
-                    },
-                    | _ => {},
-                }
+                self.handle_resource_map_key(key);
                 return;
             },
             | Panel::ResourceList(rt) if rt == ResourceType::Event => {
