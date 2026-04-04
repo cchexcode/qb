@@ -1742,6 +1742,7 @@ dependencies = [
  "jiff",
  "k8s-openapi",
  "kube",
+ "parking_lot",
  "ratatui",
  "regex",
  "rustls",

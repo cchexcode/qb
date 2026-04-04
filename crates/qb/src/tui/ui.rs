@@ -3107,7 +3107,7 @@ fn render_profiles(f: &mut Frame, app: &mut App, area: Rect) {
     });
 
     let header = Row::new(vec!["NAME", "CONTEXT", "FAVORITES", "PORT FORWARDS"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .style(Style::default().fg(Color::DarkGray))
         .bottom_margin(0);
 
     let rows: Vec<Row> = names
@@ -3160,6 +3160,57 @@ fn render_profiles(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.profiles.table_state);
 }
 
+/// Short human-readable label for a favorite's resource type string.
+fn favorite_type_label(rt_str: &str) -> &str {
+    match rt_str {
+        | "deployment" => "Deploy",
+        | "statefulset" => "StatefulSet",
+        | "daemonset" => "DaemonSet",
+        | "replicaset" => "ReplicaSet",
+        | "pod" => "Pod",
+        | "cronjob" => "CronJob",
+        | "job" => "Job",
+        | "hpa" => "HPA",
+        | "configmap" => "ConfigMap",
+        | "secret" => "Secret",
+        | "service" => "Service",
+        | "ingress" => "Ingress",
+        | "endpoints" => "Endpoints",
+        | "networkpolicy" => "NetPolicy",
+        | "pvc" => "PVC",
+        | "pv" => "PV",
+        | "storageclass" => "StorageClass",
+        | "serviceaccount" => "SA",
+        | "role" => "Role",
+        | "rolebinding" => "RoleBinding",
+        | "clusterrole" => "ClusterRole",
+        | "clusterrolebinding" => "CRBinding",
+        | "node" => "Node",
+        | "namespace" => "Namespace",
+        | "event" => "Event",
+        | "crd" => "CRD",
+        | s if s.starts_with("cr:") => {
+            // "cr:group/plural" → show the plural part
+            s.split('/').last().unwrap_or("CR")
+        },
+        | _ => "Resource",
+    }
+}
+
+/// Color for a resource type category.
+fn type_color(rt_str: &str) -> Color {
+    match rt_str {
+        | "deployment" | "statefulset" | "daemonset" | "replicaset" | "pod" | "cronjob" | "job" | "hpa" => Color::Green,
+        | "service" | "ingress" | "endpoints" | "networkpolicy" => Color::Cyan,
+        | "configmap" | "secret" => Color::Yellow,
+        | "pvc" | "pv" | "storageclass" => Color::Blue,
+        | "serviceaccount" | "role" | "rolebinding" | "clusterrole" | "clusterrolebinding" => Color::Magenta,
+        | "node" | "namespace" | "event" | "crd" => Color::White,
+        | s if s.starts_with("cr:") => Color::LightCyan,
+        | _ => Color::DarkGray,
+    }
+}
+
 fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
     let favorites = &app.config.active_profile().favorites;
 
@@ -3199,25 +3250,44 @@ fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
     let current_context = app.kube.context.name.as_str().to_string();
     let available_contexts = app.kube.contexts();
 
+    // Look up cached resource entries for basic status info
+    let cached = &app.resources.entries;
+
     let rows: Vec<Row> = display
         .iter()
         .map(|item| {
             match item {
                 | DisplayItem::Header(label) => {
-                    Row::new(vec![Cell::from(Span::styled(
-                        format!("  {}", label),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-                    ))])
+                    Row::new(vec![
+                        Cell::from(Span::styled("─", Style::default().fg(Color::DarkGray))),
+                        Cell::from(Span::styled(
+                            label.to_uppercase(),
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                        )),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ])
                 },
                 | DisplayItem::Entry(idx) => {
                     let fav = &favorites[*idx];
                     let missing = !available_contexts.iter().any(|c| c == &fav.context);
+                    let is_current_ctx = fav.context == current_context;
                     let is_diff_marked = app
                         .diff_mark
                         .as_ref()
                         .map(|(n, ns, _)| n == &fav.name && ns == &fav.namespace)
                         .unwrap_or(false);
 
+                    // Type label + color
+                    let type_label = favorite_type_label(&fav.resource_type);
+                    let t_color = type_color(&fav.resource_type);
+                    let type_cell = Cell::from(Span::styled(
+                        type_label.to_string(),
+                        Style::default().fg(if missing { Color::DarkGray } else { t_color }),
+                    ));
+
+                    // Name
                     let name_cell = if is_diff_marked {
                         Cell::from(Span::styled(
                             format!("* {}", fav.name),
@@ -3226,7 +3296,7 @@ fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         let name_style = if missing {
                             Style::default().fg(Color::DarkGray)
-                        } else if fav.context == current_context {
+                        } else if is_current_ctx {
                             Style::default().fg(Color::Green)
                         } else {
                             Style::default()
@@ -3235,29 +3305,105 @@ fn render_favorites(f: &mut Frame, app: &mut App, area: Rect) {
                         Cell::from(Span::styled(format!("{}{}", name_prefix, fav.name), name_style))
                     };
 
-                    Row::new(vec![
-                        name_cell,
-                        Cell::from(fav.namespace.as_str()),
-                        Cell::from(if missing {
-                            Span::styled(format!("{} (missing)", fav.context), Style::default().fg(Color::Red))
+                    // Namespace
+                    let ns_cell = Cell::from(Span::styled(
+                        fav.namespace.as_str(),
+                        if missing {
+                            Style::default().fg(Color::DarkGray)
                         } else {
-                            Span::raw(fav.context.as_str())
-                        }),
-                    ])
+                            Style::default()
+                        },
+                    ));
+
+                    // Status — try to find a matching cached resource entry
+                    // for current-context favorites to show live status
+                    let status_cell = if missing {
+                        Cell::from(Span::styled("unavailable", Style::default().fg(Color::Red)))
+                    } else if !is_current_ctx {
+                        Cell::from(Span::styled(
+                            format!("ctx:{}", truncate(&fav.context, 12)),
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                    } else {
+                        // Look up in cached entries for a status column
+                        let entry = cached
+                            .iter()
+                            .find(|e| e.name == fav.name && e.namespace == fav.namespace);
+                        match entry {
+                            | Some(e) if !e.columns.is_empty() => {
+                                // First column is typically the most useful status
+                                // (ready count, phase, replicas, etc.)
+                                let status = e.columns.iter().take(2).cloned().collect::<Vec<_>>().join("  ");
+                                let color = if status.contains("Running")
+                                    || status.contains("Active")
+                                    || status.contains("Bound")
+                                {
+                                    Color::Green
+                                } else if status.contains("Pending")
+                                    || status.contains("ContainerCreating")
+                                    || status.contains("Terminating")
+                                {
+                                    Color::Yellow
+                                } else if status.contains("Failed")
+                                    || status.contains("Error")
+                                    || status.contains("CrashLoop")
+                                {
+                                    Color::Red
+                                } else {
+                                    Color::White
+                                };
+                                Cell::from(Span::styled(status, Style::default().fg(color)))
+                            },
+                            | _ => Cell::from(Span::styled("–", Style::default().fg(Color::DarkGray))),
+                        }
+                    };
+
+                    // Context indicator — only show if different from current
+                    let ctx_cell = if is_current_ctx {
+                        Cell::from(Span::styled("", Style::default()))
+                    } else if missing {
+                        Cell::from(Span::styled(
+                            format!("{} ✗", truncate(&fav.context, 12)),
+                            Style::default().fg(Color::Red),
+                        ))
+                    } else {
+                        Cell::from(Span::styled(
+                            truncate(&fav.context, 14).to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                    };
+
+                    Row::new(vec![type_cell, name_cell, ns_cell, status_cell, ctx_cell])
                 },
             }
         })
         .collect();
 
-    let table = Table::new(rows, [Constraint::Min(20), Constraint::Length(18), Constraint::Min(14)])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(format!(" ★ Favorites ({}) ", favorites.len())),
-        )
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Yellow))
-        .highlight_symbol("▶ ");
+    let table = Table::new(rows, [
+        Constraint::Length(12), // TYPE
+        Constraint::Min(20),    // NAME
+        Constraint::Length(16), // NAMESPACE
+        Constraint::Length(20), // STATUS
+        Constraint::Length(14), // CONTEXT
+    ])
+    .header(
+        Row::new(vec![
+            Cell::from(Span::styled("TYPE", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("NAME", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("NAMESPACE", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("STATUS", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("CONTEXT", Style::default().fg(Color::DarkGray))),
+        ])
+        .bottom_margin(0),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(format!(" ★ Favorites ({}) ", favorites.len())),
+    )
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Yellow))
+    .highlight_symbol("▶ ");
 
     f.render_stateful_widget(table, area, &mut app.favorites.table_state);
 }
@@ -3304,10 +3450,19 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|item| {
             match item {
                 | DisplayItem::Header(label) => {
-                    Row::new(vec![Cell::from(Span::styled(
-                        format!("  {}", label),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-                    ))])
+                    Row::new(vec![
+                        Cell::from(Span::styled(
+                            label.to_uppercase(),
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                        )),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ])
                 },
                 | DisplayItem::Entry(idx) => {
                     let entry = &entries[*idx];
@@ -3326,6 +3481,10 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
                     };
                     Row::new(vec![
                         Cell::from(Span::styled(status_text, status_style)),
+                        Cell::from(Span::styled(
+                            entry.resource.r#type.as_str(),
+                            Style::default().fg(Color::DarkGray),
+                        )),
                         Cell::from(format!(":{}", entry.port.local)),
                         Cell::from(format!(":{}", entry.port.remote)),
                         Cell::from(entry.context.as_str()),
@@ -3339,14 +3498,28 @@ fn render_port_forwards(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let table = Table::new(rows, [
-        Constraint::Length(20),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Min(14),
-        Constraint::Min(18),
-        Constraint::Min(18),
-        Constraint::Length(6),
+        Constraint::Length(12), // STATUS
+        Constraint::Length(10), // TYPE
+        Constraint::Length(8),  // LOCAL
+        Constraint::Length(8),  // REMOTE
+        Constraint::Min(14),    // CONTEXT
+        Constraint::Min(18),    // RESOURCE
+        Constraint::Min(18),    // POD
+        Constraint::Length(6),  // CONNS
     ])
+    .header(
+        Row::new(vec![
+            Cell::from(Span::styled("STATUS", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("TYPE", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("LOCAL", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("REMOTE", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("CONTEXT", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("RESOURCE", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("POD", Style::default().fg(Color::DarkGray))),
+            Cell::from(Span::styled("CONNS", Style::default().fg(Color::DarkGray))),
+        ])
+        .bottom_margin(0),
+    )
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).fg(Color::Cyan))
     .block(
         Block::default()

@@ -32,3 +32,4 @@ similar = { workspace = true }
 tempfile = { workspace = true }
 semver = { workspace = true }
 dirs = { workspace = true }
+parking_lot = "0.12.5"
